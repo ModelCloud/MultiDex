@@ -748,7 +748,6 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
     properties.remove("agent_type");
-    properties.remove("provider");
     properties.remove("model");
     properties.remove("reasoning_effort");
 }

@@ -226,6 +226,7 @@ pub(crate) fn tool_call_history_cell(
     match tool {
         // V2 uses SubAgentActivity for display; these variants are analytics-only.
         CollabAgentTool::SendMessage
+        | CollabAgentTool::SetAgentSettings
         | CollabAgentTool::FollowupTask
         | CollabAgentTool::InterruptAgent
         | CollabAgentTool::ListAgents => None,

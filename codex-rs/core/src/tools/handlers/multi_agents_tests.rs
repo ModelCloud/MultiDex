@@ -4756,127 +4756,155 @@ async fn multi_agent_v2_set_agent_settings_requires_an_override() {
     assert!(message.contains("requires at least one"));
 }
 
-#[tokio::test]
-async fn multi_agent_v2_set_agent_settings_updates_loaded_agent() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
-        .await
-        .expect("root thread should start");
-    set_agent_control(&mut session, manager.agent_control());
-    session.thread_id = root.thread_id;
-    let mut config = turn.config.as_ref().clone();
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    set_turn_config(&mut turn, config);
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
+#[test]
+fn multi_agent_v2_set_agent_settings_updates_loaded_agent() {
+    // The full multi-agent path overflows the default test-thread stack; run on a big one.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    let (mut session, mut turn) = make_session_and_context().await;
+                    let manager = thread_manager();
+                    let root = manager
+                        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+                        .await
+                        .expect("root thread should start");
+                    set_agent_control(&mut session, manager.agent_control());
+                    session.thread_id = root.thread_id;
+                    let mut config = turn.config.as_ref().clone();
+                    let _ = config.features.enable(Feature::MultiAgentV2);
+                    set_turn_config(&mut turn, config);
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
 
-    SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "boot worker",
-                "task_name": "worker"
-            })),
-        ))
-        .await
-        .expect("spawn worker");
-    let agent_id = session
-        .services
-        .local_agent_runtime
-        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
-        .await
-        .expect("worker should resolve");
+                    SpawnAgentHandlerV2::default()
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "spawn_agent",
+                            function_payload(json!({
+                                "message": "boot worker",
+                                "task_name": "worker"
+                            })),
+                        ))
+                        .await
+                        .expect("spawn worker");
+                    let agent_id = session
+                        .services
+                        .local_agent_runtime
+                        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+                        .await
+                        .expect("worker should resolve");
 
-    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
-        .handle(invocation(
-            session,
-            turn,
-            "set_agent_settings",
-            function_payload(json!({
-                "target": agent_id.to_string(),
-                "model": "gpt-5.5",
-                "reasoning_effort": "high",
-            })),
-        ))
-        .await
-        .expect("set_agent_settings should succeed on a loaded agent");
+                    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+                        .handle(invocation(
+                            session,
+                            turn,
+                            "set_agent_settings",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "model": "gpt-5.5",
+                                "reasoning_effort": "high",
+                            })),
+                        ))
+                        .await
+                        .expect("set_agent_settings should succeed on a loaded agent");
 
-    let ops = manager.captured_ops();
-    assert!(ops.iter().any(|(id, op)| {
-        *id == agent_id
-            && matches!(
-                op,
-                Op::ThreadSettings { thread_settings, .. }
-                    if thread_settings.model.as_deref() == Some("gpt-5.5")
-                        && thread_settings.effort == Some(Some(ReasoningEffort::High))
-            )
-    }));
+                    let ops = manager.captured_ops();
+                    assert!(ops.iter().any(|(id, op)| {
+            *id == agent_id
+                && matches!(
+                    op,
+                    Op::ThreadSettings { thread_settings, .. }
+                        if thread_settings.model.as_deref() == Some("gpt-5.5")
+                            && thread_settings.effort == Some(Some(ReasoningEffort::High))
+                )
+        }));
+                })
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
 }
 
-#[tokio::test]
-async fn multi_agent_v2_send_message_applies_settings_overrides_before_send() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
-        .await
-        .expect("root thread should start");
-    set_agent_control(&mut session, manager.agent_control());
-    session.thread_id = root.thread_id;
-    let mut config = turn.config.as_ref().clone();
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    set_turn_config(&mut turn, config);
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
+#[test]
+fn multi_agent_v2_send_message_applies_settings_overrides_before_send() {
+    // The full multi-agent path overflows the default test-thread stack; run on a big one.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    let (mut session, mut turn) = make_session_and_context().await;
+                    let manager = thread_manager();
+                    let root = manager
+                        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+                        .await
+                        .expect("root thread should start");
+                    set_agent_control(&mut session, manager.agent_control());
+                    session.thread_id = root.thread_id;
+                    let mut config = turn.config.as_ref().clone();
+                    let _ = config.features.enable(Feature::MultiAgentV2);
+                    set_turn_config(&mut turn, config);
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
 
-    SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "boot worker",
-                "task_name": "worker"
-            })),
-        ))
-        .await
-        .expect("spawn worker");
-    let agent_id = session
-        .services
-        .local_agent_runtime
-        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
-        .await
-        .expect("worker should resolve");
+                    SpawnAgentHandlerV2::default()
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "spawn_agent",
+                            function_payload(json!({
+                                "message": "boot worker",
+                                "task_name": "worker"
+                            })),
+                        ))
+                        .await
+                        .expect("spawn worker");
+                    let agent_id = session
+                        .services
+                        .local_agent_runtime
+                        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+                        .await
+                        .expect("worker should resolve");
 
-    SendMessageHandlerV2::new(true)
-        .handle(invocation(
-            session,
-            turn,
-            "send_message",
-            function_payload(json!({
-                "target": agent_id.to_string(),
-                "message": "continue on the smaller model",
-                "model": "gpt-5.5",
-                "reasoning_effort": "low",
-            })),
-        ))
-        .await
-        .expect("send_message with overrides should succeed");
+                    SendMessageHandlerV2::new(true)
+                        .handle(invocation(
+                            session,
+                            turn,
+                            "send_message",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "message": "continue on the smaller model",
+                                "model": "gpt-5.5",
+                                "reasoning_effort": "low",
+                            })),
+                        ))
+                        .await
+                        .expect("send_message with overrides should succeed");
 
-    let ops = manager.captured_ops();
-    assert!(ops.iter().any(|(id, op)| {
-        *id == agent_id
-            && matches!(
-                op,
-                Op::ThreadSettings { thread_settings, .. }
-                    if thread_settings.model.as_deref() == Some("gpt-5.5")
-                        && thread_settings.effort == Some(Some(ReasoningEffort::Low))
-            )
-    }));
+                    let ops = manager.captured_ops();
+                    assert!(ops.iter().any(|(id, op)| {
+            *id == agent_id
+                && matches!(
+                    op,
+                    Op::ThreadSettings { thread_settings, .. }
+                        if thread_settings.model.as_deref() == Some("gpt-5.5")
+                            && thread_settings.effort == Some(Some(ReasoningEffort::Low))
+                )
+        }));
+                })
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
 }
 
 #[tokio::test]

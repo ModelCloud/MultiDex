@@ -7251,6 +7251,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         }),
     )
     .expect("initialize test hooks");
+    let models_manager_swappable = Arc::new(crate::state::SwappableModelsManager::new(
+        Arc::clone(&models_manager),
+        Arc::clone(&auth_manager),
+    ));
     let services = SessionServices {
         mcp_runtime,
         mcp_handler_cache: Default::default(),
@@ -7275,7 +7279,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         )
         .with_legacy_custom_ca_fallback(),
         session_telemetry: session_telemetry.clone(),
-        models_manager: Arc::clone(&models_manager),
+        models_manager: models_manager_swappable.clone(),
+        models_manager_swappable,
         git_root_discovery: Arc::default(),
         tool_approvals: Mutex::new(ApprovalStore::default()),
         granted_permissions_by_environment_id: Arc::default(),
@@ -9575,6 +9580,10 @@ where
         }),
     )
     .expect("initialize test hooks");
+    let models_manager_swappable = Arc::new(crate::state::SwappableModelsManager::new(
+        Arc::clone(&models_manager),
+        Arc::clone(&auth_manager),
+    ));
     let services = SessionServices {
         mcp_runtime,
         mcp_handler_cache: Default::default(),
@@ -9599,7 +9608,8 @@ where
         )
         .with_legacy_custom_ca_fallback(),
         session_telemetry: session_telemetry.clone(),
-        models_manager: Arc::clone(&models_manager),
+        models_manager: models_manager_swappable.clone(),
+        models_manager_swappable,
         git_root_discovery: Arc::default(),
         tool_approvals: Mutex::new(ApprovalStore::default()),
         granted_permissions_by_environment_id: Arc::default(),

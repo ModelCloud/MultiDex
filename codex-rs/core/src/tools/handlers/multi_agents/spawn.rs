@@ -136,7 +136,6 @@ async fn handle_spawn_agent(
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints: None,
                 cyber_access_program: turn.cyber_access_program,
-                models_manager: None,
             },
         })
         .await

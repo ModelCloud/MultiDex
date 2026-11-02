@@ -246,6 +246,7 @@ impl EventProcessorWithJsonOutput {
                 details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
                     tool: match tool {
                         CollabAgentTool::SendMessage
+                        | CollabAgentTool::SetAgentSettings
                         | CollabAgentTool::FollowupTask
                         | CollabAgentTool::InterruptAgent
                         | CollabAgentTool::ListAgents => return None,

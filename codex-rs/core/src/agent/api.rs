@@ -69,11 +69,11 @@ pub trait AgentControl: Send + Sync {
     /// the root. Legacy user input can address loaded threads outside the agent registry.
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>>;
 
-    /// Apply sparse thread-settings overrides to a loaded agent for its subsequent turns.
+    /// Apply sparse thread-settings overrides to an agent for its subsequent turns.
     ///
-    /// Targets resolve like `send`. `CodexErr::ThreadNotFound` means the recipient is not
-    /// currently loaded; callers that need overrides to survive a cold reload should also
-    /// patch the resume config they pass to `send`.
+    /// Targets resolve like `send`, restricted to the caller and its descendants. Loaded
+    /// targets get a live settings op; unloaded targets get the overrides persisted to
+    /// stored thread metadata so cold restore applies them.
     fn update_thread_settings(
         &self,
         caller: ThreadId,

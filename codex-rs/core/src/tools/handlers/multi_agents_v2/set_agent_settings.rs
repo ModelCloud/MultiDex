@@ -22,7 +22,8 @@ impl ToolExecutor<ToolInvocation> for Handler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
-            let mut analytics = ToolCallAnalytics::new(&invocation, CollabAgentTool::SendMessage);
+            let mut analytics =
+                ToolCallAnalytics::new(&invocation, CollabAgentTool::SetAgentSettings);
             let result = self.handle_call(invocation, &mut analytics).await;
             analytics.finish(&result);
             result

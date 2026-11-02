@@ -3805,6 +3805,7 @@ fn collab_agent_tool_name(tool: &CollabAgentTool) -> &'static str {
         CollabAgentTool::Wait => "wait_agent",
         CollabAgentTool::CloseAgent => "close_agent",
         CollabAgentTool::SendMessage => "send_message",
+        CollabAgentTool::SetAgentSettings => "set_agent_settings",
         CollabAgentTool::FollowupTask => "followup_task",
         CollabAgentTool::InterruptAgent => "interrupt_agent",
         CollabAgentTool::ListAgents => "list_agents",

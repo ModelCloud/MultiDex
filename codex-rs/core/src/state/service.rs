@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crate::agent::api::AgentControl;
 use crate::agent::control::LocalAgentRuntime;
@@ -33,6 +36,11 @@ use codex_hooks::Hooks;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_mcp::McpRuntime;
+use codex_models_manager::CatalogModel;
+use codex_models_manager::ModelsManagerConfig;
+use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::ModelsManagerFuture;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -64,7 +72,11 @@ pub(crate) struct SessionServices {
     pub(crate) auth_manager: Arc<AuthManager>,
     /// Upload-only clients shared across turns without logging signed blob URLs.
     pub(crate) openai_file_upload_client_pool: RouteAwareClientPool,
+    /// Stable handle to the session's models manager; resolves through `models_manager_swappable`
+    /// so a provider switch mid-session re-points every consumer at the new provider's catalog.
     pub(crate) models_manager: SharedModelsManager,
+    /// Concrete handle used to swap the inner manager when the session changes provider.
+    pub(crate) models_manager_swappable: Arc<SwappableModelsManager>,
     pub(crate) git_root_discovery: Arc<GitRootDiscovery>,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) tool_approvals: Mutex<ApprovalStore>,
@@ -105,6 +117,115 @@ pub(crate) struct SessionServices {
     pub(crate) code_mode_service: CodeModeService,
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
+}
+
+/// `ModelsManager` whose inner manager can be replaced after construction. A mid-session
+/// provider switch swaps the inner manager so catalogs, ladders, and instructions resolve
+/// against the active provider instead of the one the session was constructed with.
+pub(crate) struct SwappableModelsManager {
+    inner: ArcSwap<SharedModelsManager>,
+    auth_manager: Arc<AuthManager>,
+    api_key_model_discovery_enabled: AtomicBool,
+}
+
+impl SwappableModelsManager {
+    pub(crate) fn new(manager: SharedModelsManager, auth_manager: Arc<AuthManager>) -> Self {
+        Self {
+            inner: ArcSwap::from_pointee(manager),
+            auth_manager,
+            api_key_model_discovery_enabled: AtomicBool::new(false),
+        }
+    }
+
+    /// Point this handle at a manager built for the session's new provider.
+    pub(crate) fn swap(&self, manager: SharedModelsManager) {
+        manager.set_api_key_model_discovery_enabled(
+            self.api_key_model_discovery_enabled.load(Ordering::Relaxed),
+        );
+        self.inner.store(Arc::new(manager));
+    }
+}
+
+impl fmt::Debug for SwappableModelsManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwappableModelsManager")
+            .field("inner", &self.inner.load())
+            .finish()
+    }
+}
+
+impl ModelsManager for SwappableModelsManager {
+    fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
+        self.inner.load().for_originator(originator)
+    }
+
+    fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
+        self.api_key_model_discovery_enabled
+            .store(enabled, Ordering::Relaxed);
+        self.inner
+            .load()
+            .set_api_key_model_discovery_enabled(enabled);
+    }
+
+    fn model_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        let manager = self.inner.load_full();
+        Box::pin(async move {
+            manager
+                .model_catalog_with_origins(refresh_strategy, http_client_factory)
+                .await
+        })
+    }
+
+    fn refresh_after_auth_change(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.refresh_after_auth_change(http_client_factory).await })
+    }
+
+    fn get_remote_models(
+        &self,
+    ) -> ModelsManagerFuture<'_, Vec<codex_protocol::openai_models::ModelInfo>> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.get_remote_models().await })
+    }
+
+    fn try_get_remote_models(
+        &self,
+    ) -> Result<Vec<codex_protocol::openai_models::ModelInfo>, tokio::sync::TryLockError> {
+        self.inner.load().try_get_remote_models()
+    }
+
+    fn auth_manager(&self) -> Option<&AuthManager> {
+        Some(self.auth_manager.as_ref())
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<codex_protocol::config_types::CollaborationModeMask> {
+        self.inner.load().list_collaboration_modes()
+    }
+
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, CatalogModel> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.get_model_info(model, config).await })
+    }
+
+    fn refresh_if_new_etag(
+        &self,
+        etag: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.refresh_if_new_etag(etag, http_client_factory).await })
+    }
 }
 
 impl SessionServices {

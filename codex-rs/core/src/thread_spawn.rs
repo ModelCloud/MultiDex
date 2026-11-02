@@ -179,11 +179,14 @@ pub(crate) async fn prepare(
     let multi_agent_v2_usage_hints = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory))
         && turn.multi_agent_version == MultiAgentVersion::V2
     {
+        // A fork that also changed provider resolves the child model against the
+        // destination provider's catalog, not the caller's session manager.
+        let child_models_manager = models_manager
+            .as_deref()
+            .unwrap_or(session.services.models_manager.as_ref());
         let child_model_info = match config.model.as_deref() {
             Some(model) if model != turn.model_info().slug => Some(
-                session
-                    .services
-                    .models_manager
+                child_models_manager
                     .get_model_info(model, &config.to_models_manager_config())
                     .await,
             ),
@@ -216,7 +219,6 @@ pub(crate) async fn prepare(
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,
-                models_manager,
             },
         },
         task_name,

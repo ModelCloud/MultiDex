@@ -358,6 +358,9 @@ impl LocalAgentControl {
     /// rejected send leaves the target untouched. Loaded targets take a live
     /// `Op::ThreadSettings`; unloaded targets persist the sparse patch to stored metadata so
     /// cold restore picks it up (including queued mail for locally evicted agents).
+    ///
+    /// The patch intentionally precedes load/delivery: a cold-resumed turn must start under
+    /// the new settings, so failed sends do not roll the persisted settings back.
     pub(crate) async fn update_resolved_thread_settings(
         &self,
         caller: ThreadId,
@@ -368,7 +371,15 @@ impl LocalAgentControl {
         self.runtime.ensure_agent_known(caller)?;
         self.runtime.ensure_agent_known(target)?;
         let state = self.runtime.upgrade()?;
-        self.validate_thread_settings_overrides(&state, caller, target, &overrides)
+        // Settings retarget the recipient's own model/provider, so they are limited to the
+        // caller's agent tree: itself, or a descendant recorded in the persisted spawn graph.
+        if caller != target && !self.target_within_caller_tree(&state, caller, target).await {
+            return Err(CodexErr::InvalidRequest(
+                "thread settings updates are limited to the caller and its descendants".to_string(),
+            ));
+        }
+        let mut overrides = overrides;
+        self.validate_thread_settings_overrides(&state, caller, target, &mut overrides)
             .await?;
         if state.get_thread(target).await.is_ok() {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -403,6 +414,39 @@ impl LocalAgentControl {
         }
     }
 
+    /// Whether `target` is a spawned descendant of `caller` in the persisted spawn graph,
+    /// falling back to agent-path lineage (`/root/a` parents `/root/a/b`) without one.
+    async fn target_within_caller_tree(
+        &self,
+        state: &crate::thread_manager::ThreadManagerState,
+        caller: ThreadId,
+        target: ThreadId,
+    ) -> bool {
+        if caller == target {
+            return true;
+        }
+        if let Some(graph) = state.agent_graph_store()
+            && graph
+                .list_thread_spawn_descendants(caller, None)
+                .await
+                .is_ok_and(|descendants| descendants.contains(&target))
+        {
+            return true;
+        }
+        let caller_path = self
+            .get_agent_metadata(caller)
+            .and_then(|metadata| metadata.agent_path);
+        let target_path = self
+            .get_agent_metadata(target)
+            .and_then(|metadata| metadata.agent_path);
+        match (caller_path, target_path) {
+            (Some(caller_path), Some(target_path)) => target_path
+                .as_str()
+                .starts_with(&format!("{}/", caller_path.as_str())),
+            _ => false,
+        }
+    }
+
     /// Validate the effective provider/model pair a settings update leaves behind.
     ///
     /// Resolves the destination's current pair (live config for loaded targets, stored
@@ -414,7 +458,7 @@ impl LocalAgentControl {
         state: &crate::thread_manager::ThreadManagerState,
         caller: ThreadId,
         target: ThreadId,
-        overrides: &ThreadSettingsOverrides,
+        overrides: &mut ThreadSettingsOverrides,
     ) -> Result<()> {
         if overrides.model.is_none()
             && overrides.model_provider.is_none()
@@ -477,12 +521,6 @@ impl LocalAgentControl {
         if !pair_changed && !effort_set {
             return Ok(());
         }
-        let effective_model = overrides.model.clone().or(current_model);
-        let Some(model) = effective_model else {
-            return Err(CodexErr::InvalidRequest(
-                "settings update requires a resolvable target model".to_string(),
-            ));
-        };
         // Catalog/effort checks run against the destination provider's manager, which needs
         // the same overlays and discovery as the shared manager-built one.
         let mut validation_config = caller_config.clone();
@@ -494,8 +532,10 @@ impl LocalAgentControl {
             validation_config.model_provider = provider_info;
             validation_config.model_provider_id = effective_provider_id.clone();
         }
+        // The shared manager only serves the default provider; anything else — including a
+        // caller that already switched to it — needs a manager built for the effective provider.
         let models_manager: codex_models_manager::manager::SharedModelsManager =
-            if effective_provider_id == caller_config.model_provider_id {
+            if effective_provider_id == state.default_model_provider_id() {
                 state.shared_models_manager()
             } else {
                 crate::thread_manager::build_models_manager(
@@ -509,6 +549,39 @@ impl LocalAgentControl {
                 validation_config.http_client_factory(),
             )
             .await;
+        // Provider-only updates adopt the provider's default model, matching spawn semantics.
+        if overrides.model.is_none() && overrides.model_provider.is_some() {
+            let default_model = available_models
+                .iter()
+                .find(|preset| {
+                    preset.is_default
+                        && crate::agent::child_config::model_supports_multi_agent_backend(
+                            preset,
+                            MultiAgentVersion::V2,
+                        )
+                })
+                .or_else(|| {
+                    available_models.iter().find(|preset| {
+                        preset.show_in_picker
+                            && crate::agent::child_config::model_supports_multi_agent_backend(
+                                preset,
+                                MultiAgentVersion::V2,
+                            )
+                    })
+                })
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "Provider `{effective_provider_id}` has no models usable by agents; pass `model` explicitly"
+                    ))
+                })?;
+            overrides.model = Some(default_model.model.clone());
+        }
+        let effective_model = overrides.model.clone().or(current_model);
+        let Some(model) = effective_model else {
+            return Err(CodexErr::InvalidRequest(
+                "settings update requires a resolvable target model".to_string(),
+            ));
+        };
         if pair_changed
             && !available_models.iter().any(|preset| {
                 preset.model == model

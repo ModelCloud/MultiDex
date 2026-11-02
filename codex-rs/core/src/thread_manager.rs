@@ -344,9 +344,6 @@ pub struct StartThreadOptions {
     pub reserved_thread_id: Option<ThreadId>,
     /// Initial thread-owned plugin selection; omission restores persisted settings.
     pub disabled_plugin_ids: Option<Vec<String>>,
-    /// Destination-provider models manager for a cross-provider child; `None` shares the
-    /// manager-wide provider.
-    pub models_manager: Option<SharedModelsManager>,
 }
 
 /// A private, non-sharing provider also detaches a resumed root from its previous live provider.
@@ -409,7 +406,6 @@ impl StartThreadOptions {
             client_mcp_extensions: ClientMcpExtensions::default(),
             reserved_thread_id: None,
             disabled_plugin_ids: None,
-            models_manager: None,
         }
     }
 }
@@ -536,6 +532,9 @@ pub(crate) struct ThreadManagerState {
     agent_control_factory: Option<AgentControlFactory>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    /// Provider id `models_manager` was built for; threads on another provider get a manager
+    /// built from their own config instead.
+    default_model_provider_id: String,
     git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
@@ -768,6 +767,7 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
                 models_manager,
+                default_model_provider_id: config.model_provider_id.clone(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -976,8 +976,9 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
-                models_manager: create_model_provider(provider, Some(auth_manager.clone()))
+                models_manager: create_model_provider(provider.clone(), Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                default_model_provider_id: provider.name.clone(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -2016,6 +2017,29 @@ impl ThreadManagerState {
         Arc::clone(&self.models_manager)
     }
 
+    /// The provider id `self.models_manager` was built for. Threads pinned to a different
+    /// provider need their own manager built from their effective config.
+    pub(crate) fn default_model_provider_id(&self) -> &str {
+        &self.default_model_provider_id
+    }
+
+    /// Manager for a spawned or resumed thread: the shared manager serves the default
+    /// provider; any other provider gets a fresh manager built from the thread's config so
+    /// cold restore keeps a cross-provider child on its own catalog.
+    fn models_manager_for_spawn(
+        &self,
+        config: &Config,
+        auth_manager: &Arc<AuthManager>,
+        originator: &str,
+    ) -> SharedModelsManager {
+        let base = if config.model_provider_id == self.default_model_provider_id {
+            Arc::clone(&self.models_manager)
+        } else {
+            build_models_manager(config, Arc::clone(auth_manager))
+        };
+        base.for_originator(originator).unwrap_or(base)
+    }
+
     pub(crate) async fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -2441,7 +2465,6 @@ impl ThreadManagerState {
             client_mcp_extensions,
             mut reserved_thread_id,
             disabled_plugin_ids,
-            models_manager: requested_models_manager,
         } = options;
         if resume_preparation.is_some()
             && (config.ephemeral || !matches!(&initial_history, InitialHistory::Resumed(_)))
@@ -2683,6 +2706,8 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
+        let models_manager =
+            self.models_manager_for_spawn(&config, &auth_manager, &startup_context.originator);
         let spawn_result = Session::spawn(SessionSpawnArgs {
             attached_thread,
             startup,
@@ -2692,17 +2717,7 @@ impl ThreadManagerState {
             instructions: startup_context.instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: requested_models_manager
-                .and_then(|manager| {
-                    manager
-                        .for_originator(&startup_context.originator)
-                        .or(Some(manager))
-                })
-                .or_else(|| {
-                    self.models_manager
-                        .for_originator(&startup_context.originator)
-                })
-                .unwrap_or_else(|| Arc::clone(&self.models_manager)),
+            models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),

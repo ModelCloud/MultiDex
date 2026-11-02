@@ -1546,24 +1546,22 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     exposure,
                     native_review,
                 );
-                if turn_context
-                    .config
-                    .multi_agent_v2
-                    .expose_spawn_agent_model_overrides
-                {
-                    registry.register_trusted_with_native_review(
-                        multi_agent_v2_handler(
-                            SetAgentSettingsHandlerV2,
-                            tool_namespace,
-                            model_messages
-                                .multi_agent_tool_description_override("set_agent_settings"),
-                            model_messages
-                                .multi_agent_tool_parameters_override("set_agent_settings"),
-                        ),
-                        exposure,
-                        native_review,
-                    );
-                }
+            }
+            if turn_context
+                .config
+                .multi_agent_v2
+                .expose_spawn_agent_model_overrides
+            {
+                registry.register_trusted_with_native_review(
+                    multi_agent_v2_handler(
+                        SetAgentSettingsHandlerV2,
+                        tool_namespace,
+                        model_messages.multi_agent_tool_description_override("set_agent_settings"),
+                        model_messages.multi_agent_tool_parameters_override("set_agent_settings"),
+                    ),
+                    exposure,
+                    native_review,
+                );
             }
             if turn_context.config.multi_agent_v2.wait_agent_enabled {
                 registry.register_trusted_with_exposure(

@@ -276,6 +276,7 @@ impl CollabAgentToolCallItem {
         match self.tool {
             // V2 records these tool items privately for analytics, not legacy UI events.
             CollabAgentTool::SendMessage
+            | CollabAgentTool::SetAgentSettings
             | CollabAgentTool::FollowupTask
             | CollabAgentTool::InterruptAgent
             | CollabAgentTool::ListAgents => None,
@@ -335,6 +336,7 @@ impl CollabAgentToolCallItem {
         let receiver_thread_id = self.receiver_thread_ids.first().copied();
         match self.tool {
             CollabAgentTool::SendMessage
+            | CollabAgentTool::SetAgentSettings
             | CollabAgentTool::FollowupTask
             | CollabAgentTool::InterruptAgent
             | CollabAgentTool::ListAgents => None,
