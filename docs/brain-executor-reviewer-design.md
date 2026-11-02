@@ -130,7 +130,8 @@ credentials or assumes a shared host.
 The conceptual envelope includes `protocol_version`, `message_id` and
 `idempotency_key`, `team_id`, source session ID/role/display name,
 `destination_session_id`, task or review-round ID, optional reviewed head SHA,
-kind (`task`, `question`, `answer`, `progress`, `result`, or `cancel`),
+kind (`task`, `question`, `answer`, `progress`, `status_query`, `status_reply`,
+`result`, or `cancel`),
 `correlation_id`/`in_reply_to`, payload or artifact references, sequence, and
 creation/expiry timestamps. The host stamps the authenticated source, validates
 membership and permissions, and scopes payloads and artifact access to the
@@ -162,6 +163,50 @@ grunt peer question/reply, reviewer factual clarification and post-seal
 exchange, reconnect replay and duplicate IDs, unavailable hosts, denied native
 approval, wrong-team or spoofed sources, shared-source preflight, stale rounds,
 and review isolation. These are design targets, not tests run by this proposal.
+
+### Non-destructive brain/worker status ping/pong
+
+Negotiate a status-control capability that lets the brain query a live grunt
+or reviewer and receive its summary without replacing or ending the assignment.
+`status_query` carries a query/correlation ID, team/task/attempt identity,
+destination, deadline, and scope: `now`, `since_time` with a UTC timestamp, or
+`since_commit` with a full repository commit SHA.
+
+At a safe execution boundary, the worker reads the control request, summarizes
+its activity, sends `status_reply` through the host mailbox, then continues
+the same task/session/attempt/workspace. The reply includes current action and
+phase, work completed within the scope, pending work/blockers, head SHA and
+dirty-work status, check progress, artifact references, observation timestamp,
+event watermark, and any coverage limits. It is not the task's terminal result
+and must arrive while the task is still in progress when the worker can yield.
+
+Do not implement ping as a fresh assignment, blind steering text, concurrent
+model turn, or interruption that kills a running tool. MultiDex's adapter must
+preserve the worker's execution position and role restrictions. If a tool is
+busy, send separately identified runtime-observed status and leave the
+worker-authored reply pending until a safe yield. Unsupported control injection,
+disconnects, and deadlines return explicit capability/unavailable/timeout
+states; never claim a stale heartbeat is a current worker-authored answer.
+
+Use coarse task events/checkpoints and available code/test artifacts, not a
+second full transcript or continuous reasoning snapshot. Resolve time windows
+against event timestamps and sequence watermarks; validate commit anchors and
+their relationship to observed HEAD, reporting dirty edits separately.
+Missing, ambiguous, non-ancestor, or expired anchors yield an explicit partial
+or unsupported answer instead of a substituted range.
+
+Preserve query IDs, acknowledgement state, and attempt/revision correlation
+through reconnects. Duplicate pings do not repeat task work, late pongs cannot
+be attributed to replacement attempts, and status replies cannot resurrect
+cancelled jobs. The host bounds frequency and size; no extra grunt slot is
+allocated for a query. Reviewer pongs describe inspection progress/blockers,
+not unsealed findings or sibling deliberation.
+
+Future tests must observe a mid-task agent-authored reply followed by continued
+execution in the same session, for grunts and reviewers, and cover scoped
+queries, long-running commands, unsupported capabilities, deduplication,
+disconnect/reconnect, invalid anchors, and stale attempts. The host/backend
+contract is proposed here; no status channel is implemented by this PR.
 
 ## Context lifecycle
 
