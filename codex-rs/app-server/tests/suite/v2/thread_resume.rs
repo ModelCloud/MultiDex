@@ -6940,6 +6940,15 @@ async fn thread_resume_recovers_after_provider_configuration_is_restored(
         thread_id,
         ..Default::default()
     };
+    if configured {
+        // The saved provider is defined, so the ambient default differing from
+        // it is a provider hand-off and the resume must be admitted on the
+        // saved route instead of failing read-only.
+        let id = client.send_thread_resume_request(params.clone()).await?;
+        let resumed: ThreadResumeResponse = client.read_response(id).await?;
+        assert_eq!(resumed.model_provider, "old_provider");
+        return Ok(());
+    }
     let id = client.send_thread_resume_request(params.clone()).await?;
     let error = client
         .read_stream_until_error_message(RequestId::Integer(id))
@@ -6950,33 +6959,8 @@ async fn thread_resume_recovers_after_provider_configuration_is_restored(
             .data
             .as_ref()
             .expect("provider error should include structured data")["type"],
-        if configured {
-            "modelProviderMismatch"
-        } else {
-            "modelProviderNotConfigured"
-        }
+        "modelProviderNotConfigured"
     );
-    if configured {
-        for overrides in [
-            ThreadResumeParams {
-                model_provider: Some("mock_provider".into()),
-                ..params.clone()
-            },
-            ThreadResumeParams {
-                config: Some(std::collections::HashMap::from([(
-                    "model_provider".into(),
-                    json!("mock_provider"),
-                )])),
-                ..params.clone()
-            },
-        ] {
-            let id = client.send_thread_resume_request(overrides).await?;
-            let overridden = client
-                .read_stream_until_error_message(RequestId::Integer(id))
-                .await?;
-            assert_eq!(overridden.error, error.error);
-        }
-    }
     let id = client
         .send_raw_request(
             "thread/read",

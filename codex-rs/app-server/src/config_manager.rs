@@ -430,24 +430,40 @@ impl ConfigManager {
         Ok(CloudStartupConfig { bootstrap, config })
     }
 
-    /// Admits resumed threads and input only on the currently selected provider.
+    /// Admits resumed threads and input under current managed provider requirements.
+    ///
+    /// This deliberately does *not* compare the thread's provider against the
+    /// ambient `config.toml` selection. A thread carries its own route and
+    /// Codex honours it for every turn: `thread/settings/update` applies a
+    /// `modelProvider` override to the live thread, and a resumed rollout is
+    /// read back from `session_meta.model_provider`. The ambient selection is
+    /// only the default for *new* threads, so a divergence means the user
+    /// switched providers — either through the picker or by materializing a
+    /// different profile — and is not a broken chat.
+    ///
+    /// Rejecting here made a provider switch impossible to complete: the
+    /// picker writes the new provider to the config, after which the thread's
+    /// still-old route no longer matched and every turn, including the one
+    /// that would apply the switch, failed read-only with
+    /// "This chat uses X, but Codex now uses Y". MultiDex is meant to hand
+    /// off between OpenAI, the local endpoint, and the gateway providers
+    /// inside one chat, so the route the thread already holds is authoritative.
+    ///
+    /// Managed policy is still enforced: `check_thread_model_provider`
+    /// rejects a retained route an organization requirement no longer allows.
+    /// A configuration that fails to load also still rejects input, because an
+    /// unreadable config may be concealing a provider or policy change.
     pub(crate) async fn check_thread_model_provider_for_input(
         &self,
         current: &Config,
     ) -> std::io::Result<()> {
         self.check_thread_model_provider(current).await?;
-        let configured = self
-            .load_latest_config(Some(current.cwd.to_path_buf()))
+        // Still fail closed when the ambient configuration cannot be resolved.
+        // An unparseable or unreadable config can be hiding a provider change,
+        // so input is refused until it loads — but the *selection* it resolves
+        // is deliberately not compared: the thread's own route wins.
+        self.load_latest_config(Some(current.cwd.to_path_buf()))
             .await?;
-        if current.model_provider_id != configured.model_provider_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                ModelProviderError::ModelProviderMismatch {
-                    model_provider: current.model_provider_id.clone(),
-                    current_model_provider: configured.model_provider_id,
-                },
-            ));
-        }
         Ok(())
     }
 
@@ -550,11 +566,6 @@ impl ConfigManager {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
-        // Resolve the selection before the saved provider is applied as a resume override.
-        let current_provider = self
-            .load_latest_config(typesafe_overrides.cwd.clone().or_else(|| cwd.clone()))
-            .await
-            .map(|config| config.model_provider_id);
         self.load_with_validation(
             &self.current_cli_overrides(),
             request_overrides,
@@ -593,21 +604,13 @@ impl ConfigManager {
                         ));
                     }
                 }
-                let current_provider = current_provider?;
-                for provider in [
-                    saved_provider.unwrap_or(requested_provider),
-                    requested_provider,
-                ] {
-                    if provider != current_provider {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            ModelProviderError::ModelProviderMismatch {
-                                model_provider: provider.to_owned(),
-                                current_model_provider: current_provider,
-                            },
-                        ));
-                    }
-                }
+                // A resume is admitted on the route the thread is being resumed
+                // under: an explicit ``modelProvider`` override, else the one
+                // persisted in the rollout. The ambient selection is only the
+                // default for a new thread, so a divergence is a provider
+                // hand-off, not a corrupt chat. Both candidates above were
+                // already checked against managed policy and provider
+                // definitions, which is what actually has to hold.
                 Ok(())
             },
         )
