@@ -172,6 +172,22 @@ or reviewer and receive its summary without replacing or ending the assignment.
 destination, deadline, and scope: `now`, `since_time` with a UTC timestamp, or
 `since_commit` with a full repository commit SHA.
 
+All brain/sub-agent messages use asynchronous send-and-callback semantics.
+Return a durable acceptance receipt and message/query ID promptly; do not hold
+the sender's tool invocation open until an agent reply arrives. The brain
+continues other work without polling, and multiple outstanding queries may
+receive replies out of order.
+
+Preserve the email-like reply envelope: authenticated source session/agent ID,
+role/display name, destination team/brain, message ID, `in_reply_to` and
+correlation ID, task/attempt/revision, typed payload, timestamps, and status.
+Omnigent retains the original question/reference and delivers replies or
+timeout/refusal/cancellation events to the brain's inbox at a safe boundary,
+waking it if idle. These are runtime callbacks, not executable functions or
+concurrent turns against the same conversation. Forward and acknowledge by
+message ID; never associate a reply with whichever question was asked last.
+Acceptance, delivery, and a completed reply remain distinct states.
+
 At a safe execution boundary, the worker reads the control request, summarizes
 its activity, sends `status_reply` through the host mailbox, then continues
 the same task/session/attempt/workspace. The reply includes current action and
@@ -207,6 +223,9 @@ execution in the same session, for grunts and reviewers, and cover scoped
 queries, long-running commands, unsupported capabilities, deduplication,
 disconnect/reconnect, invalid anchors, and stale attempts. The host/backend
 contract is proposed here; no status channel is implemented by this PR.
+Also verify that the brain progresses after send, that replies delivered in
+reverse query order keep correct correlation, and that replayed callbacks after
+reconnect do not duplicate work or require the brain to poll.
 
 ## Context lifecycle
 
