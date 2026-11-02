@@ -262,13 +262,98 @@ deadlines, retries, stale rounds, and partial failure. A newer publication never
 inherits approval from an older review. Configured reviewers must all finish
 successfully before the host labels that round complete.
 
+## Resumption contract
+
+BGR must tolerate an individual brain/grunt/reviewer failure and a whole-team
+or server outage without persisting every agent's internal state. Omnigent owns
+a compact durable recovery ledger plus artifact storage; model context and
+MultiDex process-local state are not authoritative copies. The companion
+design defines the ledger and coordinator recovery protocol.
+
+The backend contributes coarse checkpoints, not token-by-token snapshots:
+
+- Team/task/round identity, logical agent ID, role/display name, backend
+  session/thread ID, host, attempt ID, and current coordinator fencing epoch.
+- Accepted contract and resolved profile revision, launch acknowledgement,
+  coarse phase, last checkpoint and heartbeat, blocker, and terminal status.
+- Exact repository/base/result revisions, workspace identity, durable
+  patch/checkpoint references and checksums, and tested-revision evidence.
+- Message IDs/acknowledgement cursors and resumability information: whether a
+  live session can reattach, a native session can resume, or only a fresh
+  attempt from durable artifacts is possible.
+
+Expose status/reconnect/checkpoint/cancel capabilities through the negotiated
+host contract, using existing thread and persistence abstractions. A backend
+resume handle is access-controlled metadata, not an API key in a job payload.
+Preserve upstream transcript/context construction; do not introduce a second
+transcript format or claim that providers share resumable conversations.
+
+### Reattach versus reconstruct
+
+If the same attempt is still alive, reconnect to it only after checking its
+identity, role ceiling, profile, and workspace. A transport timeout is not
+proof of process death. Report an existing persisted completion instead of
+starting duplicate work after a lost acknowledgement.
+
+When native session context is available and valid, the host may resume that
+same attempt. When it is unavailable, report that explicitly: Omnigent creates
+a fresh attempt using the original contract, latest verified code artifact,
+completed evidence, and pending instructions. Missing uncheckpointed edits
+may need to be redone; never imply that a fresh session recovers lost reasoning.
+The logical task persists, but replacement attempt/session IDs are new.
+
+A grunt checkpoints only at safe milestones, such as a recoverable patch or
+local commit and completed checks. Recovery artifacts go to host-managed
+durable storage; a local commit on a lost machine is not durable protection.
+This does not grant grunts remote push or PR permissions. Checks are reusable
+only when their revision and relevant environment match; arbitrary commands
+with uncertain side effects must not be automatically replayed.
+
+A reviewer may reattach to its same live attempt. If replacement is needed,
+create a new reviewer session/name for the frozen revision and contract, with
+no partial transcript or sibling findings. The host preserves other sealed
+slots, retries only the failed slot, and creates a new round if head or review
+configuration changed. Missing reviewers never count as approval.
+
+### Fencing and collective recovery
+
+The host supplies a coordinator epoch and attempt lease. Reject stale dispatch,
+resume, and result-advancement requests at the backend boundary. Lease expiry
+prevents new work; an already-running local command may still finish. Before a
+replacement writes, confirm the prior process tree is stopped or safely
+isolated; never run two attempts in the same writable workspace. If the backend
+cannot fence/isolate a disconnected attempt, report a blocker rather than
+silently starting another one.
+
+When the brain disappears, grunts may checkpoint/finish only already authorized
+bounded work while leases permit; they do not promote themselves to brain.
+Results remain available for the recovered parent. Omnigent restores one active
+logical `brain`, reconstructs its task map and pending decisions from the
+ledger when native context is unavailable, and reconciles parent/child routing
+without weakening ownership or native approvals. MultiDex reports process and
+artifact reality; it does not elect a second coordinator.
+
+On collective restart, await host reconciliation before accepting new jobs.
+Preserve cancellation and terminal state, retain stale-attempt results for
+diagnosis without applying them, and report unavailable artifacts explicitly.
+Omnigent reconciles remote pushes and PR-note markers before retrying uncertain
+publication; workers never infer successful publication from local state.
+
+Future tests must distinguish reconnect from confirmed process loss; cover
+lost launch/completion acknowledgements, missing native context or worktrees,
+partial checkpoints, stale epochs, two recovery coordinators, one lost review
+slot, and whole-team restart. Assert preserved role restrictions and task IDs,
+new replacement attempt IDs, no duplicate writers, no silent loss or false
+success, and fresh-context replacement review. These are future tests, not
+checks performed by this design PR.
+
 ## Implementation sequence and future verification
 
 1. Agree the versioned host/backend contract and capability handshake.
 2. Wire explicit selections and role restrictions through existing thread and
    child configuration paths without changing ordinary session behavior.
-3. Add fresh reviewer execution, structured results, and cancellation/reconnect
-   correlation using existing review/mailbox primitives.
+3. Add fresh reviewer execution, structured results, safe checkpoint/resume,
+   and cancellation/reconnect correlation using existing review/mailbox primitives.
 4. Integrate with the BGR selection in the Omnigent server/host UI.
 
 Acceptance tests for future implementation, not validation performed by this PR:
