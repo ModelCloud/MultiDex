@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use crate::agent::api::AgentControl;
 use crate::agent::control::LocalAgentRuntime;
@@ -125,7 +123,6 @@ pub(crate) struct SessionServices {
 pub(crate) struct SwappableModelsManager {
     inner: ArcSwap<SharedModelsManager>,
     auth_manager: Arc<AuthManager>,
-    api_key_model_discovery_enabled: AtomicBool,
 }
 
 impl SwappableModelsManager {
@@ -133,15 +130,11 @@ impl SwappableModelsManager {
         Self {
             inner: ArcSwap::from_pointee(manager),
             auth_manager,
-            api_key_model_discovery_enabled: AtomicBool::new(false),
         }
     }
 
     /// Point this handle at a manager built for the session's new provider.
     pub(crate) fn swap(&self, manager: SharedModelsManager) {
-        manager.set_api_key_model_discovery_enabled(
-            self.api_key_model_discovery_enabled.load(Ordering::Relaxed),
-        );
         self.inner.store(Arc::new(manager));
     }
 }
@@ -160,8 +153,6 @@ impl ModelsManager for SwappableModelsManager {
     }
 
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
-        self.api_key_model_discovery_enabled
-            .store(enabled, Ordering::Relaxed);
         self.inner
             .load()
             .set_api_key_model_discovery_enabled(enabled);

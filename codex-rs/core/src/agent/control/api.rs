@@ -476,8 +476,8 @@ impl LocalAgentControl {
             .clone();
         let (current_provider_id, current_model) = match state.get_thread(target).await {
             Ok(thread) => {
-                let config = thread.session.get_config().await;
-                (config.model_provider_id.clone(), config.model.clone())
+                let snapshot = thread.config_snapshot().await;
+                (snapshot.model_provider_id, Some(snapshot.model))
             }
             Err(_) => {
                 let stored = state
@@ -545,7 +545,11 @@ impl LocalAgentControl {
             };
         let available_models = models_manager
             .list_models(
-                codex_models_manager::manager::RefreshStrategy::Offline,
+                if effective_provider_id == state.default_model_provider_id() {
+                    codex_models_manager::manager::RefreshStrategy::Offline
+                } else {
+                    codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
+                },
                 validation_config.http_client_factory(),
             )
             .await;

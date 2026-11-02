@@ -23,6 +23,7 @@ use codex_extension_api::SessionIsolation;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
+use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::approvals::ExecPolicyAmendment;
@@ -3291,6 +3292,88 @@ async fn injected_models_manager_controls_refresh_policy() {
         2
     );
     assert!(!config.codex_home.join("models_cache.json").exists());
+}
+
+#[tokio::test]
+async fn multi_agent_v2_override_regression_swappable_manager_preserves_discovery_policy() {
+    for discovery_enabled in [true, false] {
+        let server = MockServer::start().await;
+        let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.5");
+        model.slug = "provider-only-discovery-model".to_string();
+        model.display_name = "Provider-only discovery model".to_string();
+        model.description = Some("Metadata from the provider catalog".to_string());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/catalog"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(ModelsResponse {
+                    models: vec![model],
+                }),
+            )
+            .expect(if discovery_enabled { 1 } else { 0 })
+            .mount(&server)
+            .await;
+
+        let home = tempdir().expect("unique codex home");
+        let mut config = test_config().await;
+        config.codex_home =
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(home.path())
+                .expect("temporary codex home should resolve");
+        config.cwd = config.codex_home.clone();
+        config.model_catalog = None;
+        config.model_provider.name = "discovery-test-provider".to_string();
+        config.model_provider.base_url = Some(server.uri());
+        config.model_provider.model_catalog_url = Some(format!("{}/catalog", server.uri()).into());
+        config.model_provider.experimental_bearer_token = Some("test-provider-token".into());
+        config.model_provider_id = "discovery-test-provider".to_string();
+
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+        if discovery_enabled {
+            config
+                .features
+                .enable(codex_features::Feature::ApiKeyModelDiscovery)
+                .expect("enable API-key model discovery");
+        } else {
+            config
+                .features
+                .disable(codex_features::Feature::ApiKeyModelDiscovery)
+                .expect("disable API-key model discovery");
+        }
+        let initial_manager = build_models_manager(&config, auth_manager.clone());
+        let replacement_manager = build_models_manager(&config, auth_manager.clone());
+        let swappable = crate::state::SwappableModelsManager::new(initial_manager, auth_manager);
+        swappable.swap(replacement_manager);
+
+        let catalog = swappable
+            .model_catalog_with_origins(
+                RefreshStrategy::OnlineIfUncached,
+                crate::test_support::default_http_client_factory(),
+            )
+            .await;
+        let fetched_model = catalog
+            .iter()
+            .find(|entry| entry.model.slug == "provider-only-discovery-model");
+        if discovery_enabled {
+            let fetched_model = fetched_model.expect("provider model should be discovered");
+            assert_eq!(
+                fetched_model.model.display_name,
+                "Provider-only discovery model"
+            );
+            assert_eq!(
+                fetched_model.model.description.as_deref(),
+                Some("Metadata from the provider catalog")
+            );
+            assert_eq!(
+                fetched_model.origin,
+                codex_protocol::openai_models::ModelOrigin::Provider
+            );
+        } else {
+            assert!(fetched_model.is_none());
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            usize::from(discovery_enabled)
+        );
+    }
 }
 
 #[test]

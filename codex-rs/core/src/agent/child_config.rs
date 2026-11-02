@@ -289,10 +289,15 @@ async fn apply_requested_spawn_agent_model_overrides(
     let models_manager: &dyn codex_models_manager::manager::ModelsManager = override_models_manager
         .as_deref()
         .unwrap_or(session.services.models_manager.as_ref());
+    let refresh_strategy = if cross_provider {
+        RefreshStrategy::OnlineIfUncached
+    } else {
+        RefreshStrategy::Offline
+    };
 
     if let Some(requested_model) = requested_model {
         let available_models = models_manager
-            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .list_models(refresh_strategy, config.http_client_factory())
             .await;
         let selected_model_name = find_spawn_agent_model_name(
             &available_models,
@@ -321,7 +326,7 @@ async fn apply_requested_spawn_agent_model_overrides(
     // Provider changed without an explicit model: pick the new provider's default catalog entry.
     if cross_provider && requested_model.is_none() {
         let available_models = models_manager
-            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .list_models(refresh_strategy, config.http_client_factory())
             .await;
         let selected_model = available_models
             .iter()
