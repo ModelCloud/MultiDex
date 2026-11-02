@@ -255,8 +255,7 @@ gh release upload multidex-build-<version>-<shortsha> --repo ModelCloud/MultiDex
 gh release edit multidex-build-<version>-<shortsha> --repo ModelCloud/MultiDex --draft=false
 ```
 
-`ModelCloud/LocalDex` now redirects to `ModelCloud/MultiDex` (same repo, renamed); either name
-works but `MultiDex` is canonical.
+`ModelCloud/MultiDex` is the canonical repo name.
 
 Publishing a partial release is safe — `latest` resolves per-target — but a release missing
 `-ubuntu24.04` causes the stale-fallback bug described above, so check all four names are present

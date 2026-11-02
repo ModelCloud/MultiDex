@@ -55,9 +55,9 @@ direction.
 Built-in providers also accept only a limited override set. Fields that are ordinary on a
 custom provider — `request_max_retries`, `stream_idle_timeout_ms`, `name`, and similar — abort
 the load on a built-in provider in every recent release. Legacy
-`~/.local/share/{localdex,multidex}/config.toml` copies often carry them, so they can already be
-unloadable before a new release is installed; prune them to the accepted set rather than
-assuming the file was working.
+`~/.local/share/multidex/config.toml` copies often carry them, so they can already be unloadable
+before a new release is installed; prune them to the accepted set rather than assuming the file
+was working.
 
 Two traps when scripting the migration:
 

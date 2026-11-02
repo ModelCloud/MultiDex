@@ -303,20 +303,14 @@ name = "Gateway"
     manager
         .check_thread_model_provider_for_input(&current)
         .await?;
+    // A thread keeps the route it is admitted under: the ambient selection in
+    // ``config.toml`` (here ``openai``) is only the default for *new* threads.
+    // A divergence means the user picked another provider and must still be
+    // able to send input, otherwise a switch could never complete.
     let default_manager =
         ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
-    let error = default_manager
+    default_manager
         .check_thread_model_provider_for_input(&current)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<ModelProviderError>()),
-        Some(&ModelProviderError::ModelProviderMismatch {
-            model_provider: "gateway".into(),
-            current_model_provider: "openai".into(),
-        })
-    );
+        .await?;
     Ok(())
 }

@@ -136,18 +136,63 @@ base_url = "{}/v1"
     } else {
         requirements.replace(gateway.uri(), &other.uri())
     };
-    let provider_error = if required_selection == "default" {
+    // Changing the ambient default selection is a provider hand-off, not a
+    // corrupted thread: the thread keeps the route it holds and stays usable.
+    // Only a managed policy change may reject the retained route.
+    if required_selection == "default" {
         let path = home.path().join("config.toml");
         let config = std::fs::read_to_string(&path)?;
         std::fs::write(
             path,
             config.replace("model_provider = \"gateway\"", "model_provider = \"other\""),
         )?;
-        codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
-            model_provider: "gateway".into(),
-            current_model_provider: "other".into(),
+        // Admission only: these must be answered, not rejected with
+        // ``modelProviderMismatch``. The retained route is unchanged, so the
+        // thread keeps talking to the gateway it was started on.
+        for (method, params) in [
+            ("thread/resume", json!({"threadId": started.thread.id})),
+            (
+                "thread/goal/set",
+                json!({"threadId": started.thread.id, "objective": "New goal"}),
+            ),
+            ("thread/goal/get", json!({"threadId": started.thread.id})),
+        ] {
+            let id = server.send_raw_request(method, Some(params)).await?;
+            server
+                .read_response::<serde_json::Value>(id)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{method} must stay admitted after the ambient provider changes: {err}")
+                });
         }
-    } else {
+        // The retained thread must still be routed to its own provider, never
+        // silently redirected to the new ambient default.
+        let id = server
+            .send_raw_request(
+                "thread/read",
+                Some(json!({"threadId": started.thread.id, "includeTurns": false})),
+            )
+            .await?;
+        let read: codex_app_server_protocol::ThreadReadResponse = server.read_response(id).await?;
+        assert_eq!(read.thread.model_provider, "gateway");
+        assert!(
+            other
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "ambient selection must not redirect the retained thread"
+        );
+        release_response.send(()).expect("release active response");
+        timeout(
+            wait,
+            server.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        gateway.shutdown().await;
+        return Ok(());
+    }
+    let provider_error = {
         std::fs::write(requirements_path, updated)?;
         codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
             model_provider: "gateway".into(),
@@ -318,20 +363,14 @@ async fn provider_selection_can_be_restored_for_existing_threads() -> Result<()>
         }],
         ..Default::default()
     };
+    // The thread keeps its retained route after the ambient default changes,
+    // so the very next turn must reach it rather than fail read-only.
     let id = server.send_turn_start_request(params.clone()).await?;
-    let error = server
-        .read_stream_until_error_message(RequestId::Integer(id))
+    let _: TurnStartResponse = server.read_response(id).await?;
+    server
+        .read_stream_until_notification_message("turn/completed")
         .await?;
-    assert_eq!(
-        error.error.data,
-        Some(serde_json::to_value(
-            codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
-                model_provider: "mock_provider".into(),
-                current_model_provider: "openai".into(),
-            }
-        )?)
-    );
-    assert!(requests.requests().is_empty());
+    assert_eq!(requests.requests().len(), 1);
     let id = server
         .send_raw_request(
             "thread/read",
@@ -340,13 +379,6 @@ async fn provider_selection_can_be_restored_for_existing_threads() -> Result<()>
         .await?;
     let read: codex_app_server_protocol::ThreadReadResponse = server.read_response(id).await?;
     assert_eq!(read.thread.model_provider, "mock_provider");
-    std::fs::write(path, original)?;
-    let id = server.send_turn_start_request(params).await?;
-    let _: TurnStartResponse = server.read_response(id).await?;
-    server
-        .read_stream_until_notification_message("turn/completed")
-        .await?;
-    assert_eq!(requests.requests().len(), 1);
     Ok(())
 }
 
