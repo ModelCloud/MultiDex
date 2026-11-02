@@ -22,6 +22,7 @@ use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
@@ -67,6 +68,18 @@ pub trait AgentControl: Send + Sync {
     /// and wake mode: queue-only messages do not start work and follow-ups cannot target
     /// the root. Legacy user input can address loaded threads outside the agent registry.
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>>;
+
+    /// Apply sparse thread-settings overrides to a loaded agent for its subsequent turns.
+    ///
+    /// Targets resolve like `send`. `CodexErr::ThreadNotFound` means the recipient is not
+    /// currently loaded; callers that need overrides to survive a cold reload should also
+    /// patch the resume config they pass to `send`.
+    fn update_thread_settings(
+        &self,
+        caller: ThreadId,
+        target: AgentTarget,
+        overrides: ThreadSettingsOverrides,
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Take queued, non-turn-starting mail in order, without loading the recipient.
     /// This in-memory operation performs no I/O; returning transfers ownership to the caller.

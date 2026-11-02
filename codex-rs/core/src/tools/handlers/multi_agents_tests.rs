@@ -1194,7 +1194,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         json!(r#"<agent name="/root/test_process" />"#),
     );
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::new(true)
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -1351,7 +1351,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         agent_role: None,
     });
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::new(true)
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1428,7 +1428,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let Err(err) = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2::new(true)
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1814,7 +1814,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::new(true).handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1869,15 +1869,13 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::new(true).handle(invocation).await else {
         panic!("send_message interrupt parameter should be rejected");
     };
     let FunctionCallError::RespondToModel(message) = err else {
         panic!("expected model-facing parse error");
     };
-    assert!(message.starts_with(
-        "failed to parse function arguments: unknown field `interrupt`, expected `target` or `message`"
-    ));
+    assert!(message.contains("unknown field `interrupt`"));
 
     let ops = manager.captured_ops();
     let ops_for_agent: Vec<&Op> = ops
@@ -1958,7 +1956,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
+    FollowupTaskHandlerV2::new(true)
         .handle(invocation(
             session,
             turn,
@@ -2099,7 +2097,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = FollowupTaskHandlerV2.handle(invocation).await else {
+    let Err(err) = FollowupTaskHandlerV2::new(true).handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -4731,4 +4729,190 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_set_agent_settings_requires_an_override() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let Err(err) = crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+        .handle(invocation(
+            session,
+            turn,
+            "set_agent_settings",
+            function_payload(json!({
+                "target": "worker",
+            })),
+        ))
+        .await
+    else {
+        panic!("set_agent_settings without overrides should be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing validation error");
+    };
+    assert!(message.contains("requires at least one"));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_set_agent_settings_updates_loaded_agent() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = turn.config.as_ref().clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .local_agent_runtime
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+
+    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+        .handle(invocation(
+            session,
+            turn,
+            "set_agent_settings",
+            function_payload(json!({
+                "target": agent_id.to_string(),
+                "model": "gpt-5.5",
+                "reasoning_effort": "high",
+            })),
+        ))
+        .await
+        .expect("set_agent_settings should succeed on a loaded agent");
+
+    let ops = manager.captured_ops();
+    assert!(ops.iter().any(|(id, op)| {
+        *id == agent_id
+            && matches!(
+                op,
+                Op::ThreadSettings { thread_settings, .. }
+                    if thread_settings.model.as_deref() == Some("gpt-5.5")
+                        && thread_settings.effort == Some(Some(ReasoningEffort::High))
+            )
+    }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_send_message_applies_settings_overrides_before_send() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = turn.config.as_ref().clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .local_agent_runtime
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+
+    SendMessageHandlerV2::new(true)
+        .handle(invocation(
+            session,
+            turn,
+            "send_message",
+            function_payload(json!({
+                "target": agent_id.to_string(),
+                "message": "continue on the smaller model",
+                "model": "gpt-5.5",
+                "reasoning_effort": "low",
+            })),
+        ))
+        .await
+        .expect("send_message with overrides should succeed");
+
+    let ops = manager.captured_ops();
+    assert!(ops.iter().any(|(id, op)| {
+        *id == agent_id
+            && matches!(
+                op,
+                Op::ThreadSettings { thread_settings, .. }
+                    if thread_settings.model.as_deref() == Some("gpt-5.5")
+                        && thread_settings.effort == Some(Some(ReasoningEffort::Low))
+            )
+    }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_rejects_unknown_provider() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = turn.config.as_ref().clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let Err(err) = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker",
+                "provider": "no-such-provider",
+            })),
+        ))
+        .await
+    else {
+        panic!("spawn_agent with an unknown provider should be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing provider error");
+    };
+    assert!(message.contains("Unknown provider `no-such-provider`"));
+    assert!(message.contains("Available providers:"));
 }

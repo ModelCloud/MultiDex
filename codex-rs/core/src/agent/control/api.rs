@@ -27,6 +27,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
 use futures::future::BoxFuture;
@@ -175,6 +176,34 @@ impl AgentControl for LocalAgentControl {
                 metadata,
                 submission_id,
             })
+        })
+    }
+
+    fn update_thread_settings(
+        &self,
+        caller: ThreadId,
+        target: AgentTarget,
+        overrides: ThreadSettingsOverrides,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let target = self.resolve_target(caller, &target)?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            self.runtime
+                .upgrade()?
+                .send_op(
+                    target,
+                    codex_protocol::protocol::Op::ThreadSettings {
+                        thread_settings: overrides,
+                        reply: Some(reply_tx),
+                    },
+                    /*parent_turn_id*/ None,
+                    /*root_turn_id*/ None,
+                    /*message_delivery*/ None,
+                )
+                .await?;
+            reply_rx.await.map_err(|_| {
+                CodexErr::InvalidRequest("thread settings update ended before replying".to_string())
+            })?
         })
     }
 

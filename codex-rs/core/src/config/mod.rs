@@ -983,6 +983,9 @@ pub struct Config {
     /// User-configured maximum number of spawned agent threads per session.
     pub agent_max_threads: Option<usize>,
 
+    /// Default provider id for spawned subagents when the spawn call does not select one.
+    pub agent_default_subagent_provider: Option<String>,
+
     /// Default model for spawned subagents when the spawn call does not select one.
     pub agent_default_subagent_model: Option<String>,
 
@@ -4179,6 +4182,10 @@ impl Config {
             .as_ref()
             .and_then(|agents| agents.max_depth)
             .unwrap_or(DEFAULT_AGENT_MAX_DEPTH);
+        let agent_default_subagent_provider = cfg
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.default_subagent_provider.clone());
         let agent_default_subagent_model = cfg
             .agents
             .as_ref()
@@ -4675,6 +4682,7 @@ impl Config {
             tool_output_token_limit: cfg.tool_output_token_limit,
             agents_enabled,
             agent_max_threads,
+            agent_default_subagent_provider,
             agent_default_subagent_model,
             agent_default_subagent_reasoning_effort,
             agent_max_depth,

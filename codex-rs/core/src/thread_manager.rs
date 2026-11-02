@@ -164,6 +164,12 @@ fn capture_test_op(op: &Op) -> Option<Op> {
             start_options: start_options.clone(),
         }),
         Op::Shutdown => Some(Op::Shutdown),
+        Op::ThreadSettings {
+            thread_settings, ..
+        } => Some(Op::ThreadSettings {
+            thread_settings: thread_settings.clone(),
+            reply: None,
+        }),
         _ => None,
     }
 }

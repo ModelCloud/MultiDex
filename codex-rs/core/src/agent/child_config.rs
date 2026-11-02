@@ -40,6 +40,8 @@ pub(crate) struct SpawnConfigOptions<'a> {
     pub(crate) version: SpawnConfigVersion,
     pub(crate) full_history_fork: bool,
     pub(crate) role_name: Option<&'a str>,
+    /// Configured `[model_providers]` id for the child; `None` inherits the caller's provider.
+    pub(crate) provider: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
@@ -65,6 +67,7 @@ pub(crate) async fn prepare_agent_spawn_config(
         session,
         step_context,
         &mut config,
+        options.provider,
         options.model,
         options.reasoning_effort,
     )
@@ -206,21 +209,61 @@ async fn apply_requested_spawn_agent_model_overrides(
     session: &Session,
     step_context: &StepContext,
     config: &mut Config,
+    requested_provider: Option<&str>,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), String> {
     let turn = step_context.turn.as_ref();
+    let requested_provider =
+        requested_provider.or(turn.config.agent_default_subagent_provider.as_deref());
     let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
     let requested_reasoning_effort = requested_reasoning_effort
         .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
-    if requested_model.is_none() && requested_reasoning_effort.is_none() {
+    if requested_provider.is_none()
+        && requested_model.is_none()
+        && requested_reasoning_effort.is_none()
+    {
         return Ok(());
     }
 
+    // A provider override selects the child's endpoint before its model is resolved, so the
+    // model must validate against that provider's catalog rather than the caller's manager.
+    if let Some(provider_id) = requested_provider {
+        let provider_info = config.model_providers.get(provider_id).cloned().ok_or_else(|| {
+            let available = config
+                .model_providers
+                .keys()
+                .map(String::as_str)
+                .take(MAX_SPAWN_AGENT_MODEL_OVERRIDES)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Unknown provider `{provider_id}` for spawn_agent. Available providers: {available}"
+            )
+        })?;
+        config.model_provider = provider_info;
+        config.model_provider_id = provider_id.to_string();
+    }
+
+    let cross_provider =
+        requested_provider.is_some_and(|provider_id| provider_id != turn.config.model_provider_id);
+    let override_models_manager = if cross_provider {
+        Some(
+            codex_model_provider::create_model_provider(
+                config.model_provider.clone(),
+                Some(std::sync::Arc::clone(&session.services.auth_manager)),
+            )
+            .models_manager_without_cache(config.model_catalog.clone()),
+        )
+    } else {
+        None
+    };
+    let models_manager: &dyn codex_models_manager::manager::ModelsManager = override_models_manager
+        .as_deref()
+        .unwrap_or(session.services.models_manager.as_ref());
+
     if let Some(requested_model) = requested_model {
-        let available_models = session
-            .services
-            .models_manager
+        let available_models = models_manager
             .list_models(RefreshStrategy::Offline, config.http_client_factory())
             .await;
         let selected_model_name = find_spawn_agent_model_name(
@@ -228,9 +271,7 @@ async fn apply_requested_spawn_agent_model_overrides(
             requested_model,
             turn.multi_agent_version,
         )?;
-        let selected_model_info = session
-            .services
-            .models_manager
+        let selected_model_info = models_manager
             .get_model_info(&selected_model_name, &config.to_models_manager_config())
             .await;
 
@@ -249,10 +290,43 @@ async fn apply_requested_spawn_agent_model_overrides(
         return Ok(());
     }
 
+    // Provider changed without an explicit model: pick the new provider's default catalog entry.
+    if cross_provider && requested_model.is_none() {
+        let available_models = models_manager
+            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .await;
+        let selected_model = available_models
+            .iter()
+            .find(|model| {
+                model.is_default
+                    && model_supports_multi_agent_backend(model, turn.multi_agent_version)
+            })
+            .or_else(|| {
+                available_models.iter().find(|model| {
+                    model.show_in_picker
+                        && model_supports_multi_agent_backend(model, turn.multi_agent_version)
+                })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Provider `{}` has no models usable by spawn_agent; pass `model` explicitly",
+                    config.model_provider_id
+                )
+            })?;
+        config.model = Some(selected_model.model.clone());
+        config.model_reasoning_effort = None;
+    }
+
     if let Some(reasoning_effort) = requested_reasoning_effort {
+        let model_info = models_manager
+            .get_model_info(
+                config.model.as_deref().unwrap_or_default(),
+                &config.to_models_manager_config(),
+            )
+            .await;
         validate_spawn_agent_reasoning_effort(
-            &step_context.settings.model_info.slug,
-            &step_context.settings.model_info.supported_reasoning_levels,
+            config.model.as_deref().unwrap_or_default(),
+            &model_info.supported_reasoning_levels,
             &reasoning_effort,
         )?;
         config.model_reasoning_effort = Some(reasoning_effort);

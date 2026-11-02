@@ -32,6 +32,8 @@ pub struct ThreadCreateRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    /// Configured provider id from `[model_providers]`; `None` inherits the caller's provider.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -43,6 +45,7 @@ pub(crate) struct ThreadSpawnRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -64,6 +67,7 @@ impl ThreadSpawnRequest {
                 task_name: self.task_name,
                 fork_mode: self.fork_mode,
                 agent_type: self.agent_type,
+                provider: self.provider,
                 model: self.model,
                 reasoning_effort: self.reasoning_effort,
             },
@@ -132,6 +136,7 @@ pub(crate) async fn prepare(
         task_name,
         fork_mode,
         agent_type,
+        provider,
         model,
         reasoning_effort,
     } = request;
@@ -146,6 +151,7 @@ pub(crate) async fn prepare(
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
             role_name,
+            provider: provider.as_deref(),
             model: model.as_deref(),
             reasoning_effort,
         },

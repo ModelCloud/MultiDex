@@ -47,6 +47,7 @@ use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTask
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
+use crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler as SetAgentSettingsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
@@ -1517,7 +1518,12 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             if !turn_context.config.multi_agent_v2.disable_direct_message {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        SendMessageHandlerV2,
+                        SendMessageHandlerV2::new(
+                            turn_context
+                                .config
+                                .multi_agent_v2
+                                .expose_spawn_agent_model_overrides,
+                        ),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("send_message"),
                         model_messages.multi_agent_tool_parameters_override("send_message"),
@@ -1527,7 +1533,12 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 );
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        FollowupTaskHandlerV2,
+                        FollowupTaskHandlerV2::new(
+                            turn_context
+                                .config
+                                .multi_agent_v2
+                                .expose_spawn_agent_model_overrides,
+                        ),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("followup_task"),
                         model_messages.multi_agent_tool_parameters_override("followup_task"),
@@ -1535,6 +1546,24 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     exposure,
                     native_review,
                 );
+                if turn_context
+                    .config
+                    .multi_agent_v2
+                    .expose_spawn_agent_model_overrides
+                {
+                    registry.register_trusted_with_native_review(
+                        multi_agent_v2_handler(
+                            SetAgentSettingsHandlerV2,
+                            tool_namespace,
+                            model_messages
+                                .multi_agent_tool_description_override("set_agent_settings"),
+                            model_messages
+                                .multi_agent_tool_parameters_override("set_agent_settings"),
+                        ),
+                        exposure,
+                        native_review,
+                    );
+                }
             }
             if turn_context.config.multi_agent_v2.wait_agent_enabled {
                 registry.register_trusted_with_exposure(
