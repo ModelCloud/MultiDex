@@ -1173,6 +1173,7 @@ async fn cancelled_v2_send_finishes_reload_registration() {
         caller: parent_id,
         target: AgentTarget::Id(child_id),
         resume_config: harness.config.clone(),
+        settings: None,
         input: AgentInput::Message {
             message: AgentMessage::Plaintext(message.to_string()),
             mode: MessageDeliveryMode::TriggerTurn,
@@ -1837,6 +1838,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
                 target: crate::AgentTarget::Id(target_thread_id),
                 resume_config: crate::agent::child_config::build_agent_resume_config(&turn)
                     .expect("capture resume config"),
+                settings: None,
                 input: crate::AgentInput::Message {
                     message: AgentMessage::Plaintext("hello after resume".to_string()),
                     mode: MessageDeliveryMode::QueueOnly,
@@ -1986,6 +1988,7 @@ async fn v2_reload_preserves_shared_instructions_after_root_unloads(
             target: crate::AgentTarget::Id(target_id),
             resume_config: crate::agent::child_config::build_agent_resume_config(&sender_turn)
                 .expect("capture resume config"),
+            settings: None,
             input: crate::AgentInput::Message {
                 message: AgentMessage::Plaintext("wake the unloaded target".to_string()),
                 mode: MessageDeliveryMode::QueueOnly,

@@ -532,7 +532,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
     config.model = Some("gpt-5.5".to_string());
-    apply_spawn_agent_service_tier(root.thread.session.as_ref(), &mut config)
+    apply_spawn_agent_service_tier(root.thread.session.as_ref(), None, &mut config)
         .await
         .expect("root preference should be resolved against the child model");
 

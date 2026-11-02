@@ -733,6 +733,7 @@ impl LocalAgentControl {
                 .map(TurnEnvironmentSnapshot::inheritable_requests),
             inherited_environments,
             disabled_plugin_ids,
+            models_manager: options.models_manager.clone(),
             ..StartThreadOptions::new(config.clone())
         };
         let fork_context = match (session_source, options.fork_mode.as_ref()) {

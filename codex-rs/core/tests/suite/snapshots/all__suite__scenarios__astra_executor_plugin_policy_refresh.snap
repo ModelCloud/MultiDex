@@ -7,6 +7,7 @@ Scenario: Astra applies refreshed plugin policy to the next step while preservin
 ## Window 1
 Settings:
   include: ["reasoning.encrypted_content"]
+  max_output_tokens: 65536
   model: "gpt-6-astra"
   parallel_tool_calls: false
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
@@ -16,7 +17,7 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (request) --
-00:additional_tools/developer (3; hash=5e8370540461db70):
+00:additional_tools/developer (3; hash=de86a969fc853ddf):
         - namespace/functions; hash=7d26e086c1dbba28
           - custom/exec
           - function/wait
@@ -24,11 +25,12 @@ Settings:
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=f4cd55aaf98f2f2e
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
           - function/send_message
+          - function/set_agent_settings
           - function/spawn_agent
           - function/wait_agent
 01:message/developer:

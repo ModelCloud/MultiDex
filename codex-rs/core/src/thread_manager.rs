@@ -344,6 +344,9 @@ pub struct StartThreadOptions {
     pub reserved_thread_id: Option<ThreadId>,
     /// Initial thread-owned plugin selection; omission restores persisted settings.
     pub disabled_plugin_ids: Option<Vec<String>>,
+    /// Destination-provider models manager for a cross-provider child; `None` shares the
+    /// manager-wide provider.
+    pub models_manager: Option<SharedModelsManager>,
 }
 
 /// A private, non-sharing provider also detaches a resumed root from its previous live provider.
@@ -406,6 +409,7 @@ impl StartThreadOptions {
             client_mcp_extensions: ClientMcpExtensions::default(),
             reserved_thread_id: None,
             disabled_plugin_ids: None,
+            models_manager: None,
         }
     }
 }
@@ -1985,6 +1989,33 @@ impl ThreadManagerState {
             })
     }
 
+    /// Update persisted metadata for a thread that is not loaded.
+    ///
+    /// Loaded threads must go through [`ThreadManager::update_thread_metadata`], which routes
+    /// the patch through the live session; this direct-store path covers cold settings updates.
+    pub(crate) async fn update_stored_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: ThreadMetadataPatch,
+    ) -> CodexResult<Option<StoredThread>> {
+        self.thread_store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch,
+                include_archived: true,
+            })
+            .await
+            .map_err(|err| thread_store_metadata_update_error(thread_id, err))
+    }
+
+    pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
+        Arc::clone(&self.auth_manager)
+    }
+
+    pub(crate) fn shared_models_manager(&self) -> SharedModelsManager {
+        Arc::clone(&self.models_manager)
+    }
+
     pub(crate) async fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -2410,6 +2441,7 @@ impl ThreadManagerState {
             client_mcp_extensions,
             mut reserved_thread_id,
             disabled_plugin_ids,
+            models_manager: requested_models_manager,
         } = options;
         if resume_preparation.is_some()
             && (config.ephemeral || !matches!(&initial_history, InitialHistory::Resumed(_)))
@@ -2660,9 +2692,16 @@ impl ThreadManagerState {
             instructions: startup_context.instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: self
-                .models_manager
-                .for_originator(&startup_context.originator)
+            models_manager: requested_models_manager
+                .and_then(|manager| {
+                    manager
+                        .for_originator(&startup_context.originator)
+                        .or(Some(manager))
+                })
+                .or_else(|| {
+                    self.models_manager
+                        .for_originator(&startup_context.originator)
+                })
                 .unwrap_or_else(|| Arc::clone(&self.models_manager)),
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),

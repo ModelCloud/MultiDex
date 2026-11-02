@@ -233,6 +233,9 @@ pub struct SendRequest {
     pub target: AgentTarget,
     /// Captured caller settings used if the recipient must be restored.
     pub resume_config: Config,
+    /// Sparse thread settings applied to the recipient before delivery. Loaded targets update
+    /// live; unloaded targets persist the update to stored metadata so restore picks it up.
+    pub settings: Option<ThreadSettingsOverrides>,
     pub input: AgentInput,
     pub start_options: TurnStartOptions,
 }

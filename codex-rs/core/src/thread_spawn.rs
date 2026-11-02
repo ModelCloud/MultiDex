@@ -158,7 +158,11 @@ pub(crate) async fn prepare(
     )
     .await
     .map_err(ThreadSpawnError::Preparation)?;
-    let config = prepared.config;
+    let crate::agent::child_config::PreparedSpawnConfig {
+        config,
+        role_name,
+        models_manager,
+    } = prepared;
     let task_name = turn
         .session_source
         .get_agent_path()
@@ -170,7 +174,7 @@ pub(crate) async fn prepare(
         depth: next_thread_spawn_depth(&turn.session_source),
         agent_path: Some(task_name.clone()),
         agent_nickname: None,
-        agent_role: prepared.role_name,
+        agent_role: role_name,
     });
     let multi_agent_v2_usage_hints = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory))
         && turn.multi_agent_version == MultiAgentVersion::V2
@@ -212,6 +216,7 @@ pub(crate) async fn prepare(
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,
+                models_manager,
             },
         },
         task_name,

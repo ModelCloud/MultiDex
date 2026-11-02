@@ -1,8 +1,7 @@
 use super::analytics::ToolCallAnalytics;
 use super::message_tool::AgentSettingsOverrides;
-use super::message_tool::apply_agent_settings_overrides;
 use super::*;
-use crate::agent::child_config::build_agent_resume_config;
+use crate::agent::api::AgentTarget;
 use crate::tools::handlers::multi_agents_spec::create_set_agent_settings_tool;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -68,25 +67,18 @@ impl Handler {
         }
         let receiver_thread_id = resolve_agent_target(&session, turn, &args.target).await?;
         analytics.set_receiver(receiver_thread_id);
-        // No message is delivered here, so there is no resume config to carry the
-        // overrides onto an unloaded target's restore; tell the caller to use a
-        // messaging tool for that instead of dropping the update silently.
-        let mut resume_config =
-            build_agent_resume_config(turn).map_err(FunctionCallError::RespondToModel)?;
-        let applied_live = apply_agent_settings_overrides(
-            &session,
-            turn,
-            receiver_thread_id,
-            overrides,
-            &mut resume_config,
-        )
-        .await?;
-        if !applied_live {
-            return Err(FunctionCallError::RespondToModel(
-                "target agent is not loaded; apply overrides through `send_message` or `followup_task` so they are retained for restore"
-                    .to_string(),
-            ));
-        }
+        // The control layer updates loaded targets live and persists overrides onto stored
+        // metadata for unloaded ones so cold restore picks them up.
+        session
+            .services
+            .agent_control
+            .update_thread_settings(
+                session.thread_id,
+                AgentTarget::Id(receiver_thread_id),
+                overrides.to_thread_settings_overrides(),
+            )
+            .await
+            .map_err(|err| collab_v2_agent_error(receiver_thread_id, err))?;
         Ok(boxed_tool_output(
             crate::tools::context::FunctionToolOutput::from_text(String::new(), Some(true)),
         ))

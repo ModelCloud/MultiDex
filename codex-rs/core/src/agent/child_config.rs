@@ -11,6 +11,7 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_features::Feature;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelOrigin;
@@ -49,6 +50,8 @@ pub(crate) struct SpawnConfigOptions<'a> {
 pub(crate) struct PreparedSpawnConfig {
     pub(crate) config: Config,
     pub(crate) role_name: Option<String>,
+    /// Provider-specific catalog the child must keep when spawned on a different provider.
+    pub(crate) models_manager: Option<SharedModelsManager>,
 }
 
 /// Resolves child settings before starting the thread, retaining the invoking tool's precedence.
@@ -63,7 +66,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    apply_requested_spawn_agent_model_overrides(
+    let models_manager = apply_requested_spawn_agent_model_overrides(
         session,
         step_context,
         &mut config,
@@ -75,7 +78,13 @@ pub(crate) async fn prepare_agent_spawn_config(
     if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
-        apply_spawn_agent_role(session, &mut config, options.role_name).await?;
+        apply_spawn_agent_role(
+            session,
+            models_manager.as_ref(),
+            &mut config,
+            options.role_name,
+        )
+        .await?;
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
             && config.developer_instructions.is_none()
@@ -85,7 +94,7 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .clone_from(&turn.developer_instructions);
         }
     }
-    apply_spawn_agent_service_tier(session, &mut config).await?;
+    apply_spawn_agent_service_tier(session, models_manager.as_ref(), &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
@@ -101,7 +110,11 @@ pub(crate) async fn prepare_agent_spawn_config(
             .then_some(DEFAULT_ROLE_NAME)
         })
         .map(str::to_owned);
-    Ok(PreparedSpawnConfig { config, role_name })
+    Ok(PreparedSpawnConfig {
+        config,
+        role_name,
+        models_manager,
+    })
 }
 
 /// Builds the base config snapshot for a newly spawned sub-agent.
@@ -212,22 +225,38 @@ async fn apply_requested_spawn_agent_model_overrides(
     requested_provider: Option<&str>,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
-) -> Result<(), String> {
+) -> Result<Option<SharedModelsManager>, String> {
     let turn = step_context.turn.as_ref();
-    let requested_provider =
-        requested_provider.or(turn.config.agent_default_subagent_provider.as_deref());
-    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
+    // The configured provider/model defaults resolve as a pair: an explicit value in either
+    // field means the caller already picked a coherent pair and the configured defaults would
+    // only mix in a mismatched provider or model.
+    let (requested_provider, requested_model) =
+        if requested_provider.is_none() && requested_model.is_none() {
+            (
+                turn.config.agent_default_subagent_provider.as_deref(),
+                turn.config.agent_default_subagent_model.as_deref(),
+            )
+        } else {
+            (requested_provider, requested_model)
+        };
     let requested_reasoning_effort = requested_reasoning_effort
         .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
     if requested_provider.is_none()
         && requested_model.is_none()
         && requested_reasoning_effort.is_none()
     {
-        return Ok(());
+        return Ok(None);
     }
 
     // A provider override selects the child's endpoint before its model is resolved, so the
     // model must validate against that provider's catalog rather than the caller's manager.
+    if let Some(required) = config.config_layer_stack.required_model_provider()
+        && requested_provider.is_some_and(|provider_id| provider_id != required)
+    {
+        return Err(format!(
+            "Provider override is not allowed for spawn_agent: this session requires the managed provider `{required}`"
+        ));
+    }
     if let Some(provider_id) = requested_provider {
         let provider_info = config.model_providers.get(provider_id).cloned().ok_or_else(|| {
             let available = config
@@ -247,14 +276,13 @@ async fn apply_requested_spawn_agent_model_overrides(
 
     let cross_provider =
         requested_provider.is_some_and(|provider_id| provider_id != turn.config.model_provider_id);
+    // A cross-provider child keeps its own manager: the shared one only serves the caller's
+    // provider, and this build also carries the endpoint overlays and discovery the child needs.
     let override_models_manager = if cross_provider {
-        Some(
-            codex_model_provider::create_model_provider(
-                config.model_provider.clone(),
-                Some(std::sync::Arc::clone(&session.services.auth_manager)),
-            )
-            .models_manager_without_cache(config.model_catalog.clone()),
-        )
+        Some(crate::thread_manager::build_models_manager(
+            config,
+            std::sync::Arc::clone(&session.services.auth_manager),
+        ))
     } else {
         None
     };
@@ -287,7 +315,7 @@ async fn apply_requested_spawn_agent_model_overrides(
             config.model_reasoning_effort = selected_model_info.default_reasoning_level.clone();
         }
 
-        return Ok(());
+        return Ok(override_models_manager);
     }
 
     // Provider changed without an explicit model: pick the new provider's default catalog entry.
@@ -332,11 +360,12 @@ async fn apply_requested_spawn_agent_model_overrides(
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
-    Ok(())
+    Ok(override_models_manager)
 }
 
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
+    models_manager: Option<&SharedModelsManager>,
     config: &mut Config,
 ) -> Result<(), String> {
     let Some(service_tier) = session.services.agent_control.service_tier() else {
@@ -351,9 +380,9 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for service tier validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let model_info = models_manager
+        .map(AsRef::as_ref)
+        .unwrap_or(session.services.models_manager.as_ref())
         .get_model_info(model.as_str(), &config.to_models_manager_config())
         .await;
 
@@ -365,6 +394,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
 
 async fn apply_spawn_agent_role(
     session: &Session,
+    models_manager: Option<&SharedModelsManager>,
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
@@ -382,9 +412,9 @@ async fn apply_spawn_agent_role(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for reasoning effort validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let model_info = models_manager
+        .map(AsRef::as_ref)
+        .unwrap_or(session.services.models_manager.as_ref())
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
     if model_info.origin == ModelOrigin::Synthetic {
