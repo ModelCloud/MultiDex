@@ -153,8 +153,9 @@ Messaging never grants planning, spawning, editing, or publication authority.
 The host applies role and phase policy: clarification requests during
 independent review route through the brain with only minimal source-grounded
 facts; reviewers cannot see implementation transcripts or sibling findings
-before both independent results are sealed. Post-seal discussion cannot rewrite
-those results, and every new revision receives fresh review contexts.
+before all configured reviewers' independent results are sealed. Post-seal
+discussion cannot rewrite those results, and every new revision receives fresh
+review contexts.
 
 Future acceptance checks cover cross-provider brain/grunt/brain round trips,
 grunt peer question/reply, reviewer factual clarification and post-seal
