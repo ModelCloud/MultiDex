@@ -6,7 +6,17 @@ use crate::agent::types::MessageDeliveryMode;
 use crate::tools::handlers::multi_agents_spec::create_followup_task_tool;
 use codex_tools::ToolSpec;
 
-pub(crate) struct Handler;
+pub(crate) struct Handler {
+    expose_model_overrides: bool,
+}
+
+impl Handler {
+    pub(crate) fn new(expose_model_overrides: bool) -> Self {
+        Self {
+            expose_model_overrides,
+        }
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for Handler {
     fn tool_name(&self) -> ToolName {
@@ -14,7 +24,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_followup_task_tool()
+        create_followup_task_tool(self.expose_model_overrides)
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -43,6 +53,11 @@ impl Handler {
             MessageDeliveryMode::TriggerTurn,
             args.target,
             args.message,
+            Some(super::message_tool::AgentSettingsOverrides {
+                provider: args.provider,
+                model: args.model,
+                reasoning_effort: args.reasoning_effort,
+            }),
             analytics,
         )
         .await

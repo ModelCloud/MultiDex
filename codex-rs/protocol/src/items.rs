@@ -329,6 +329,7 @@ pub enum CollabAgentTool {
     Wait,
     CloseAgent,
     SendMessage,
+    SetAgentSettings,
     FollowupTask,
     InterruptAgent,
     ListAgents,

@@ -245,7 +245,7 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
         parameters,
         output_schema,
         ..
-    }) = create_send_message_tool()
+    }) = create_send_message_tool(true)
     else {
         panic!("send_message should be a function tool");
     };
@@ -288,7 +288,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
         parameters,
         output_schema,
         ..
-    }) = create_followup_task_tool()
+    }) = create_followup_task_tool(true)
     else {
         panic!("followup_task should be a function tool");
     };

@@ -2151,6 +2151,23 @@ impl Session {
                     .turn_environments
                     .update_configured_selections(&updated.environments);
             }
+            // A provider change also changes which catalog serves context windows, reasoning
+            // ladders, and model instructions; swap the manager alongside the provider.
+            if updated.original_config_do_not_use.model_provider_id
+                != state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .model_provider_id
+            {
+                let manager = crate::thread_manager::build_models_manager(
+                    &updated.original_config_do_not_use,
+                    Arc::clone(&self.services.auth_manager),
+                );
+                let originator = updated.originator.clone();
+                self.services
+                    .models_manager_swappable
+                    .swap(manager.for_originator(&originator).unwrap_or(manager));
+            }
             state.session_configuration = updated;
             if root_service_tier_changed {
                 self.services.agent_control.propagate_config_update(

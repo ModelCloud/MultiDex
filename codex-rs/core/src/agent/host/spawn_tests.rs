@@ -192,6 +192,7 @@ async fn same_manager_creation_retains_step_executor_and_shares_exec_policy() ->
                 task_name: "worker".into(),
                 fork_mode: None,
                 agent_type: None,
+                provider: None,
                 model: None,
                 reasoning_effort: None,
             },

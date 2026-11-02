@@ -22,6 +22,7 @@ use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
@@ -67,6 +68,18 @@ pub trait AgentControl: Send + Sync {
     /// and wake mode: queue-only messages do not start work and follow-ups cannot target
     /// the root. Legacy user input can address loaded threads outside the agent registry.
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>>;
+
+    /// Apply sparse thread-settings overrides to an agent for its subsequent turns.
+    ///
+    /// Targets resolve like `send`, restricted to the caller and its descendants. Loaded
+    /// targets get a live settings op; unloaded targets get the overrides persisted to
+    /// stored thread metadata so cold restore applies them.
+    fn update_thread_settings(
+        &self,
+        caller: ThreadId,
+        target: AgentTarget,
+        overrides: ThreadSettingsOverrides,
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Take queued, non-turn-starting mail in order, without loading the recipient.
     /// This in-memory operation performs no I/O; returning transfers ownership to the caller.
@@ -220,6 +233,9 @@ pub struct SendRequest {
     pub target: AgentTarget,
     /// Captured caller settings used if the recipient must be restored.
     pub resume_config: Config,
+    /// Sparse thread settings applied to the recipient before delivery. Loaded targets update
+    /// live; unloaded targets persist the update to stored metadata so restore picks it up.
+    pub settings: Option<ThreadSettingsOverrides>,
     pub input: AgentInput,
     pub start_options: TurnStartOptions,
 }

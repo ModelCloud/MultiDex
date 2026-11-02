@@ -1,9 +1,12 @@
 use super::*;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
+use crate::agent::child_config::SpawnConfigOptions;
+use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::child_config::apply_spawn_agent_service_tier;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_config::build_agent_spawn_config;
+use crate::agent::child_config::prepare_agent_spawn_config;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::config::PermissionProfileSnapshot;
@@ -36,6 +39,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_otel::MULTI_AGENT_SPAWN_FAILURE_METRIC;
 use codex_otel::MetricsClient;
@@ -56,7 +60,11 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -76,6 +84,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
+use core_test_support::PathExt;
 use core_test_support::TempDirExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -91,6 +100,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use wiremock::MockServer;
 
 fn set_agent_control(
     session: &mut crate::session::session::Session,
@@ -158,6 +168,77 @@ fn thread_manager() -> ThreadManager {
         CodexAuth::from_api_key("dummy"),
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
     )
+}
+
+fn thread_manager_for_config(config: &crate::config::Config) -> ThreadManager {
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    ThreadManager::new(
+        config,
+        auth_manager.clone(),
+        crate::thread_manager::build_models_manager(config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
+        thread_store_from_config(config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        "11111111-1111-4111-8111-111111111111".to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+}
+
+fn set_unique_codex_home(config: &mut crate::config::Config, home: &tempfile::TempDir) {
+    config.codex_home = home.abs();
+    config.cwd = config.codex_home.abs();
+}
+
+fn configure_override_provider(
+    config: &mut crate::config::Config,
+    provider_id: &str,
+    base_url: Option<&str>,
+) {
+    let mut provider = config.model_provider.clone();
+    provider.name = "Multi-agent override test provider".to_string();
+    provider.experimental_bearer_token = Some("test-provider-bearer-token".into());
+    if let Some(base_url) = base_url {
+        provider.base_url = Some(base_url.to_string());
+        provider.model_catalog_url = Some(format!("{base_url}/catalog").into());
+    }
+    config
+        .model_providers
+        .insert(provider_id.to_string(), provider);
+}
+
+fn override_catalog_model(slug: &str, effort: Option<ReasoningEffort>) -> ModelInfo {
+    let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.5");
+    model.slug = slug.to_string();
+    model.display_name = format!("Override catalog {slug}");
+    model.description = Some("Model supplied by the test provider catalog".to_string());
+    model.visibility = ModelVisibility::List;
+    model.supported_in_api = true;
+    model.multi_agent_version = Some(codex_protocol::protocol::MultiAgentVersion::V2);
+    if let Some(effort) = effort {
+        let description = format!("{effort} reasoning");
+        model.default_reasoning_level = Some(effort.clone());
+        model.supported_reasoning_levels = vec![ReasoningEffortPreset {
+            effort,
+            description,
+        }];
+    }
+    model
+}
+
+async fn mount_override_catalog(server: &MockServer, catalog: ModelsResponse) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/catalog"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(catalog))
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
@@ -532,7 +613,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
     config.model = Some("gpt-5.5".to_string());
-    apply_spawn_agent_service_tier(root.thread.session.as_ref(), &mut config)
+    apply_spawn_agent_service_tier(root.thread.session.as_ref(), None, &mut config)
         .await
         .expect("root preference should be resolved against the child model");
 
@@ -1194,7 +1275,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         json!(r#"<agent name="/root/test_process" />"#),
     );
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::new(true)
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -1351,7 +1432,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         agent_role: None,
     });
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::new(true)
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1428,7 +1509,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let Err(err) = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2::new(true)
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1814,7 +1895,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::new(true).handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1869,15 +1950,13 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::new(true).handle(invocation).await else {
         panic!("send_message interrupt parameter should be rejected");
     };
     let FunctionCallError::RespondToModel(message) = err else {
         panic!("expected model-facing parse error");
     };
-    assert!(message.starts_with(
-        "failed to parse function arguments: unknown field `interrupt`, expected `target` or `message`"
-    ));
+    assert!(message.contains("unknown field `interrupt`"));
 
     let ops = manager.captured_ops();
     let ops_for_agent: Vec<&Op> = ops
@@ -1958,7 +2037,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
+    FollowupTaskHandlerV2::new(true)
         .handle(invocation(
             session,
             turn,
@@ -2099,7 +2178,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = FollowupTaskHandlerV2.handle(invocation).await else {
+    let Err(err) = FollowupTaskHandlerV2::new(true).handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -4731,4 +4810,447 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_set_agent_settings_requires_an_override() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let Err(err) = crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+        .handle(invocation(
+            session,
+            turn,
+            "set_agent_settings",
+            function_payload(json!({
+                "target": "worker",
+            })),
+        ))
+        .await
+    else {
+        panic!("set_agent_settings without overrides should be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing validation error");
+    };
+    assert!(message.contains("requires at least one"));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_override_regression_spawn_prepares_uncached_provider_model() {
+    let server = MockServer::start().await;
+    let model = override_catalog_model("provider-only-spawn-model", None);
+    mount_override_catalog(
+        &server,
+        ModelsResponse {
+            models: vec![model],
+        },
+    )
+    .await;
+
+    let (session, mut turn) = make_session_and_context().await;
+    let home = tempfile::tempdir().expect("unique codex home");
+    let provider_id = "multi-agent-override-provider";
+    let model_slug = "provider-only-spawn-model";
+    let mut config = turn.config.as_ref().clone();
+    set_unique_codex_home(&mut config, &home);
+    config.model_catalog = None;
+    configure_override_provider(&mut config, provider_id, Some(&server.uri()));
+    config
+        .features
+        .enable(Feature::ApiKeyModelDiscovery)
+        .expect("test config should allow API-key model discovery");
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow multi-agent v2");
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(turn.clone());
+    let prepared = prepare_agent_spawn_config(
+        session.as_ref(),
+        step_context.as_ref(),
+        SpawnConfigOptions {
+            version: SpawnConfigVersion::V2,
+            full_history_fork: false,
+            role_name: None,
+            provider: Some(provider_id),
+            model: Some(model_slug),
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .expect("cross-provider spawn should discover its model");
+
+    assert_eq!(prepared.config.model.as_deref(), Some(model_slug));
+    assert_eq!(prepared.config.model_provider_id, provider_id);
+    assert!(turn.config.model_catalog.is_none());
+    let manager = prepared
+        .models_manager
+        .expect("cross-provider spawn should retain its provider manager");
+    let catalog = manager
+        .model_catalog_with_origins(
+            RefreshStrategy::OnlineIfUncached,
+            turn.config.http_client_factory(),
+        )
+        .await;
+    let model = catalog
+        .iter()
+        .find(|entry| entry.model.slug == model_slug)
+        .expect("provider-only model should remain in the catalog");
+    assert_eq!(
+        model.origin,
+        codex_protocol::openai_models::ModelOrigin::Provider
+    );
+    assert_eq!(
+        model.model.description.as_deref(),
+        Some("Model supplied by the test provider catalog")
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        1
+    );
+}
+
+#[test]
+fn multi_agent_v2_override_regression_settings_discover_uncached_provider_model() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    let model = override_catalog_model("provider-only-settings-model", None);
+                    mount_override_catalog(
+                        &server,
+                        ModelsResponse {
+                            models: vec![model],
+                        },
+                    )
+                    .await;
+
+                    let (mut session, mut turn) = make_session_and_context().await;
+                    let home = tempfile::tempdir().expect("unique codex home");
+                    let provider_id = "multi-agent-override-provider";
+                    let model_slug = "provider-only-settings-model";
+                    let mut config = turn.config.as_ref().clone();
+                    set_unique_codex_home(&mut config, &home);
+                    config.model_catalog = None;
+                    configure_override_provider(&mut config, provider_id, Some(&server.uri()));
+                    config
+                        .features
+                        .enable(Feature::ApiKeyModelDiscovery)
+                        .expect("test config should allow API-key model discovery");
+                    config
+                        .features
+                        .enable(Feature::MultiAgentV2)
+                        .expect("test config should allow multi-agent v2");
+                    set_turn_config(&mut turn, config.clone());
+
+                    let manager = thread_manager_for_config(&config);
+                    let root = manager
+                        .start_thread(StartThreadOptions::new(config))
+                        .await
+                        .expect("root thread should start");
+                    set_agent_control(&mut session, manager.agent_control());
+                    session.thread_id = root.thread_id;
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
+
+                    SpawnAgentHandlerV2::default()
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "spawn_agent",
+                            function_payload(json!({
+                                "message": "boot worker",
+                                "task_name": "worker"
+                            })),
+                        ))
+                        .await
+                        .expect("spawn worker");
+                    let agent_id = session
+                        .services
+                        .local_agent_runtime
+                        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+                        .await
+                        .expect("worker should resolve");
+
+                    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "set_agent_settings",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "provider": provider_id,
+                                "model": model_slug,
+                            })),
+                        ))
+                        .await
+                        .expect("cross-provider settings update should discover the model");
+
+                    let snapshot = manager
+                        .get_thread(agent_id)
+                        .await
+                        .expect("worker thread should be loaded")
+                        .config_snapshot()
+                        .await;
+                    assert_eq!(snapshot.model, model_slug);
+                    assert_eq!(snapshot.model_provider_id, provider_id);
+                    assert!(turn.config.model_catalog.is_none());
+                    assert_eq!(
+                        server.received_requests().await.unwrap_or_default().len(),
+                        1
+                    );
+                })
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
+}
+
+#[test]
+fn multi_agent_v2_override_regression_loaded_settings_validate_against_snapshot() {
+    // The full multi-agent path overflows the default test-thread stack; run on a big one.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    let (mut session, mut turn) = make_session_and_context().await;
+                    let home = tempfile::tempdir().expect("unique codex home");
+                    let provider_id = "multi-agent-static-override-provider";
+                    let model_b = "loaded-target-model-b";
+                    let mut config = turn.config.as_ref().clone();
+                    set_unique_codex_home(&mut config, &home);
+                    config.model = Some("gpt-5.5".to_string());
+                    let model_a = override_catalog_model("gpt-5.5", Some(ReasoningEffort::High));
+                    let model_b_info =
+                        override_catalog_model(model_b, Some(ReasoningEffort::Minimal));
+                    config.model_catalog = Some(ModelsResponse {
+                        models: vec![model_a, model_b_info],
+                    });
+                    configure_override_provider(&mut config, provider_id, None);
+                    config
+                        .features
+                        .enable(Feature::MultiAgentV2)
+                        .expect("test config should allow multi-agent v2");
+                    let manager = thread_manager_for_config(&config);
+                    let root = manager
+                        .start_thread(StartThreadOptions::new(config.clone()))
+                        .await
+                        .expect("root thread should start");
+                    set_agent_control(&mut session, manager.agent_control());
+                    session.thread_id = root.thread_id;
+                    set_turn_config(&mut turn, config);
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
+
+                    SpawnAgentHandlerV2::default()
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "spawn_agent",
+                            function_payload(json!({
+                                "message": "boot worker",
+                                "task_name": "worker"
+                            })),
+                        ))
+                        .await
+                        .expect("spawn worker");
+                    let agent_id = session
+                        .services
+                        .local_agent_runtime
+                        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+                        .await
+                        .expect("worker should resolve");
+
+                    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "set_agent_settings",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "provider": provider_id,
+                                "model": model_b,
+                            })),
+                        ))
+                        .await
+                        .expect("loaded agent should switch to model B");
+                    let snapshot = manager
+                        .get_thread(agent_id)
+                        .await
+                        .expect("worker thread should be loaded")
+                        .config_snapshot()
+                        .await;
+                    assert_eq!(snapshot.model, model_b);
+                    assert_eq!(snapshot.model_provider_id, provider_id);
+
+                    crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "set_agent_settings",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "reasoning_effort": "minimal",
+                            })),
+                        ))
+                        .await
+                        .expect("minimal effort should validate against model B");
+                    let snapshot = manager
+                        .get_thread(agent_id)
+                        .await
+                        .expect("worker thread should be loaded")
+                        .config_snapshot()
+                        .await;
+                    assert_eq!(snapshot.model, model_b);
+                    assert_eq!(snapshot.model_provider_id, provider_id);
+                    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+
+                    let Err(err) = crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler
+                        .handle(invocation(
+                            session,
+                            turn,
+                            "set_agent_settings",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "reasoning_effort": "high",
+                            })),
+                        ))
+                        .await
+                    else {
+                        panic!("high effort should not validate against model B");
+                    };
+                    assert!(matches!(err, FunctionCallError::RespondToModel(_)));
+                })
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
+}
+
+#[test]
+fn multi_agent_v2_send_message_applies_settings_overrides_before_send() {
+    // The full multi-agent path overflows the default test-thread stack; run on a big one.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async {
+                    let (mut session, mut turn) = make_session_and_context().await;
+                    let manager = thread_manager();
+                    let root = manager
+                        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+                        .await
+                        .expect("root thread should start");
+                    set_agent_control(&mut session, manager.agent_control());
+                    session.thread_id = root.thread_id;
+                    let mut config = turn.config.as_ref().clone();
+                    let _ = config.features.enable(Feature::MultiAgentV2);
+                    set_turn_config(&mut turn, config);
+                    let session = Arc::new(session);
+                    let turn = Arc::new(turn);
+
+                    SpawnAgentHandlerV2::default()
+                        .handle(invocation(
+                            session.clone(),
+                            turn.clone(),
+                            "spawn_agent",
+                            function_payload(json!({
+                                "message": "boot worker",
+                                "task_name": "worker"
+                            })),
+                        ))
+                        .await
+                        .expect("spawn worker");
+                    let agent_id = session
+                        .services
+                        .local_agent_runtime
+                        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+                        .await
+                        .expect("worker should resolve");
+
+                    SendMessageHandlerV2::new(true)
+                        .handle(invocation(
+                            session,
+                            turn,
+                            "send_message",
+                            function_payload(json!({
+                                "target": agent_id.to_string(),
+                                "message": "continue on the smaller model",
+                                "model": "gpt-5.5",
+                                "reasoning_effort": "low",
+                            })),
+                        ))
+                        .await
+                        .expect("send_message with overrides should succeed");
+
+                    let ops = manager.captured_ops();
+                    assert!(ops.iter().any(|(id, op)| {
+            *id == agent_id
+                && matches!(
+                    op,
+                    Op::ThreadSettings { thread_settings, .. }
+                        if thread_settings.model.as_deref() == Some("gpt-5.5")
+                            && thread_settings.effort == Some(Some(ReasoningEffort::Low))
+                )
+        }));
+                })
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_rejects_unknown_provider() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = turn.config.as_ref().clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let Err(err) = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker",
+                "provider": "no-such-provider",
+            })),
+        ))
+        .await
+    else {
+        panic!("spawn_agent with an unknown provider should be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing provider error");
+    };
+    assert!(message.contains("Unknown provider `no-such-provider`"));
+    assert!(message.contains("Available providers:"));
 }

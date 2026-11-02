@@ -27,6 +27,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
 use futures::future::BoxFuture;
@@ -103,12 +104,17 @@ impl AgentControl for LocalAgentControl {
                 caller,
                 target,
                 resume_config,
+                settings,
                 input,
                 mut start_options,
             } = request;
             let target = self.resolve_target(caller, &target)?;
             let (metadata, submission_id) = match input {
                 AgentInput::UserInput(input) => {
+                    if let Some(settings) = settings {
+                        self.update_resolved_thread_settings(caller, target, settings)
+                            .await?;
+                    }
                     let receiver = self.get_agent_metadata(target);
                     let _residency_pin = if receiver.is_some() {
                         self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
@@ -138,6 +144,10 @@ impl AgentControl for LocalAgentControl {
                             "target agent is missing an agent_path".to_string(),
                         )
                     })?;
+                    if let Some(settings) = settings {
+                        self.update_resolved_thread_settings(caller, target, settings)
+                            .await?;
+                    }
                     // Cold-restored children still reload lazily on any message. Only
                     // locally evicted recipients can retain mail without reloading.
                     // Loaded recipients go straight to delivery, which rejects sends
@@ -175,6 +185,19 @@ impl AgentControl for LocalAgentControl {
                 metadata,
                 submission_id,
             })
+        })
+    }
+
+    fn update_thread_settings(
+        &self,
+        caller: ThreadId,
+        target: AgentTarget,
+        overrides: ThreadSettingsOverrides,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let target = self.resolve_target(caller, &target)?;
+            self.update_resolved_thread_settings(caller, target, overrides)
+                .await
         })
     }
 
@@ -325,5 +348,290 @@ impl AgentControl for LocalAgentControl {
         Box::pin(async move {
             LocalAgentControl::mark_budget_reminder_delivered(self, agent, window, reminder);
         })
+    }
+}
+
+impl LocalAgentControl {
+    /// Shared settings update behind `send` overrides and `update_thread_settings`.
+    ///
+    /// Both parties must be registered agents; settings are validated before any mutation so a
+    /// rejected send leaves the target untouched. Loaded targets take a live
+    /// `Op::ThreadSettings`; unloaded targets persist the sparse patch to stored metadata so
+    /// cold restore picks it up (including queued mail for locally evicted agents).
+    ///
+    /// The patch intentionally precedes load/delivery: a cold-resumed turn must start under
+    /// the new settings, so failed sends do not roll the persisted settings back.
+    pub(crate) async fn update_resolved_thread_settings(
+        &self,
+        caller: ThreadId,
+        target: ThreadId,
+        overrides: ThreadSettingsOverrides,
+    ) -> Result<()> {
+        self.runtime.register_session_root(caller, /*parent*/ None);
+        self.runtime.ensure_agent_known(caller)?;
+        self.runtime.ensure_agent_known(target)?;
+        let state = self.runtime.upgrade()?;
+        // Settings retarget the recipient's own model/provider, so they are limited to the
+        // caller's agent tree: itself, or a descendant recorded in the persisted spawn graph.
+        if caller != target && !self.target_within_caller_tree(&state, caller, target).await {
+            return Err(CodexErr::InvalidRequest(
+                "thread settings updates are limited to the caller and its descendants".to_string(),
+            ));
+        }
+        let mut overrides = overrides;
+        self.validate_thread_settings_overrides(&state, caller, target, &mut overrides)
+            .await?;
+        if state.get_thread(target).await.is_ok() {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            state
+                .send_op(
+                    target,
+                    codex_protocol::protocol::Op::ThreadSettings {
+                        thread_settings: overrides,
+                        reply: Some(reply_tx),
+                    },
+                    /*parent_turn_id*/ None,
+                    /*root_turn_id*/ None,
+                    /*message_delivery*/ None,
+                )
+                .await?;
+            reply_rx.await.map_err(|_| {
+                CodexErr::InvalidRequest("thread settings update ended before replying".to_string())
+            })?
+        } else {
+            state
+                .update_stored_thread_metadata(
+                    target,
+                    codex_thread_store::ThreadMetadataPatch {
+                        model_provider: overrides.model_provider.clone(),
+                        model: overrides.model.clone(),
+                        reasoning_effort: overrides.effort.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(drop)
+        }
+    }
+
+    /// Whether `target` is a spawned descendant of `caller` in the persisted spawn graph,
+    /// falling back to agent-path lineage (`/root/a` parents `/root/a/b`) without one.
+    async fn target_within_caller_tree(
+        &self,
+        state: &crate::thread_manager::ThreadManagerState,
+        caller: ThreadId,
+        target: ThreadId,
+    ) -> bool {
+        if caller == target {
+            return true;
+        }
+        if let Some(graph) = state.agent_graph_store()
+            && graph
+                .list_thread_spawn_descendants(caller, None)
+                .await
+                .is_ok_and(|descendants| descendants.contains(&target))
+        {
+            return true;
+        }
+        let caller_path = self
+            .get_agent_metadata(caller)
+            .and_then(|metadata| metadata.agent_path);
+        let target_path = self
+            .get_agent_metadata(target)
+            .and_then(|metadata| metadata.agent_path);
+        match (caller_path, target_path) {
+            (Some(caller_path), Some(target_path)) => target_path
+                .as_str()
+                .starts_with(&format!("{}/", caller_path.as_str())),
+            _ => false,
+        }
+    }
+
+    /// Validate the effective provider/model pair a settings update leaves behind.
+    ///
+    /// Resolves the destination's current pair (live config for loaded targets, stored
+    /// metadata otherwise), rejects providers outside the managed set and pairs that strand a
+    /// model the destination provider does not serve, and checks requested efforts against the
+    /// model's ladder.
+    async fn validate_thread_settings_overrides(
+        &self,
+        state: &crate::thread_manager::ThreadManagerState,
+        caller: ThreadId,
+        target: ThreadId,
+        overrides: &mut ThreadSettingsOverrides,
+    ) -> Result<()> {
+        if overrides.model.is_none()
+            && overrides.model_provider.is_none()
+            && overrides.effort.is_none()
+        {
+            return Ok(());
+        }
+        let caller_config = state
+            .get_thread(caller)
+            .await?
+            .session
+            .get_config()
+            .await
+            .as_ref()
+            .clone();
+        let (current_provider_id, current_model) = match state.get_thread(target).await {
+            Ok(thread) => {
+                let snapshot = thread.config_snapshot().await;
+                (snapshot.model_provider_id, Some(snapshot.model))
+            }
+            Err(_) => {
+                let stored = state
+                    .read_stored_thread(codex_thread_store::ReadThreadParams {
+                        thread_id: target,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await?;
+                (stored.model_provider.clone(), stored.model)
+            }
+        };
+        let effective_provider_id = overrides
+            .model_provider
+            .clone()
+            .unwrap_or(current_provider_id);
+        if let Some(required) = caller_config.config_layer_stack.required_model_provider()
+            && effective_provider_id != required
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "model_provider `{effective_provider_id}` conflicts with the required model provider `{required}`"
+            )));
+        }
+        if overrides.model_provider.is_some()
+            && !caller_config
+                .model_providers
+                .contains_key(&effective_provider_id)
+        {
+            let available = caller_config
+                .model_providers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CodexErr::InvalidRequest(format!(
+                "Unknown provider `{effective_provider_id}`. Available providers: {available}"
+            )));
+        }
+        let pair_changed = overrides.model.is_some() || overrides.model_provider.is_some();
+        let effort_set = matches!(&overrides.effort, Some(Some(_)));
+        if !pair_changed && !effort_set {
+            return Ok(());
+        }
+        // Catalog/effort checks run against the destination provider's manager, which needs
+        // the same overlays and discovery as the shared manager-built one.
+        let mut validation_config = caller_config.clone();
+        if let Some(provider_info) = caller_config
+            .model_providers
+            .get(&effective_provider_id)
+            .cloned()
+        {
+            validation_config.model_provider = provider_info;
+            validation_config.model_provider_id = effective_provider_id.clone();
+        }
+        // The shared manager only serves the default provider; anything else — including a
+        // caller that already switched to it — needs a manager built for the effective provider.
+        let models_manager: codex_models_manager::manager::SharedModelsManager =
+            if effective_provider_id == state.default_model_provider_id() {
+                state.shared_models_manager()
+            } else {
+                crate::thread_manager::build_models_manager(
+                    &validation_config,
+                    state.auth_manager(),
+                )
+            };
+        let available_models = models_manager
+            .list_models(
+                if effective_provider_id == state.default_model_provider_id() {
+                    codex_models_manager::manager::RefreshStrategy::Offline
+                } else {
+                    codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
+                },
+                validation_config.http_client_factory(),
+            )
+            .await;
+        // Provider-only updates adopt the provider's default model, matching spawn semantics.
+        if overrides.model.is_none() && overrides.model_provider.is_some() {
+            let default_model = available_models
+                .iter()
+                .find(|preset| {
+                    preset.is_default
+                        && crate::agent::child_config::model_supports_multi_agent_backend(
+                            preset,
+                            MultiAgentVersion::V2,
+                        )
+                })
+                .or_else(|| {
+                    available_models.iter().find(|preset| {
+                        preset.show_in_picker
+                            && crate::agent::child_config::model_supports_multi_agent_backend(
+                                preset,
+                                MultiAgentVersion::V2,
+                            )
+                    })
+                })
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "Provider `{effective_provider_id}` has no models usable by agents; pass `model` explicitly"
+                    ))
+                })?;
+            overrides.model = Some(default_model.model.clone());
+        }
+        let effective_model = overrides.model.clone().or(current_model);
+        let Some(model) = effective_model else {
+            return Err(CodexErr::InvalidRequest(
+                "settings update requires a resolvable target model".to_string(),
+            ));
+        };
+        if pair_changed
+            && !available_models.iter().any(|preset| {
+                preset.model == model
+                    && crate::agent::child_config::model_supports_multi_agent_backend(
+                        preset,
+                        MultiAgentVersion::V2,
+                    )
+            })
+        {
+            let available = available_models
+                .iter()
+                .filter(|preset| preset.show_in_picker)
+                .filter(|preset| {
+                    crate::agent::child_config::model_supports_multi_agent_backend(
+                        preset,
+                        MultiAgentVersion::V2,
+                    )
+                })
+                .take(crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES)
+                .map(|preset| preset.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CodexErr::InvalidRequest(format!(
+                "Unknown model `{model}` on provider `{effective_provider_id}`. Available models: {available}"
+            )));
+        }
+        if let Some(Some(effort)) = &overrides.effort {
+            let model_info = models_manager
+                .get_model_info(&model, &validation_config.to_models_manager_config())
+                .await;
+            if !model_info
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| &preset.effort == effort)
+            {
+                let supported = model_info
+                    .supported_reasoning_levels
+                    .iter()
+                    .map(|preset| preset.effort.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(CodexErr::InvalidRequest(format!(
+                    "Reasoning effort `{effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
+                )));
+            }
+        }
+        Ok(())
     }
 }

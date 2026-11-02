@@ -164,6 +164,12 @@ fn capture_test_op(op: &Op) -> Option<Op> {
             start_options: start_options.clone(),
         }),
         Op::Shutdown => Some(Op::Shutdown),
+        Op::ThreadSettings {
+            thread_settings, ..
+        } => Some(Op::ThreadSettings {
+            thread_settings: thread_settings.clone(),
+            reply: None,
+        }),
         _ => None,
     }
 }
@@ -526,6 +532,9 @@ pub(crate) struct ThreadManagerState {
     agent_control_factory: Option<AgentControlFactory>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    /// Provider id `models_manager` was built for; threads on another provider get a manager
+    /// built from their own config instead.
+    default_model_provider_id: String,
     git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
@@ -758,6 +767,7 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
                 models_manager,
+                default_model_provider_id: config.model_provider_id.clone(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -966,8 +976,9 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
-                models_manager: create_model_provider(provider, Some(auth_manager.clone()))
+                models_manager: create_model_provider(provider.clone(), Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                default_model_provider_id: provider.name.clone(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -1979,6 +1990,56 @@ impl ThreadManagerState {
             })
     }
 
+    /// Update persisted metadata for a thread that is not loaded.
+    ///
+    /// Loaded threads must go through [`ThreadManager::update_thread_metadata`], which routes
+    /// the patch through the live session; this direct-store path covers cold settings updates.
+    pub(crate) async fn update_stored_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: ThreadMetadataPatch,
+    ) -> CodexResult<Option<StoredThread>> {
+        self.thread_store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch,
+                include_archived: true,
+            })
+            .await
+            .map_err(|err| thread_store_metadata_update_error(thread_id, err))
+    }
+
+    pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
+        Arc::clone(&self.auth_manager)
+    }
+
+    pub(crate) fn shared_models_manager(&self) -> SharedModelsManager {
+        Arc::clone(&self.models_manager)
+    }
+
+    /// The provider id `self.models_manager` was built for. Threads pinned to a different
+    /// provider need their own manager built from their effective config.
+    pub(crate) fn default_model_provider_id(&self) -> &str {
+        &self.default_model_provider_id
+    }
+
+    /// Manager for a spawned or resumed thread: the shared manager serves the default
+    /// provider; any other provider gets a fresh manager built from the thread's config so
+    /// cold restore keeps a cross-provider child on its own catalog.
+    fn models_manager_for_spawn(
+        &self,
+        config: &Config,
+        auth_manager: &Arc<AuthManager>,
+        originator: &str,
+    ) -> SharedModelsManager {
+        let base = if config.model_provider_id == self.default_model_provider_id {
+            Arc::clone(&self.models_manager)
+        } else {
+            build_models_manager(config, Arc::clone(auth_manager))
+        };
+        base.for_originator(originator).unwrap_or(base)
+    }
+
     pub(crate) async fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -2645,6 +2706,8 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
+        let models_manager =
+            self.models_manager_for_spawn(&config, &auth_manager, &startup_context.originator);
         let spawn_result = Session::spawn(SessionSpawnArgs {
             attached_thread,
             startup,
@@ -2654,10 +2717,7 @@ impl ThreadManagerState {
             instructions: startup_context.instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: self
-                .models_manager
-                .for_originator(&startup_context.originator)
-                .unwrap_or_else(|| Arc::clone(&self.models_manager)),
+            models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),

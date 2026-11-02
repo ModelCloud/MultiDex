@@ -49,6 +49,10 @@
           "description": "Default model for spawned subagents when the spawn call does not select one.",
           "type": "string"
         },
+        "default_subagent_provider": {
+          "description": "Default provider id (from `[model_providers]`) for spawned subagents when the spawn call does not select one. Inherits the caller's provider when unset.",
+          "type": "string"
+        },
         "default_subagent_reasoning_effort": {
           "allOf": [
             {

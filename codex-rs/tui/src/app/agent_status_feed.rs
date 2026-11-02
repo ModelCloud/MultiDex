@@ -164,6 +164,7 @@ fn activity_summary(item: &ThreadItemPayload) -> Option<String> {
         ThreadItemPayload::CollabAgentToolCall { tool, .. } => {
             let action = match tool {
                 CollabAgentTool::SendMessage
+                | CollabAgentTool::SetAgentSettings
                 | CollabAgentTool::FollowupTask
                 | CollabAgentTool::InterruptAgent
                 | CollabAgentTool::ListAgents => return None,

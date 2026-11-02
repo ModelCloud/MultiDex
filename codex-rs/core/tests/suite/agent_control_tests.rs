@@ -105,6 +105,19 @@ impl AgentControl for TestAgentControl {
         Box::pin(async { Err(CodexErr::InvalidRequest("host send rejection".to_string())) })
     }
 
+    fn update_thread_settings(
+        &self,
+        _caller: ThreadId,
+        _target: AgentTarget,
+        _overrides: codex_protocol::protocol::ThreadSettingsOverrides,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        Box::pin(async {
+            Err(CodexErr::InvalidRequest(
+                "host settings update rejection".to_string(),
+            ))
+        })
+    }
+
     fn take_mailbox(&self, _agent: ThreadId) -> Vec<PendingAgentMessage> {
         let messages = std::mem::take(&mut *self.mail.lock().expect("mail lock"));
         self.mailbox_state.send_if_modified(std::mem::take);

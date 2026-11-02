@@ -32,6 +32,8 @@ pub struct ThreadCreateRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    /// Configured provider id from `[model_providers]`; `None` inherits the caller's provider.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -43,6 +45,7 @@ pub(crate) struct ThreadSpawnRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -64,6 +67,7 @@ impl ThreadSpawnRequest {
                 task_name: self.task_name,
                 fork_mode: self.fork_mode,
                 agent_type: self.agent_type,
+                provider: self.provider,
                 model: self.model,
                 reasoning_effort: self.reasoning_effort,
             },
@@ -132,6 +136,7 @@ pub(crate) async fn prepare(
         task_name,
         fork_mode,
         agent_type,
+        provider,
         model,
         reasoning_effort,
     } = request;
@@ -146,13 +151,18 @@ pub(crate) async fn prepare(
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
             role_name,
+            provider: provider.as_deref(),
             model: model.as_deref(),
             reasoning_effort,
         },
     )
     .await
     .map_err(ThreadSpawnError::Preparation)?;
-    let config = prepared.config;
+    let crate::agent::child_config::PreparedSpawnConfig {
+        config,
+        role_name,
+        models_manager,
+    } = prepared;
     let task_name = turn
         .session_source
         .get_agent_path()
@@ -164,16 +174,19 @@ pub(crate) async fn prepare(
         depth: next_thread_spawn_depth(&turn.session_source),
         agent_path: Some(task_name.clone()),
         agent_nickname: None,
-        agent_role: prepared.role_name,
+        agent_role: role_name,
     });
     let multi_agent_v2_usage_hints = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory))
         && turn.multi_agent_version == MultiAgentVersion::V2
     {
+        // A fork that also changed provider resolves the child model against the
+        // destination provider's catalog, not the caller's session manager.
+        let child_models_manager = models_manager
+            .as_deref()
+            .unwrap_or(session.services.models_manager.as_ref());
         let child_model_info = match config.model.as_deref() {
             Some(model) if model != turn.model_info().slug => Some(
-                session
-                    .services
-                    .models_manager
+                child_models_manager
                     .get_model_info(model, &config.to_models_manager_config())
                     .await,
             ),

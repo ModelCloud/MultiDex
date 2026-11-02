@@ -1906,6 +1906,10 @@ impl Session {
                 Ok(trace) => (trace, None),
                 Err(err) => (ThreadTraceContext::disabled(), Some(err)),
             };
+            let models_manager_swappable = Arc::new(crate::state::SwappableModelsManager::new(
+                Arc::clone(&models_manager),
+                Arc::clone(&auth_manager),
+            ));
             let services = SessionServices {
                 // Start with an empty connection set. The initialized set is
                 // published after SessionConfigured so MCP events follow it.
@@ -1928,7 +1932,8 @@ impl Session {
                 )
                 .with_legacy_custom_ca_fallback(),
                 session_telemetry,
-                models_manager: Arc::clone(&models_manager),
+                models_manager: models_manager_swappable.clone(),
+                models_manager_swappable,
                 git_root_discovery,
                 tool_approvals: Mutex::new(ApprovalStore::default()),
                 granted_permissions_by_environment_id: Arc::default(),

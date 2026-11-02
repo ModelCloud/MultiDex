@@ -2925,6 +2925,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
             "interrupt_agent".to_string(),
             "list_agents".to_string(),
             "send_message".to_string(),
+            "set_agent_settings".to_string(),
             "spawn_agent".to_string(),
         ]
     );

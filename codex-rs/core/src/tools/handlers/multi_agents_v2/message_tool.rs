@@ -19,6 +19,38 @@ use crate::tools::context::FunctionToolOutput;
 pub(crate) struct SendMessageArgs {
     pub(crate) target: String,
     pub(crate) message: String,
+    /// Provider id override applied to the target's subsequent turns.
+    pub(crate) provider: Option<String>,
+    /// Model override applied to the target's subsequent turns.
+    pub(crate) model: Option<String>,
+    /// Reasoning effort override applied to the target's subsequent turns.
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Optional model/provider/effort overrides a messaging tool applies to the target agent.
+#[derive(Debug, Default)]
+pub(crate) struct AgentSettingsOverrides {
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl AgentSettingsOverrides {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.reasoning_effort.is_none()
+    }
+
+    /// Convert to the sparse thread-settings overrides the agent control layer applies.
+    pub(crate) fn to_thread_settings_overrides(
+        &self,
+    ) -> codex_protocol::protocol::ThreadSettingsOverrides {
+        codex_protocol::protocol::ThreadSettingsOverrides {
+            model: self.model.clone(),
+            model_provider: self.provider.clone(),
+            effort: self.reasoning_effort.clone().map(Some),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +59,12 @@ pub(crate) struct SendMessageArgs {
 pub(crate) struct FollowupTaskArgs {
     pub(crate) target: String,
     pub(crate) message: String,
+    /// Provider id override applied to the target's subsequent turns.
+    pub(crate) provider: Option<String>,
+    /// Model override applied to the target's subsequent turns.
+    pub(crate) model: Option<String>,
+    /// Reasoning effort override applied to the target's subsequent turns.
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 pub(super) fn message_content(message: String) -> Result<String, FunctionCallError> {
@@ -44,6 +82,7 @@ pub(super) async fn handle_message_string_tool(
     mode: MessageDeliveryMode,
     target: String,
     message: String,
+    settings: Option<AgentSettingsOverrides>,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let message = message_content(message)?;
@@ -58,6 +97,11 @@ pub(super) async fn handle_message_string_tool(
     analytics.set_receiver(receiver_thread_id);
     let resume_config =
         build_agent_resume_config(&turn).map_err(FunctionCallError::RespondToModel)?;
+    // Overrides travel with the request so the control layer applies them only after the
+    // send's own eligibility checks pass and can persist them for unloaded recipients.
+    let settings = settings
+        .filter(|overrides| !overrides.is_empty())
+        .map(|overrides| overrides.to_thread_settings_overrides());
     let receipt = session
         .services
         .agent_control
@@ -65,6 +109,7 @@ pub(super) async fn handle_message_string_tool(
             caller: session.thread_id,
             target: AgentTarget::Id(receiver_thread_id),
             resume_config,
+            settings,
             input: AgentInput::Message {
                 message: agent_message_from_tool(message, &source),
                 mode,

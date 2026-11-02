@@ -7,6 +7,7 @@ Scenario: The parent finishes above the compaction threshold. Its prediction for
 ## Window 1
 Settings:
   include: ["reasoning.encrypted_content"]
+  max_output_tokens: 65536
   model: "gpt-6-astra"
   parallel_tool_calls: false
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
@@ -16,7 +17,7 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=696793f2090ba3e3):
+00:additional_tools/developer (3; hash=4dbec773a9c10994):
         - namespace/functions; hash=eb439da1f745d8d5
           - custom/exec
           - function/wait
@@ -25,11 +26,12 @@ Settings:
           - function/new_context
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=f4cd55aaf98f2f2e
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
           - function/send_message
+          - function/set_agent_settings
           - function/spawn_agent
           - function/wait_agent
 01:message/developer:

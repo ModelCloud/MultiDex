@@ -127,6 +127,7 @@ pub fn create_spawn_agent_tool_v2(
         properties.remove("agent_type");
     }
     if !options.expose_spawn_agent_model_overrides {
+        properties.remove("provider");
         properties.remove("model");
         properties.remove("reasoning_effort");
     }
@@ -201,8 +202,33 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
     })
 }
 
-pub fn create_send_message_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+fn agent_settings_override_properties_v2() -> BTreeMap<String, JsonSchema> {
+    BTreeMap::from([
+        (
+            "provider".to_string(),
+            JsonSchema::string(Some(
+                "Provider id override for the target agent's subsequent turns, from `[model_providers]` in the configuration.".to_string(),
+            )),
+        ),
+        (
+            "model".to_string(),
+            JsonSchema::string(Some(
+                "Model override for the target agent's subsequent turns. Must belong to the effective provider's catalog."
+                    .to_string(),
+            )),
+        ),
+        (
+            "reasoning_effort".to_string(),
+            JsonSchema::string(Some(
+                "Reasoning effort override for the target agent's subsequent turns."
+                    .to_string(),
+            )),
+        ),
+    ])
+}
+
+pub fn create_send_message_tool(expose_model_overrides: bool) -> ToolSpec {
+    let mut properties = BTreeMap::from([
         (
             "target".to_string(),
             JsonSchema::string(Some(
@@ -217,6 +243,9 @@ pub fn create_send_message_tool() -> ToolSpec {
             .with_encrypted(),
         ),
     ]);
+    if expose_model_overrides {
+        properties.extend(agent_settings_override_properties_v2());
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
@@ -233,8 +262,32 @@ pub fn create_send_message_tool() -> ToolSpec {
     })
 }
 
-pub fn create_followup_task_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+pub fn create_set_agent_settings_tool() -> ToolSpec {
+    let mut properties = agent_settings_override_properties_v2();
+    properties.insert(
+        "target".to_string(),
+        JsonSchema::string(Some(
+            "Relative or canonical task name to update (from spawn_agent).".to_string(),
+        )),
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "set_agent_settings".to_string(),
+        description: "Update a sub-agent's model, provider, or reasoning effort for its subsequent turns. Applies immediately to loaded agents; unloaded agents adopt the overrides when restored."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
+pub fn create_followup_task_tool(expose_model_overrides: bool) -> ToolSpec {
+    let mut properties = BTreeMap::from([
         (
             "target".to_string(),
             JsonSchema::string(Some(
@@ -250,6 +303,9 @@ pub fn create_followup_task_tool() -> ToolSpec {
             .with_encrypted(),
         ),
     ]);
+    if expose_model_overrides {
+        properties.extend(agent_settings_override_properties_v2());
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
@@ -665,6 +721,13 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
             "fork_turns".to_string(),
             JsonSchema::string(Some(
                 "Parent history to inherit. Defaults to `all`; use `none` to start without parent history. Only `all` and `none` are supported.".to_string(),
+            )),
+        ),
+        (
+            "provider".to_string(),
+            JsonSchema::string(Some(
+                "Provider id override for the new agent, from `[model_providers]` in the configuration. Omit to inherit the parent's provider. When set, `model` must name a model from that provider's catalog; when `model` is omitted the provider's default model is used."
+                    .to_string(),
             )),
         ),
         (
