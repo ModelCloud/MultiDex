@@ -1,4 +1,4 @@
-# Role-constrained execution for the Polly brain
+# BGR: role-constrained brain, grunt, and reviewer execution
 
 Status: **design proposal only**. No Rust behavior, configuration schema,
 protocol, prompts, permissions, or binaries are changed by this document.
@@ -8,23 +8,26 @@ Companion: [Omnigent orchestration design](https://github.com/ModelCloud/omnigen
 
 ## Purpose and boundary
 
-Support an Omnigent-managed team with one persistent planning brain,
-task-scoped executors, and one or two independently configured review slots.
+Support Omnigent's BGR (brain-grunt-reviewers) mode, a separate opt-in choice
+alongside Polly in the Omnigent server/host UI. BGR has one persistent planning
+brain, task-scoped grunts, and one or two independently configured reviewers.
 MultiDex supplies role-constrained execution and reports evidence; Omnigent
-owns the task graph, integration/publication, review scheduler, PR comments,
-and delivery back to the brain.
+owns profile configuration, the task graph, integration/publication, review
+scheduler, PR comments, and delivery back to the brain.
 
 The main brain may itself use MultiDex, but there is still only one orchestrator.
-Do not create an additional MultiDex scheduling loop for an Omnigent-owned job.
-Standalone MultiDex orchestration/PR automation is a separate future proposal.
+Omnigent alone schedules BGR jobs and enforces the dynamic in-flight grunt cap;
+MultiDex must not create a second scheduler, static worker pool, or pre-spawned
+grunts. Standalone MultiDex orchestration/PR automation is a separate future
+proposal.
 
-| Role     | MultiDex behavior                                                                           | Ownership outside this backend                                      |
-| -------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Brain    | Normal persistent session, selected provider/model, orchestration tools exposed by the host | Omnigent supplies durable lifecycle and publication operations      |
-| Executor | Execute a scoped contract; return changes, checks, and blockers                             | Brain makes design decisions and accepts/integrates work            |
-| Reviewer | Fresh session; inspect exact revision; report findings without source edits                 | Omnigent starts each round and publishes results; brain adjudicates |
+| Role     | MultiDex behavior                                                                                                       | Ownership outside this backend                                      |
+| -------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Brain    | Normal persistent session with resolved provider/model/variant/speed/reasoning, orchestration tools exposed by the host | Omnigent supplies durable lifecycle and publication operations      |
+| Grunt    | Execute a scoped contract; return changes, checks, and blockers                                                         | Brain makes design decisions and accepts/integrates work            |
+| Reviewer | Fresh session; inspect exact revision; report findings without source edits                                             | Omnigent starts each round and publishes results; brain adjudicates |
 
-Bounded executors can make routine implementation choices but must return
+Bounded grunts can make routine implementation choices but must return
 unsettled design questions. Lower reasoning is a supported model option where
 available, not a requirement to suppress error detection. Reviewers need enough
 reasoning to perform independent analysis.
@@ -51,7 +54,7 @@ Use existing thread/context entry points and capability/permission abstractions.
 ## Proposed capability handshake
 
 Before launching a managed job, the adapter negotiates a protocol version and
-capabilities for explicit provider/model selection, supported reasoning values,
+capabilities for explicit provider/model/variant/speed/reasoning selection,
 fresh context, role tool restrictions, isolated workspace access, structured
 results, cancellation, and durable job identity/reconciliation.
 
@@ -60,30 +63,47 @@ Do not silently downgrade to a normal coding session or prompt-only read-only
 mode. Old clients and ordinary interactive MultiDex sessions retain their
 current behavior.
 
-The host validates provider credentials and resolves a model identity from
-existing catalogs. Secrets stay in the existing credential mechanism and never
-enter job payloads, logs, result artifacts, or review checkout contents.
-Do not add a second credential format as part of this feature.
+Omnigent resolves each capability-aware profile against the catalog and passes
+the selected provider/model, supported variant, speed, reasoning, execution-
+compatible harness, and configuration revision in the job snapshot. The UI
+offers only supported values, validates combinations, and rejects invalid
+explicit choices rather than silently remapping them. Harness is execution
+compatibility, not a substitute for model/provider settings. Grunt jobs use the
+configured default unless the brain explicitly assigns a permitted profile
+within user policy; there is no implicit task-based auto-routing. Optional
+per-grunt profile defaults do not require configuring a static pool.
+
+Secrets stay in the existing credential mechanism and never enter job payloads,
+logs, result artifacts, or review checkout contents. Do not add a second
+credential format as part of this feature.
 
 ## Conceptual job and result contracts
 
-| Job field                                | Semantics                                                                                             |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Protocol version, job ID, attempt ID     | Version compatibility, correlation, retry/reconnect reconciliation                                    |
-| Owner/parent ID, task or review-round ID | Trusted ownership; no arbitrary cross-session result delivery                                         |
-| Role                                     | Brain, executor, or reviewer; runtime-enforced capability ceiling                                     |
-| Display name                             | Runtime-assigned role-prefixed name, visible in UI and reports                                        |
-| Selection snapshot                       | Harness, provider/profile reference, model, supported reasoning effort, configuration revision        |
-| Repository/workspace                     | Repository identity, exact starting/head SHA, isolated workspace identity; base/merge-base for review |
-| Context mode                             | Persistent brain; task-scoped executor continuation; fresh reviewer                                   |
-| Contract                                 | Objective, plan, allowed scope, acceptance criteria, exact checks, escalation conditions              |
-| Limits                                   | Time/resource budget, output limits, cancellation identity                                            |
+| Job field                                | Semantics                                                                                               |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Protocol version, job ID, attempt ID     | Version compatibility, correlation, retry/reconnect reconciliation                                      |
+| Owner/parent ID, task or review-round ID | Trusted ownership; no arbitrary cross-session result delivery                                           |
+| Role                                     | Brain, grunt, or reviewer; runtime-enforced capability ceiling                                          |
+| Display name                             | Runtime-assigned role-prefixed name, visible in UI and reports                                          |
+| Selection snapshot                       | Provider/model, resolved variant/speed/reasoning, execution-compatible harness, profile/config revision |
+| Repository/workspace                     | Repository identity, exact starting/head SHA, isolated workspace identity; base/merge-base for review   |
+| Context mode                             | Persistent brain; task-scoped grunt continuation; fresh reviewer                                        |
+| Contract                                 | Objective, plan, allowed scope, acceptance criteria, exact checks, escalation conditions                |
+| Limits                                   | Time/resource budget, output limits, cancellation identity                                              |
 
-Results echo the job identity, role, display name, and resolved selection, then
-provide:
+Omnigent persists and enforces the dynamic max-concurrent-grunt cap across brain
+turns and restarts. The cap is an in-flight upper bound, not a pool size: the
+brain starts only needed grunts, excess work is queued or rejected, and
+reviewers do not consume the cap. Lowering the cap never terminates active
+grunts; Omnigent blocks new starts until the in-flight count falls below the
+new cap. MultiDex executes explicitly dispatched jobs and owns no second
+scheduler or concurrency pool.
+
+Results echo the job identity, role, display name, resolved selection, and
+configuration revision, then provide:
 
 - Status: completed, blocked, failed, or cancelled.
-- Executor: resulting SHA/patch, changed files, check commands, working
+- Grunt: resulting SHA/patch, changed files, check commands, working
   directories, tested revision, exit codes, redacted log references, blockers.
 - Reviewer: reviewed base/head and diff identity, structured findings with
   severity, title, path/line range, rationale/evidence, and suggested action.
@@ -109,11 +129,14 @@ new unique name and session ID on every round.
 
 ### Brain
 
-Keep one normal persistent main session. Its selected provider/model is not
-inherited implicitly by every managed worker: each job carries a resolved
-selection. Explicit profile changes affect future jobs and are recorded.
+Keep one normal persistent brain session. Omnigent resolves and pins the brain's
+default provider/model/variant/speed/reasoning and compatible harness when
+creating the BGR session; changing that default never mutates the active brain.
+Do not inherit the brain's selection implicitly into every managed worker.
+Grunt and reviewer profile changes are versioned and apply to future jobs/rounds;
+in-flight jobs retain their resolved snapshots.
 
-### Executor
+### Grunt
 
 Create a task-scoped session/worktree at the brain-selected starting revision.
 Continue the same task session for concrete fix instructions where appropriate.
@@ -143,7 +166,7 @@ an old review under a new round.
 Role capabilities must be enforced by tools, permission inheritance, and
 sandbox/workspace controls; prompts alone are insufficient.
 
-- Executors cannot spawn descendants, expand role permissions, push remote
+- Grunts cannot spawn descendants, expand role permissions, push remote
   branches, create PRs, or approve their own output. Local commits may be used
   to return a precise result revision. Publication credentials are absent.
 - Reviewers cannot mutate reviewed source, spawn descendants, or access
@@ -178,7 +201,7 @@ Jobs must not continue unauthorized publication after the parent disappears.
 Omnigent's trusted publisher delivers the same results to a PR discussion note
 and the brain inbox. MultiDex reviewers have no direct GitHub credentials and
 do not post comments themselves. The brain deduplicates/adjudicates findings
-and sends only concrete accepted fixes to executors.
+and sends only concrete accepted fixes to grunts.
 
 ## Relationship to publication
 
@@ -200,13 +223,23 @@ successfully before the host labels that round complete.
    child configuration paths without changing ordinary session behavior.
 3. Add fresh reviewer execution, structured results, and cancellation/reconnect
    correlation using existing review/mailbox primitives.
-4. Integrate with the Omnigent CLI MVP, then its session UI.
+4. Integrate with the BGR selection in the Omnigent server/host UI.
 
 Acceptance tests for future implementation, not validation performed by this PR:
 
-- A managed job uses the exact requested provider/model and supported effort;
-  unavailable or incompatible choices fail clearly.
-- Executor continuation retains only its task context. Each review attempt
+- A BGR job carries the exact resolved provider/model/variant/speed/reasoning,
+  harness compatibility, and configuration revision; unsupported explicit
+  combinations fail without remapping.
+- Grunt default selection is used unless the brain explicitly assigns a
+  permitted profile within user policy; no implicit auto-routing or required
+  static worker pool.
+- Omnigent starts only needed grunts up to the persisted dynamic cap across
+  turns/restarts; excess work queues or is rejected, and reviewers do not use
+  the cap. Lowering the cap does not terminate active grunts and blocks new
+  starts until below the new cap. MultiDex does not schedule a second pool.
+- Brain defaults resolve at session creation; profile revisions affect future
+  jobs/rounds without silently changing an active brain.
+- Grunt continuation retains only its task context. Each review attempt
   begins without prior conversation and uses a newly allocated unique reviewer
   name and session ID.
 - A reviewer reads the exact frozen revision and surrounding source, cannot
@@ -216,6 +249,9 @@ Acceptance tests for future implementation, not validation performed by this PR:
   malformed/empty/failed output is not confused with success.
 - Duplicate delivery/reconnect and cancellation do not produce new logical
   review jobs or authorize stale results.
+- BGR offers Polly as a separate existing choice and does not change its
+  behavior; BGR selection exposes one or two reviewers and independent
+  provider/model/variant/speed/reasoning settings per active reviewer.
 - An integration cycle has two different reviewers report the same SHA to the
   host, followed by a brain-assigned fix and entirely fresh review sessions.
 - Existing non-managed threads, upstream conversation formatting, provider
