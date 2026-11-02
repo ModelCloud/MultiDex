@@ -117,6 +117,51 @@ The brain evaluates evidence; the backend reports it faithfully.
 The precise API transport/schema remains to be selected using existing
 app-server/thread abstractions. This document does not add tool or RPC names.
 
+## Cross-provider team messaging
+
+The future host messaging bridge negotiates team-mailbox capabilities and
+preserves envelope IDs, correlation, and authenticated source metadata for
+send/receive/ack across OpenAI-backed, MultiDex/Codex-native, and Claude-backed
+sessions. MultiDex and Codex-native identify a harness/backend, not an LLM
+vendor. Provider-neutral adapters expose the host bridge; Omnigent owns team
+membership, ACLs, routing, and durable mailboxes. No agent receives messaging
+credentials or assumes a shared host.
+
+The conceptual envelope includes `protocol_version`, `message_id` and
+`idempotency_key`, `team_id`, source session ID/role/display name,
+`destination_session_id`, task or review-round ID, optional reviewed head SHA,
+kind (`task`, `question`, `answer`, `progress`, `result`, or `cancel`),
+`correlation_id`/`in_reply_to`, payload or artifact references, sequence, and
+creation/expiry timestamps. The host stamps the authenticated source, validates
+membership and permissions, and scopes payloads and artifact access to the
+team. Display names are not authorization.
+
+MultiDex's process-local mailbox is not cross-host durable transport. The host
+bridge uses Omnigent's durable envelope, mailbox, and recovery contract;
+MultiDex does not own Redis, a durable cross-provider transport, or a second
+scheduler. Preserve scoped roles and native approval boundaries, including the
+separation between child-dispatch and peer-message tools. Do not inherit a
+child-tool approval exemption for peer sends. Unsupported mailbox, role, or
+authorization capabilities fail clearly during negotiation, especially on
+older backends. Omnigent's
+[cross-provider messaging design](https://github.com/ModelCloud/omnigent/blob/design/brain-executor-reviewer-roles/docs/BRAIN_EXECUTOR_REVIEWER_DESIGN.md#cross-provider-team-messaging)
+is authoritative for the team mailbox contract; its
+[messaging-tool and approval boundary](https://github.com/ModelCloud/omnigent/blob/main/docs/session-messaging-tool-boundary.md)
+documents the existing native approval scopes.
+
+Messaging never grants planning, spawning, editing, or publication authority.
+The host applies role and phase policy: clarification requests during
+independent review route through the brain with only minimal source-grounded
+facts; reviewers cannot see implementation transcripts or sibling findings
+before both independent results are sealed. Post-seal discussion cannot rewrite
+those results, and every new revision receives fresh review contexts.
+
+Future acceptance checks cover cross-provider brain/grunt/brain round trips,
+grunt peer question/reply, reviewer factual clarification and post-seal
+exchange, reconnect replay and duplicate IDs, unavailable hosts, denied native
+approval, wrong-team or spoofed sources, shared-source preflight, stale rounds,
+and review isolation. These are design targets, not tests run by this proposal.
+
 ## Context lifecycle
 
 The single main session is named `brain`. All execution sub-agents are named
