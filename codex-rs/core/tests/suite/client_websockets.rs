@@ -30,6 +30,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ExecutedToolCall;
@@ -42,6 +43,7 @@ use codex_protocol::models::ToolResultSources;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -1998,9 +2000,14 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
 
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
-    let prompt_one = prompt_with_input(vec![message_item("hello")]);
+    let audio = ResponseItem::from(ResponseInputItem::from(vec![UserInput::Audio {
+        audio: AudioReference::File {
+            file_id: "file_audio".to_string(),
+        },
+    }]));
+    let prompt_one = prompt_with_input(vec![audio.clone()]);
     let prompt_two = prompt_with_input(vec![
-        message_item("hello"),
+        audio,
         assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
@@ -2017,6 +2024,10 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
     assert_eq!(first["model"].as_str(), Some(MODEL));
     assert_eq!(first["stream"], serde_json::Value::Bool(true));
     assert_eq!(first["input"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        first["input"][0]["content"],
+        serde_json::json!([{"type": "input_audio", "file_id": "file_audio"}]),
+    );
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
     assert_eq!(
@@ -2490,8 +2501,13 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
     server.shutdown().await;
 }
 
+#[test_case::test_case("invalid_prompt", CodexErrorInfo::InvalidPrompt; "invalid prompt")]
+#[test_case::test_case("budget_reached", CodexErrorInfo::SessionBudgetExceeded; "budget reached")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_v2_after_error_uses_full_create_without_previous_response_id() {
+async fn responses_websocket_v2_after_error_uses_full_create_without_previous_response_id(
+    code: &str,
+    expected_error: CodexErrorInfo,
+) {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![
@@ -2501,7 +2517,7 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
                 "type": "response.failed",
                 "response": {
                     "error": {
-                        "code": "invalid_prompt",
+                        "code": code,
                         "message": "synthetic websocket failure"
                     }
                 }
@@ -2539,14 +2555,23 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
         .expect("websocket stream failed");
     let mut saw_error = false;
     while let Some(event) = second_stream.next().await {
-        if event.is_err() {
+        if let Err(error) = event {
+            assert_eq!(error.to_codex_protocol_error(), expected_error);
+            assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
             saw_error = true;
             break;
         }
     }
     assert!(saw_error, "expected second websocket stream to error");
 
-    stream_until_complete(&mut session, &harness, &prompt_three).await;
+    stream_until_complete_with_model_info(
+        &mut session,
+        &harness,
+        &prompt_three,
+        &harness.model_info,
+        "resp-3",
+    )
+    .await;
 
     assert_eq!(server.handshakes().len(), 2);
 
@@ -2672,22 +2697,25 @@ async fn responses_websocket_retries_unreplayable_context_with_full_history() {
     server.shutdown().await;
 }
 
+#[test_case::test_case(
+    json!({"type": "response.failed", "response": {"error": {"code": "invalid_prompt"}}}),
+    CodexErrorInfo::InvalidPrompt; "invalid prompt"
+)]
+#[test_case::test_case(
+    json!({"type": "error", "status": 400, "error": {"code": "budget_reached"}}),
+    CodexErrorInfo::SessionBudgetExceeded; "budget HTTP envelope"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake() {
+async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
+    failure: serde_json::Value,
+    expected_error: CodexErrorInfo,
+) {
     skip_if_no_network!();
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
             vec![ev_response_created("resp-1"), ev_completed("resp-1")],
-            vec![json!({
-                "type": "response.failed",
-                "response": {
-                    "error": {
-                        "code": "invalid_prompt",
-                        "message": "synthetic websocket failure"
-                    }
-                }
-            })],
+            vec![failure],
         ],
         response_headers: Vec::new(),
         accept_delay: None,
@@ -2717,18 +2745,24 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
         .await
         .expect("websocket stream failed");
 
-    let saw_error = tokio::time::timeout(Duration::from_secs(2), async {
+    let error = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(event) = second_stream.next().await {
-            if event.is_err() {
-                return true;
+            if let Err(error) = event {
+                return error;
             }
         }
-        false
+        panic!("expected second websocket stream to error");
     })
     .await
     .expect("timed out waiting for terminal websocket error");
 
-    assert!(saw_error, "expected second websocket stream to error");
+    assert_eq!(
+        (
+            error.to_codex_protocol_error(),
+            error.retry_delay(/*retry_count*/ 1),
+        ),
+        (expected_error, None),
+    );
 
     server.shutdown().await;
 }

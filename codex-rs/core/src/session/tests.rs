@@ -6321,6 +6321,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
             vec![ResponseItemEnvelope::new(user_message("compacted history"))],
             turn_context.to_turn_context_item(),
             WorldStateSnapshot::default(),
+            /*rejected_audio_file_ids*/ Default::default(),
             CompactedHistoryMetadata {
                 input_goal_ids: Default::default(),
                 message: "summary".to_string(),
@@ -6455,6 +6456,7 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
             vec![ResponseItemEnvelope::new(user_message("compacted history"))],
             turn_context.to_turn_context_item(),
             WorldStateSnapshot::default(),
+            /*rejected_audio_file_ids*/ Default::default(),
             CompactedHistoryMetadata {
                 input_goal_ids: Default::default(),
                 message: "summary".to_string(),
@@ -6593,6 +6595,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
 
     session.multi_agent_version = std::sync::OnceLock::from(MultiAgentVersion::V2);
     let expected = CompactionResumeMetadata {
+        rejected_audio_file_ids: Default::default(),
         dynamic_tools: Some(Box::new(DynamicToolsSnapshot {
             thread_id: session.thread_id(),
             tools: Vec::new(),
@@ -6650,6 +6653,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
             vec![ResponseItemEnvelope::new(user_message("compacted context"))],
             turn_context_baseline.clone(),
             world_state.render_full().0,
+            /*rejected_audio_file_ids*/ Default::default(),
             CompactedHistoryMetadata {
                 input_goal_ids,
                 message: String::new(),
