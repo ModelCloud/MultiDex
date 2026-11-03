@@ -54,6 +54,12 @@ export type { AttestationGenerateResponse } from "./AttestationGenerateResponse"
 export type { AuthRecoveryNotification } from "./AuthRecoveryNotification";
 export type { AutoReviewDecisionSource } from "./AutoReviewDecisionSource";
 export type { AutoReviewRequirements } from "./AutoReviewRequirements";
+export type { BgrEnvelope } from "./BgrEnvelope";
+export type { BgrIdentity } from "./BgrIdentity";
+export type { BgrMessageKind } from "./BgrMessageKind";
+export type { BgrMessageNotification } from "./BgrMessageNotification";
+export type { BgrRole } from "./BgrRole";
+export type { BgrSnapshot } from "./BgrSnapshot";
 export type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
 export type { BrowserUseConfig } from "./BrowserUseConfig";
 export type { BrowserUseExtensionRequirements } from "./BrowserUseExtensionRequirements";

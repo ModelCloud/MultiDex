@@ -4662,6 +4662,26 @@
       "description": "Notification sent from the server to the client.",
       "oneOf": [
         {
+          "properties": {
+            "method": {
+              "enum": [
+                "bgr/message"
+              ],
+              "title": "Bgr/messageNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/BgrMessageNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Bgr/messageNotification",
+          "type": "object"
+        },
+        {
           "description": "NEW NOTIFICATIONS",
           "properties": {
             "method": {
@@ -8398,6 +8418,176 @@
         },
         "type": "object"
       },
+      "BgrEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "correlationId": {
+            "type": "string"
+          },
+          "headSha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "identity": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/BgrIdentity"
+              }
+            ],
+            "description": "The target assignment for queries; the reporting assignment for replies."
+          },
+          "inReplyTo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/definitions/v2/BgrMessageKind"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "payload": true,
+          "recipientAgentId": {
+            "type": "string"
+          },
+          "senderAgentId": {
+            "type": "string"
+          },
+          "version": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "correlationId",
+          "identity",
+          "kind",
+          "messageId",
+          "payload",
+          "recipientAgentId",
+          "senderAgentId",
+          "version"
+        ],
+        "type": "object"
+      },
+      "BgrIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "attemptId": {
+            "type": "string"
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "role": {
+            "$ref": "#/definitions/v2/BgrRole"
+          },
+          "sessionId": {
+            "description": "Host session identity, not the native thread UUID used by RPC threadId.",
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "teamId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "attemptId",
+          "epoch",
+          "role",
+          "sessionId",
+          "taskId",
+          "teamId"
+        ],
+        "type": "object"
+      },
+      "BgrMessageKind": {
+        "enum": [
+          "task",
+          "question",
+          "answer",
+          "progress",
+          "status_query",
+          "status_reply",
+          "result",
+          "cancel"
+        ],
+        "type": "string"
+      },
+      "BgrMessageNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "envelope": {
+            "$ref": "#/definitions/v2/BgrEnvelope"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "envelope",
+          "threadId"
+        ],
+        "title": "BgrMessageNotification",
+        "type": "object"
+      },
+      "BgrRole": {
+        "enum": [
+          "brain",
+          "grunt",
+          "reviewer"
+        ],
+        "type": "string"
+      },
+      "BgrSnapshot": {
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          },
+          "identity": {
+            "$ref": "#/definitions/v2/BgrIdentity"
+          },
+          "pending": {
+            "items": {
+              "$ref": "#/definitions/v2/BgrEnvelope"
+            },
+            "type": "array"
+          },
+          "replies": {
+            "items": {
+              "$ref": "#/definitions/v2/BgrEnvelope"
+            },
+            "type": "array"
+          },
+          "sequence": {
+            "description": "Process-local event watermark, not a transcript position or a durable lease.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cancelled",
+          "identity",
+          "pending",
+          "replies",
+          "sequence"
+        ],
+        "type": "object"
+      },
       "BrowserUseAccessApprovalLifetime": {
         "enum": [
           "turn",
@@ -8910,6 +9100,7 @@
           "wait",
           "closeAgent",
           "sendMessage",
+          "setAgentSettings",
           "followupTask",
           "interruptAgent",
           "listAgents"
@@ -19679,7 +19870,6 @@
           {
             "properties": {
               "content": {
-                "default": null,
                 "items": {
                   "$ref": "#/definitions/v2/ReasoningItemContent"
                 },

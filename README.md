@@ -9,6 +9,14 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## Experimental host-managed worker status
+
+The app-server exposes an opt-in BGR v1 status bridge for host-managed brain/grunt
+threads: correlated asynchronous `now` queries, safe-boundary replies, and live
+attempt inspection/cancellation. Omnigent remains the scheduler and durable
+ledger. Reviewer enforcement and restart recovery are not yet supported. See the
+[implemented contract and capability limits](docs/brain-executor-reviewer-design.md#implemented-backend-contract-version-1).
+
 ## Quickstart
 
 ### Installing and running MultiDex

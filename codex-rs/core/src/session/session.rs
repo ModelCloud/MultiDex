@@ -752,6 +752,16 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    pub(crate) async fn allows_bgr_binding(&self, require_report_tool: bool) -> bool {
+        if self.active_turn.lock().await.is_some() {
+            return false;
+        }
+        let state = self.state.lock().await;
+        state.last_started_turn_id.is_none()
+            && !state.history.raw_items().any(|item| matches!(item, codex_protocol::models::ResponseItem::Message { role, .. } if role == "user"))
+            && (!require_report_tool || state.persisted_dynamic_tools.contains(&codex_protocol::bgr::report_tool()))
+    }
+
     pub(crate) async fn model_client_for_provider(
         &self,
         provider: &SharedModelProvider,

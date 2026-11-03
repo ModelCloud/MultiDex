@@ -2,6 +2,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use codex_arg0::Arg0DispatchPaths;
+mod bgr;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_config::LoaderOverrides;

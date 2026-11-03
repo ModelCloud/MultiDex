@@ -146,6 +146,7 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
 }
 
 pub(crate) struct MessageProcessor {
+    bgr_processor: crate::bgr::BgrRequestProcessor,
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
@@ -612,6 +613,7 @@ impl MessageProcessor {
 
         Self {
             turn_admission,
+            bgr_processor: crate::bgr::BgrRequestProcessor::new(Arc::clone(&thread_manager)),
             user_verification,
             outgoing,
             startup_warnings: StartupWarnings {
@@ -1321,6 +1323,34 @@ impl MessageProcessor {
                 .model_provider_capabilities_read()
                 .await
                 .map(|response| Some(response.into())),
+            ClientRequest::BgrCapabilitiesRead { .. } => {
+                Ok(Some(self.bgr_processor.capabilities().into()))
+            }
+            ClientRequest::BgrThreadBind { params, .. } => self
+                .bgr_processor
+                .bind(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::BgrMessageSend { params, .. } => self
+                .bgr_processor
+                .send(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::BgrThreadInspect { params, .. } => self
+                .bgr_processor
+                .inspect(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrThreadInspect(response))),
+            ClientRequest::BgrThreadCheckpoint { params, .. } => self
+                .bgr_processor
+                .checkpoint(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrThreadCheckpoint(response))),
+            ClientRequest::BgrThreadCancel { params, .. } => self
+                .bgr_processor
+                .cancel(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrThreadCancel(response))),
             ClientRequest::ThreadStart { params, .. } => {
                 self.thread_processor
                     .thread_start(

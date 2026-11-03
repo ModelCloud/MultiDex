@@ -193,6 +193,7 @@ pub use codex_guardian_reviewer::GuardianAuthorizationVersion;
 pub use codex_guardian_reviewer::GuardianRootSnapshot;
 
 pub struct CodexThread {
+    pub(crate) bgr: Mutex<Option<crate::bgr::BgrRuntime>>,
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
     // Queued agent mail owns a read guard until handled or dropped; eviction needs a write guard.
@@ -231,6 +232,7 @@ impl CodexThread {
         session_source: SessionSource,
     ) -> Self {
         Self {
+            bgr: Mutex::new(None),
             session,
             io,
             residency_gate: Arc::default(),

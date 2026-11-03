@@ -1,10 +1,140 @@
 # BGR: role-constrained brain, grunt, and reviewer execution
 
-Status: **design proposal only**. No Rust behavior, configuration schema,
-protocol, prompts, permissions, or binaries are changed by this document.
-Names below are conceptual contracts, not supported configuration/API fields.
+Status: **experimental first backend slice implemented**. The next section is
+the actual supported wire contract. Later sections retain the broader design;
+their conceptual fields are not automatically supported configuration/API fields.
 
 Companion: [Omnigent orchestration design](https://github.com/ModelCloud/omnigent/blob/design/brain-executor-reviewer-roles/docs/BRAIN_EXECUTOR_REVIEWER_DESIGN.md).
+
+## Implemented backend contract (version 1)
+
+Opt in with `initialize.capabilities.experimentalApi=true`. RPCs use the native
+JSON-RPC transport, camelCase field names, and ordinary per-thread request
+serialization. This is a trusted host bridge, not a public multi-tenant identity
+service: the host controls thread creation, binding, and membership. Models
+cannot select their reporting sender/recipient/epoch; the backend derives these
+from the bound thread and original query. A query's `senderAgentId` is checked
+against the bound `sourceThreadId`, not trusted on its own. Omnigent must
+authenticate/authorize its callers before allowing host RPCs.
+
+| RPC / notification                  | Parameters / result                                                          | Meaning                                                                                                                           |
+| ----------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `bgr/capabilities/read`             | `{}` -> capabilities below                                                   | Negotiate before starting managed threads                                                                                         |
+| `bgr/thread/bind`                   | `{threadId, identity}` -> `{snapshot}`                                       | Bind a fresh, delegation-disabled normal thread; exact repeated binding is idempotent                                             |
+| `bgr/message/send`                  | `{sourceThreadId, threadId, envelope}` -> `{messageId, accepted, duplicate}` | Queue a validated `status_query`; returns without waiting for worker output                                                       |
+| `bgr/thread/inspect`                | `{threadId}` -> `{snapshot}`                                                 | Inspect/reconcile an already live attempt; never cold-starts a replacement                                                        |
+| `bgr/thread/checkpoint`             | `{threadId, identity}` -> `{snapshot}`                                       | Validate the complete identity and flush the native rollout; not an atomic durable BGR checkpoint                                 |
+| `bgr/thread/cancel`                 | `{threadId, identity}` -> `{snapshot}`                                       | Fence the assignment immediately and submit native interruption; acknowledgement does not prove every external process has exited |
+| `bgr/message` (server notification) | `{threadId, envelope}`                                                       | Typed status reply emitted by the native worker tool; also retained in `inspect`                                                  |
+
+Capabilities are `version:1`, `roles:["brain","grunt"]`,
+`statusScopes:["now"]`, `messageKinds:["status_query","status_reply"]`,
+`liveReattach:true`, `maxQueriesPerAttempt:128`, and the exact `reportTool`
+dynamic-tool specification. `durableMailbox`, `restartRecovery`,
+`reviewerSandbox`, `crossHostDelivery`, and `taskDispatch` are all **false**.
+Other declared message kinds and scopes are reserved, not implemented. Neither
+progress/result envelopes nor review/publication jobs are accepted by send.
+Ordinary native turn/item/usage events remain available, but `turn/completed`
+is not an attestation of task success.
+
+### Start, bind, query, report
+
+1. Discover capabilities. Create each role via ordinary `thread/start` with its
+   own resolved provider/model/reasoning/speed settings. This slice does not
+   introduce model selection/remapping or a new variant configuration field.
+   Set native feature overrides `features.multi_agent=false`,
+   `features.multi_agent_v2=false`, `features.defer_mailbox_preemption=true`.
+   Include the returned `reportTool` in each grunt's `dynamicTools` unchanged.
+2. Before any user turn/history, bind
+   `{teamId,agentId,sessionId,taskId,attemptId,epoch,role}` with host-owned IDs
+   and a positive `epoch`. Omnigent's lowercase 32-hex IDs are preserved;
+   `agentId` is an opaque ID, not the display label `brain`/`grunt-...`.
+   Reviewer binding is rejected, not silently
+   downgraded. Team membership and uniqueness across threads are host-owned.
+   A bound thread cannot be rebound to a new task/attempt; allocate a new thread.
+3. Start the host-authorized task using native `turn/start`. Arbitrary task
+   text is **not** accepted as BGR message payload. Native nested delegation
+   tools are disabled by the required feature configuration; host-provided
+   tools, shell policy, credentials, and worktree ceilings remain host-owned.
+4. Send a query from the bound brain thread, targeting the complete worker
+   identity. Example envelope (optional fields may be omitted):
+
+   ```json
+   {
+     "version": 1,
+     "messageId": "11111111111111111111111111111111",
+     "senderAgentId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "recipientAgentId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "identity": {
+       "teamId": "cccccccccccccccccccccccccccccccc",
+       "agentId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "sessionId": "22222222222222222222222222222222",
+       "taskId": "dddddddddddddddddddddddddddddddd",
+       "attemptId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+       "epoch": 1,
+       "role": "grunt"
+     },
+     "kind": "status_query",
+     "correlationId": "ffffffffffffffffffffffffffffffff",
+     "payload": { "scope": "now" }
+   }
+   ```
+
+   The receipt is process-local queue acceptance, not history commitment or
+   durable delivery. Native `Op::InterAgentCommunication` targets the selected
+   thread (each normal managed thread has native `/root` identity). The
+   existing input queue and deferred mailbox-preemption policy deliver at a
+   safe boundary, without a parallel turn, forced steering, context reset, or
+   killing a long-running tool. If idle, normal mailbox handling can start the
+   next turn of the same assignment. There is no second mailbox polling loop.
+
+   The adapter maps snake_case host fields to these camelCase wire fields;
+   `messageId` is the original host message/idempotency ID, never a separate
+   server envelope ID. Every `inReplyTo` refers to that original ID. The host
+   ledger must keep the separate mapping from `identity.sessionId` (Omnigent
+   logical session ID) to RPC `threadId` (MultiDex native thread UUID). Neither
+   binding nor replies overwrite the logical session ID. `sourceThreadId`
+   selects the native brain thread; notification `threadId` selects the native
+   reporting worker. Role display names and membership uniqueness remain
+   host-owned. The backend accepts bounded ASCII IDs, including host 32-hex IDs.
+
+5. The worker calls `bgr_report_status` with
+   `{messageId,inReplyTo,payload:{currentAction,completed,pending,blockers,
+headSha?,dirty?,coverageLimits}}`. The backend constructs the reply's
+   identity, sender, recipient and original correlation, emits `bgr/message`,
+   acknowledges the tool, and lets the worker continue its assignment. Evidence
+   fields are worker self-report, not repository attestation. Omnigent consumes
+   this event and owns delivery into the brain's durable inbox; MultiDex does
+   not schedule or block the brain waiting for it.
+
+Identical query/reply retries are idempotent; ID reuse with different content
+fails. Replies may arrive out of order and retain `inReplyTo`, correlation, and
+attempt identity. Cancellation and all target-identity fields fence late
+reports. A sender must be a live bound brain in the same team and epoch.
+Envelope/report bodies are bounded to 32 KiB, and a binding retains at most 128
+queries (including answered queries); it does not evict deduplication history.
+At the limit, the host must reconcile and explicitly finish/replace the
+attempt rather than assume delivery succeeded.
+
+### Recovery limits
+
+`snapshot` is `{identity,cancelled,sequence,pending,replies}`; sequence counts
+accepted queries, fresh replies, and cancellation. Persist this compact
+metadata in Omnigent, not model reasoning/context. Native rollout flush does
+not create the host's phase/summary/head-SHA/artifact-reference checkpoint;
+those remain Omnigent ledger metadata. It also does
+not persist the BGR binding, queue, or dedup state. A live inspect plus existing
+native thread subscription can reattach to the same loaded attempt. After
+process loss or unload, inspect fails; ordinary `thread/resume` does not restore
+the binding or role ceiling. Do not resume a managed attempt as an ordinary
+session. Fence the old attempt externally and allocate a clean replacement
+with a new native session/attempt identity. Reviewer retries likewise require
+fresh independent sessions once reviewer enforcement is implemented.
+
+Remaining stages: scoped history coverage, role-constrained job dispatch,
+reviewer isolation, typed progress/results, durable replay/acknowledgement,
+restart recovery and broader configuration-ceiling enforcement. These are
+deliberately not advertised by this first slice.
 
 ## Purpose and boundary
 
@@ -409,7 +539,7 @@ partial checkpoints, stale epochs, two recovery coordinators, one lost review
 slot, and whole-team restart. Assert preserved role restrictions and task IDs,
 new replacement attempt IDs, no duplicate writers, no silent loss or false
 success, and fresh-context replacement review. These are future tests, not
-checks performed by this design PR.
+checks completed by the first backend slice.
 
 ## Implementation sequence and future verification
 
@@ -454,7 +584,7 @@ Acceptance tests for future implementation, not validation performed by this PR:
 
 ## Out of scope
 
-No implementation in this PR; no release packages, dependency changes, model
+Beyond the first backend slice: no release packages, dependency changes, model
 defaults, live automations, new credential storage, automatic merging, or
-standalone MultiDex orchestration. Exact schema names and capability encoding
-remain implementation-review decisions shared with the Omnigent companion.
+standalone MultiDex orchestration. The implemented RPC names and limits above
+supersede conceptual names elsewhere in this design.
