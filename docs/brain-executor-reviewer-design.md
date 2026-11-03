@@ -143,6 +143,11 @@ fails. Replies may arrive out of order and retain `inReplyTo`, correlation, and
 attempt identity. Cancellation and all target-identity fields fence late
 reports. A sender must be a same-team/epoch brain, either live bound for `send`
 or controller-attested for `deliver`.
+Cancellation also fences already accepted BGR mail at native queue/turn-admission
+boundaries, including an idle wake reserved before cancellation. Cancelled status
+queries cannot start a follow-up model turn. Unrelated mailbox/input remains
+available, and ordinary interrupts keep their existing behavior. Cancellation
+still acknowledges fencing/interrupt submission, not external-process termination.
 Envelope/report bodies are bounded to 32 KiB, and a binding retains at most 128
 queries (including answered queries); it does not evict deduplication history.
 At the limit, the host must reconcile and explicitly finish/replace the
@@ -384,7 +389,9 @@ Future tests must observe a mid-task agent-authored reply followed by continued
 execution in the same session, for grunts and reviewers, and cover scoped
 queries, long-running commands, unsupported capabilities, deduplication,
 disconnect/reconnect, invalid anchors, and stale attempts. The host/backend
-contract is proposed here; no status channel is implemented by this PR.
+contract beyond the implemented live grunt `now` status bridge remains proposed:
+durable/scoped/reviewer/cross-host status and automatic brain wake are not
+implemented.
 Also verify that the brain progresses after send, that replies delivered in
 reverse query order keep correct correlation, and that replayed callbacks after
 reconnect do not duplicate work or require the brain to poll.

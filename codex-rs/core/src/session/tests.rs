@@ -6529,6 +6529,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
             root_turn_id: None,
             residency_guard: None,
             message_delivery: None,
+            mail_cancellation: None,
         })
         .await
         .expect("submit settings");
@@ -8595,6 +8596,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
             residency_guard: None,
             message_delivery: None,
             trace: Some(submission_trace),
+            mail_cancellation: None,
         })
     });
 
@@ -8626,6 +8628,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
         residency_guard: None,
         message_delivery: None,
         trace: None,
+        mail_cancellation: None,
     });
 
     assert_eq!(
@@ -8989,6 +8992,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
         residency_guard: None,
         message_delivery: None,
         trace: Some(submission_trace.clone()),
+        mail_cancellation: None,
     });
     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
 

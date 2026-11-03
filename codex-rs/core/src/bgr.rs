@@ -18,6 +18,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use std::collections::BTreeMap;
+use tokio_util::sync::CancellationToken;
 
 const MAX_MESSAGES: usize = 128;
 const MAX_BYTES: usize = 32 * 1024;
@@ -25,6 +26,7 @@ const MAX_BYTES: usize = 32 * 1024;
 pub(crate) struct BgrRuntime {
     identity: BgrIdentity,
     cancelled: bool,
+    mail_cancellation: CancellationToken,
     sequence: u32,
     queries: BTreeMap<String, BgrEnvelope>,
     replies: BTreeMap<String, BgrEnvelope>,
@@ -65,6 +67,7 @@ impl BgrRuntime {
         Ok(Self {
             identity,
             cancelled: false,
+            mail_cancellation: CancellationToken::new(),
             sequence: 0,
             queries: BTreeMap::new(),
             replies: BTreeMap::new(),
@@ -164,6 +167,13 @@ impl BgrRuntime {
             head_sha: query.head_sha.clone(),
             payload: serde_json::to_value(report.payload).map_err(|e| invalid(e.to_string()))?,
         };
+        if serde_json::to_vec(&envelope)
+            .map_err(|e| invalid(e.to_string()))?
+            .len()
+            > MAX_BYTES
+        {
+            return Err(invalid("oversized BGR status reply envelope"));
+        }
         if let Some(previous) = self.replies.get(&query.message_id) {
             return if previous == &envelope {
                 Ok((envelope, false))
@@ -275,11 +285,9 @@ impl CodexThread {
             content,
             true,
         );
-        self.submit(Op::InterAgentCommunication {
-            communication,
-            start_options: Default::default(),
-        })
-        .await?;
+        self.io
+            .submit_cancellable_mail(communication, runtime.mail_cancellation.clone())
+            .await?;
         runtime
             .queries
             .insert(envelope.message_id.clone(), envelope);
@@ -313,9 +321,10 @@ impl CodexThread {
             return Err(invalid("BGR cancellation identity mismatch"));
         }
         if !runtime.cancelled {
-            self.submit(Op::Interrupt).await?;
+            runtime.mail_cancellation.cancel();
             runtime.cancelled = true;
             runtime.sequence += 1;
+            self.submit(Op::Interrupt).await?;
         }
         Ok(runtime.snapshot())
     }
@@ -400,6 +409,56 @@ mod tests {
         assert!(state.report(conflict).is_err());
         assert_eq!(state.snapshot().pending.len(), 0);
         assert_eq!(state.snapshot().replies.len(), 1);
+    }
+
+    #[test]
+    fn bgr_status_reply_envelope_byte_limit_preserves_valid_retry() {
+        for character in ['a', '界'] {
+            for overflow in [0, 1] {
+                let mut state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
+                state.queries.insert("one".into(), query("one"));
+                let mut status = report("one");
+                let (base, _) = state.report(status.clone()).unwrap();
+                let base_size = serde_json::to_vec(&base).unwrap().len();
+                state.replies.clear();
+                state.sequence = 0;
+                let padding_bytes = MAX_BYTES - base_size + overflow;
+                status.payload.current_action.push_str(
+                    &character
+                        .to_string()
+                        .repeat(padding_bytes / character.len_utf8()),
+                );
+                status
+                    .payload
+                    .current_action
+                    .push_str(&"x".repeat(padding_bytes % character.len_utf8()));
+                assert!(serde_json::to_vec(&status).unwrap().len() < MAX_BYTES);
+                let mut expected = base;
+                expected.payload = serde_json::to_value(&status.payload).unwrap();
+                let envelope_bytes = serde_json::to_vec(&expected).unwrap().len();
+                assert_eq!(envelope_bytes, MAX_BYTES + overflow);
+                eprintln!(
+                    "BGR_REPLY_SIZE_TRACE: character={character} args={} envelope={envelope_bytes}",
+                    serde_json::to_vec(&status).unwrap().len()
+                );
+                let before = state.snapshot();
+                let result = state.report(status.clone());
+                if overflow == 0 {
+                    let (envelope, fresh) = result.unwrap();
+                    assert!(fresh);
+                    assert_eq!(serde_json::to_vec(&envelope).unwrap().len(), MAX_BYTES);
+                    assert_eq!(state.report(status).unwrap(), (envelope, false));
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "report args fit but final envelope exceeds MAX_BYTES"
+                    );
+                    assert_eq!(state.snapshot(), before);
+                    assert!(state.report(report("one")).unwrap().1);
+                    assert!(state.snapshot().pending.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

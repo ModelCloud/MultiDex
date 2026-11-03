@@ -19,4 +19,5 @@ pub(crate) struct Submission {
     pub residency_guard: Option<OwnedRwLockReadGuard<()>>,
     /// Owns delivery until dispatch; failed or abandoned submissions discard it.
     pub message_delivery: Option<crate::agent_communication::MessageDelivery>,
+    pub mail_cancellation: Option<tokio_util::sync::CancellationToken>,
 }

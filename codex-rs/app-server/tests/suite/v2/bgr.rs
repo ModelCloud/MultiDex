@@ -3,6 +3,7 @@ use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
+use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::*;
 use codex_features::Feature;
 use core_test_support::responses;
@@ -39,25 +40,113 @@ fn identity(thread: &str, role: BgrRole) -> BgrIdentity {
 
 #[tokio::test]
 async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_turn() -> Result<()> {
-    bgr_status_round_trip(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), false).await
+    bgr_status_round_trip(
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        false,
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn bgr_status_reply_preserves_null_query_anchor_with_observed_head() -> Result<()> {
-    bgr_status_round_trip(None, false).await
+    bgr_status_round_trip(None, false, false).await
 }
 
 #[tokio::test]
 async fn bgr_external_brain_status_reply_preserves_query_anchor_at_safe_boundary() -> Result<()> {
-    bgr_status_round_trip(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), true).await
+    bgr_status_round_trip(
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        true,
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn bgr_external_brain_status_reply_preserves_null_anchor_at_safe_boundary() -> Result<()> {
-    bgr_status_round_trip(None, true).await
+    bgr_status_round_trip(None, true, false).await
 }
 
-async fn bgr_status_round_trip(query_head_sha: Option<&str>, external_brain: bool) -> Result<()> {
+#[tokio::test]
+async fn bgr_cancel_while_busy_does_not_wake_queued_query() -> Result<()> {
+    bgr_status_round_trip(None, true, true).await
+}
+
+#[tokio::test]
+async fn bgr_cancel_idle_is_idempotent_and_rejects_new_queries() -> Result<()> {
+    let home = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("Unexpected wake.")?,
+    ])
+    .await;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::Collab)
+        .disable_feature(Feature::MultiAgentV2)
+        .enable_feature(Feature::DeferMailboxPreemption)
+        .write(home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    mcp.initialize_with_capabilities(
+        ClientInfo {
+            name: "bgr-idle-cancel-test".into(),
+            title: None,
+            version: "1".into(),
+        },
+        Some(InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let capabilities: BgrCapabilitiesReadResponse =
+        rpc(&mut mcp, "bgr/capabilities/read", json!({})).await?;
+    let worker: ThreadStartResponse = rpc(
+        &mut mcp,
+        "thread/start",
+        json!({"dynamicTools": [capabilities.report_tool]}),
+    )
+    .await?;
+    let sender = BgrSender::from(&identity("brain", BgrRole::Brain));
+    let identity = identity("worker", BgrRole::Grunt);
+    rpc::<BgrThreadStateResponse>(
+        &mut mcp,
+        "bgr/thread/bind",
+        json!({"threadId": worker.thread.id, "identity": identity}),
+    )
+    .await?;
+    let params = json!({"threadId": worker.thread.id, "identity": identity});
+    let first: BgrThreadStateResponse = rpc(&mut mcp, "bgr/thread/cancel", params.clone()).await?;
+    let second: BgrThreadStateResponse = rpc(&mut mcp, "bgr/thread/cancel", params).await?;
+    assert!(first.snapshot.cancelled);
+    assert_eq!(first.snapshot, second.snapshot);
+    let id = mcp.send_raw_request("bgr/message/deliver", Some(json!({"threadId": worker.thread.id, "sender": sender, "envelope": {"version": 1, "messageId": "cancelled-query", "senderAgentId": sender.agent_id, "recipientAgentId": identity.agent_id, "identity": identity, "kind": "status_query", "correlationId": "cancelled-correlation", "payload": {"scope": "now"}}}))).await?;
+    let rejected = timeout(
+        TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    assert!(rejected.error.message.contains("cancelled"));
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            mcp.read_notification::<TurnStartedNotification>("turn/started")
+        )
+        .await
+        .is_err()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    Ok(())
+}
+
+async fn bgr_status_round_trip(
+    query_head_sha: Option<&str>,
+    external_brain: bool,
+    cancel_while_busy: bool,
+) -> Result<()> {
     let query_id = "c".repeat(32);
     let reply_id = "d".repeat(32);
     let correlation_id = "e".repeat(32);
@@ -68,7 +157,7 @@ async fn bgr_status_round_trip(query_head_sha: Option<&str>, external_brain: boo
             "pending": ["assignment remains active"], "blockers": [], "headSha": observed_head_sha,
             "dirty": null, "coverageLimits": ["self-reported current state"] }
     });
-    let server = create_mock_responses_server_sequence(vec![
+    let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("response-one"),
             responses::ev_function_call("hold-call", "hold_work", "{}"),
@@ -228,8 +317,67 @@ async fn bgr_status_round_trip(query_head_sha: Option<&str>, external_brain: boo
         json!({"threadId": worker.thread.id}),
     )
     .await?;
-    assert_eq!(snapshot.snapshot.pending, vec![envelope]);
+    assert_eq!(snapshot.snapshot.pending, vec![envelope.clone()]);
     assert!(!snapshot.snapshot.cancelled);
+
+    if cancel_while_busy {
+        let started: TurnStartedNotification =
+            timeout(TIMEOUT, mcp.read_notification("turn/started")).await??;
+        assert_eq!(started.turn.id, turn.turn.id);
+        let cancelled: BgrThreadStateResponse = rpc(
+            &mut mcp,
+            "bgr/thread/cancel",
+            json!({"threadId": worker.thread.id, "identity": worker_identity}),
+        )
+        .await?;
+        assert!(cancelled.snapshot.cancelled);
+        let interrupted: TurnCompletedNotification =
+            timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
+        assert_eq!(interrupted.turn.id, turn.turn.id);
+        assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
+        let unexpected = timeout(
+            Duration::from_secs(1),
+            mcp.read_notification::<TurnStartedNotification>("turn/started"),
+        )
+        .await;
+        if let Ok(Ok(ref started)) = unexpected {
+            let completed: TurnCompletedNotification =
+                timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
+            eprintln!(
+                "BGR_CANCEL_TRACE: unexpected turn {} completed {:?}",
+                started.turn.id, completed.turn.status
+            );
+        }
+        let reply = timeout(
+            Duration::from_millis(100),
+            mcp.read_notification::<BgrMessageNotification>("bgr/message"),
+        )
+        .await;
+        let bodies = server.received_requests().await.unwrap();
+        eprintln!(
+            "BGR_CANCEL_TRACE: {} requests; reply={reply:?}",
+            bodies.len()
+        );
+        for (index, request) in bodies.iter().enumerate() {
+            let body: Value = serde_json::from_slice(&request.body)?;
+            eprintln!(
+                "BGR_CANCEL_TRACE: request {} contains queued query={}",
+                index + 1,
+                body["input"].to_string().contains(&envelope.message_id)
+            );
+        }
+        assert!(
+            unexpected.is_err(),
+            "cancelled BGR query started another native turn: {unexpected:?}"
+        );
+        assert!(reply.is_err(), "cancelled query emitted a BGR reply");
+        assert_eq!(
+            bodies.len(),
+            1,
+            "cancelled BGR query caused another model request"
+        );
+        return Ok(());
+    }
 
     mcp.send_response(
         request_id,

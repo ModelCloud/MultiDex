@@ -90,6 +90,10 @@ pub(crate) enum InputQueueActivity {
 }
 
 impl TurnInput {
+    pub(crate) fn is_cancelled_mail(&self) -> bool {
+        matches!(self, Self::InterAgentCommunication(mail) if mail.is_cancelled())
+    }
+
     fn wait_activity(&self) -> InputQueueActivity {
         match self {
             Self::InterAgentCommunication(_)
@@ -231,6 +235,9 @@ impl InputQueue {
         let mut pending = self.mailbox_pending_mails.lock().await;
         // Mail retained while unloaded precedes new submissions to the loaded session.
         self.read_mailbox(&mut pending);
+        if communication.is_cancelled() {
+            return;
+        }
         pending.push_back(PendingMailboxCommunication {
             communication,
             start_options,
@@ -240,7 +247,9 @@ impl InputQueue {
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        let mut pending = self.mailbox_pending_mails.lock().await;
+        pending.retain(|mail| !mail.communication.is_cancelled());
+        !pending.is_empty()
             || self
                 .controller
                 .as_ref()
@@ -252,12 +261,13 @@ impl InputQueue {
             .lock()
             .await
             .iter()
-            .any(|mail| mail.communication.trigger_turn)
+            .any(|mail| mail.communication.trigger_turn && !mail.communication.is_cancelled())
     }
 
     pub(crate) async fn drain_mailbox(&self) -> Vec<PendingMailboxCommunication> {
         let mut pending = self.mailbox_pending_mails.lock().await;
         self.read_mailbox(&mut pending);
+        pending.retain(|mail| !mail.communication.is_cancelled());
         pending.drain(..).collect()
     }
 
@@ -418,7 +428,9 @@ impl InputQueue {
         &self,
         turn_state: &Mutex<TurnState>,
     ) -> Vec<TurnInput> {
-        std::mem::take(&mut turn_state.lock().await.pending_input).items
+        let mut pending = std::mem::take(&mut turn_state.lock().await.pending_input).items;
+        pending.retain(|item| !item.is_cancelled_mail());
+        pending
     }
 
     #[expect(
@@ -429,7 +441,7 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
-        let (pending_input, accepts_mailbox_delivery) = {
+        let (mut pending_input, accepts_mailbox_delivery) = {
             let mut active = active_turn.lock().await;
             match active.as_mut() {
                 Some(active_turn) => {
@@ -446,6 +458,7 @@ impl InputQueue {
                 None => (Vec::new(), true),
             }
         };
+        pending_input.retain(|item| !item.is_cancelled_mail());
         if !accepts_mailbox_delivery {
             return (pending_input, TurnStartOptions::default());
         }
@@ -488,6 +501,12 @@ impl InputQueue {
 }
 
 impl TurnInputQueue {
+    pub(crate) fn discard_cancelled_mail(&mut self) -> bool {
+        let previous_len = self.items.len();
+        self.items.retain(|item| !item.is_cancelled_mail());
+        self.items.len() != previous_len
+    }
+
     fn has_user_input(&self) -> bool {
         self.items
             .iter()
@@ -584,6 +603,64 @@ mod tests {
             content.to_string(),
             trigger_turn,
         )
+    }
+
+    #[tokio::test]
+    async fn cancelled_bgr_mail_preserves_unrelated_mail_and_input() {
+        for cancel_before_enqueue in [false, true] {
+            let input_queue = InputQueue::new();
+            let cancellation = CancellationToken::new();
+            let mut bgr_mail: crate::PendingAgentMessage =
+                make_mail(AgentPath::root(), AgentPath::root(), "BGR query", true).into();
+            bgr_mail.cancellation = Some(cancellation.clone());
+            if cancel_before_enqueue {
+                cancellation.cancel();
+            }
+            input_queue
+                .enqueue_mailbox_communication(bgr_mail.clone(), Default::default())
+                .await;
+            cancellation.cancel();
+            assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+            assert!(!input_queue.has_pending_mailbox_items().await);
+
+            let ordinary = make_mail(
+                AgentPath::root(),
+                AgentPath::root(),
+                "ordinary followup",
+                true,
+            );
+            input_queue
+                .enqueue_mailbox_communication(ordinary.clone().into(), Default::default())
+                .await;
+            let active = Mutex::new(Some(ActiveTurn::default()));
+            let turn_state = Arc::clone(&active.lock().await.as_ref().unwrap().turn_state);
+            let user_input = TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "keep user input".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+                metadata: Default::default(),
+            };
+            input_queue
+                .extend_pending_input_for_turn_state(
+                    &turn_state,
+                    vec![
+                        TurnInput::InterAgentCommunication(bgr_mail),
+                        user_input.clone(),
+                    ],
+                )
+                .await;
+            assert!(input_queue.has_trigger_turn_mailbox_items().await);
+            let (input, _) = input_queue.get_pending_input(&active).await;
+            assert_eq!(
+                input,
+                vec![
+                    user_input,
+                    TurnInput::InterAgentCommunication(ordinary.into())
+                ]
+            );
+        }
     }
 
     #[tokio::test]

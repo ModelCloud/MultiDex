@@ -40,6 +40,98 @@ use tokio_util::sync::CancellationToken;
 
 struct PendingTask;
 
+#[tokio::test]
+async fn bgr_cancel_during_pending_work_admission_does_not_recreate_turn() {
+    struct CancelAtAdmission {
+        cancellation: CancellationToken,
+        interrupt: bool,
+        session: std::sync::Mutex<std::sync::Weak<Session>>,
+    }
+    impl codex_extension_api::TurnLifecycleContributor for CancelAtAdmission {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.cancellation.cancel();
+                if self.interrupt {
+                    let session = self
+                        .session
+                        .lock()
+                        .expect("session lock")
+                        .upgrade()
+                        .expect("live session");
+                    session
+                        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                        .await;
+                }
+            })
+        }
+    }
+
+    for (interrupt_reservation, interrupt_during_admission) in
+        [(false, false), (true, false), (false, true)]
+    {
+        let (mut session, context, receiver) = make_session_and_context_with_rx().await;
+        let cancellation = CancellationToken::new();
+        let mut registry =
+            codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+        let contributor = Arc::new(CancelAtAdmission {
+            cancellation: cancellation.clone(),
+            interrupt: interrupt_during_admission,
+            session: std::sync::Mutex::new(std::sync::Weak::new()),
+        });
+        registry.turn_lifecycle_contributor(contributor.clone());
+        Arc::get_mut(&mut session)
+            .expect("unique session")
+            .services
+            .extensions = Arc::new(registry.build());
+        *contributor.session.lock().expect("session lock") = Arc::downgrade(&session);
+        let mut mail: crate::PendingAgentMessage =
+            codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "BGR query".to_string(),
+                true,
+            )
+            .into();
+        mail.cancellation = Some(cancellation.clone());
+        session
+            .input_queue
+            .enqueue_mailbox_communication(mail, Default::default())
+            .await;
+        let (reservation, _) = session
+            .reserve_pending_work_turn()
+            .await
+            .expect("reserve BGR wake");
+        let (input, _) = session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await;
+        session
+            .input_queue
+            .extend_pending_input_for_turn_state(&reservation, input)
+            .await;
+        if interrupt_reservation {
+            cancellation.cancel();
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
+        }
+        session
+            .start_task_with_mail_reservation(context, Vec::new(), PendingTask, Some(reservation))
+            .await;
+        assert!(cancellation.is_cancelled());
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(
+            receiver.try_recv().is_err(),
+            "cancelled wake emitted a native event"
+        );
+        assert!(!session.input_queue.has_pending_mailbox_items().await);
+    }
+}
+
 impl SessionTask for PendingTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular

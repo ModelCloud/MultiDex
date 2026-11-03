@@ -676,8 +676,9 @@ pub(super) async fn submission_loop(
                     communication,
                     start_options,
                 } => {
-                    let communication =
+                    let mut communication =
                         crate::PendingAgentMessage::new(communication, sub.message_delivery);
+                    communication.cancellation = sub.mail_cancellation;
                     inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
                         .await;
                     false
