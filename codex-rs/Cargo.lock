@@ -3327,7 +3327,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "which 8.0.0",
  "windows-sys 0.61.2",
  "wiremock",
 ]
@@ -5637,6 +5636,7 @@ dependencies = [
  "dirs-next",
  "dunce",
  "glob",
+ "ignore",
  "pretty_assertions",
  "rand 0.8.6",
  "serde",
