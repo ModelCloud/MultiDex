@@ -567,6 +567,13 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::BgrMessageSendResponse,
     },
+    #[experimental("bgr/message/deliver")]
+    BgrMessageDeliver => "bgr/message/deliver" {
+        params: v2::BgrMessageDeliverParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrMessageSendResponse,
+    },
     #[experimental("bgr/thread/inspect")]
     BgrThreadInspect => "bgr/thread/inspect" {
         params: v2::BgrThreadInspectParams,

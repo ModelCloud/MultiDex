@@ -1336,6 +1336,11 @@ impl MessageProcessor {
                 .send(params)
                 .await
                 .map(|response| Some(response.into())),
+            ClientRequest::BgrMessageDeliver { params, .. } => self
+                .bgr_processor
+                .deliver(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrMessageDeliver(response))),
             ClientRequest::BgrThreadInspect { params, .. } => self
                 .bgr_processor
                 .inspect(params)

@@ -13,15 +13,20 @@ JSON-RPC transport, camelCase field names, and ordinary per-thread request
 serialization. This is a trusted host bridge, not a public multi-tenant identity
 service: the host controls thread creation, binding, and membership. Models
 cannot select their reporting sender/recipient/epoch; the backend derives these
-from the bound thread and original query. A query's `senderAgentId` is checked
-against the bound `sourceThreadId`, not trusted on its own. Omnigent must
-authenticate/authorize its callers before allowing host RPCs.
+from the bound thread and original query. For `bgr/message/send`, a query's
+`senderAgentId` is checked against the bound `sourceThreadId`. For
+`bgr/message/deliver`, the host attests the external sender on the trusted
+transport, with the same privilege as binding threads. This is not backend-local
+authentication of a Claude/Omnigent brain. Omnigent must enforce team/owner ACLs
+and authenticate/authorize callers before allowing host RPCs or supplying a
+sender; model-authored sender claims must never be forwarded unchecked.
 
 | RPC / notification                  | Parameters / result                                                          | Meaning                                                                                                                           |
 | ----------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `bgr/capabilities/read`             | `{}` -> capabilities below                                                   | Negotiate before starting managed threads                                                                                         |
 | `bgr/thread/bind`                   | `{threadId, identity}` -> `{snapshot}`                                       | Bind a fresh, delegation-disabled normal thread; exact repeated binding is idempotent                                             |
 | `bgr/message/send`                  | `{sourceThreadId, threadId, envelope}` -> `{messageId, accepted, duplicate}` | Queue a validated `status_query`; returns without waiting for worker output                                                       |
+| `bgr/message/deliver`               | `{threadId, sender, envelope}` -> `{messageId, accepted, duplicate}`         | Trusted host delivery to a worker; no native brain thread or second model required                                                |
 | `bgr/thread/inspect`                | `{threadId}` -> `{snapshot}`                                                 | Inspect/reconcile an already live attempt; never cold-starts a replacement                                                        |
 | `bgr/thread/checkpoint`             | `{threadId, identity}` -> `{snapshot}`                                       | Validate the complete identity and flush the native rollout; not an atomic durable BGR checkpoint                                 |
 | `bgr/thread/cancel`                 | `{threadId, identity}` -> `{snapshot}`                                       | Fence the assignment immediately and submit native interruption; acknowledgement does not prove every external process has exited |
@@ -29,11 +34,17 @@ authenticate/authorize its callers before allowing host RPCs.
 
 Capabilities are `version:1`, `roles:["brain","grunt"]`,
 `statusScopes:["now"]`, `messageKinds:["status_query","status_reply"]`,
-`liveReattach:true`, `maxQueriesPerAttempt:128`, and the exact `reportTool`
+`liveReattach:true`, `hostDelivery:true`, `maxQueriesPerAttempt:128`, and the exact `reportTool`
 dynamic-tool specification. `durableMailbox`, `restartRecovery`,
 `reviewerSandbox`, `crossHostDelivery`, and `taskDispatch` are all **false**.
 Other declared message kinds and scopes are reserved, not implemented. Neither
 progress/result envelopes nor review/publication jobs are accepted by send.
+Reserved scoped payloads use the host's `since_time` and `since_commit` field
+names (for example, `{scope:"since_time",since_time:"<UTC timestamp>"}`), but
+both scopes are rejected until advertised as supported.
+`hostDelivery` means the authenticated controller can deliver queries into a
+local worker process. It does not provide backend networking, remote discovery,
+durable transport, or cross-host delivery; `crossHostDelivery` remains false.
 Ordinary native turn/item/usage events remain available, but `turn/completed`
 is not an attestation of task success.
 
@@ -45,7 +56,8 @@ is not an attestation of task success.
    Set native feature overrides `features.multi_agent=false`,
    `features.multi_agent_v2=false`, `features.defer_mailbox_preemption=true`.
    Include the returned `reportTool` in each grunt's `dynamicTools` unchanged.
-2. Before any user turn/history, bind
+2. Before any user turn/history, bind each native worker (and a native brain
+   only when it actually runs in this same app-server process) using
    `{teamId,agentId,sessionId,taskId,attemptId,epoch,role}` with host-owned IDs
    and a positive `epoch`. Omnigent's lowercase 32-hex IDs are preserved;
    `agentId` is an opaque ID, not the display label `brain`/`grunt-...`.
@@ -56,8 +68,24 @@ is not an attestation of task success.
    text is **not** accepted as BGR message payload. Native nested delegation
    tools are disabled by the required feature configuration; host-provided
    tools, shell policy, credentials, and worktree ceilings remain host-owned.
-4. Send a query from the bound brain thread, targeting the complete worker
-   identity. Example envelope (optional fields may be omitted):
+4. Deliver a host-authorized query targeting the complete worker identity.
+   For an external Claude/Omnigent brain or a brain in a separate native
+   app-server process, use `bgr/message/deliver` with:
+
+   ```text
+   {threadId: <native worker thread>,
+    sender: {teamId,agentId,sessionId,epoch,role:"brain"},
+    envelope: <query below>}
+   ```
+
+   `sender` is controller-attested logical identity, with no worker task or
+   attempt fields and no required backend-local session. The backend validates
+   bounded IDs, brain role, and matching team/epoch/agent against the target
+   envelope, then applies the same complete target-binding fence and safe queue.
+   Alternatively, `bgr/message/send` verifies a live bound brain selected by
+   `sourceThreadId` in the same `ThreadManager`/process. It cannot address a brain
+   in another per-session app-server. Do not create a proxy brain or second model
+   to use host delivery. Example envelope (optional fields may be omitted):
 
    ```json
    {
@@ -103,14 +131,18 @@ is not an attestation of task success.
 headSha?,dirty?,coverageLimits}}`. The backend constructs the reply's
    identity, sender, recipient and original correlation, emits `bgr/message`,
    acknowledges the tool, and lets the worker continue its assignment. Evidence
-   fields are worker self-report, not repository attestation. Omnigent consumes
+   fields are worker self-report, not repository attestation. The reply's
+   top-level `headSha` preserves the original query anchor, including null;
+   `payload.headSha` is the worker's self-reported observed head and may differ
+   as work advances. Omnigent consumes
    this event and owns delivery into the brain's durable inbox; MultiDex does
    not schedule or block the brain waiting for it.
 
 Identical query/reply retries are idempotent; ID reuse with different content
 fails. Replies may arrive out of order and retain `inReplyTo`, correlation, and
 attempt identity. Cancellation and all target-identity fields fence late
-reports. A sender must be a live bound brain in the same team and epoch.
+reports. A sender must be a same-team/epoch brain, either live bound for `send`
+or controller-attested for `deliver`.
 Envelope/report bodies are bounded to 32 KiB, and a binding retains at most 128
 queries (including answered queries); it does not evict deduplication history.
 At the limit, the host must reconcile and explicitly finish/replace the

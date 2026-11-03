@@ -2,12 +2,14 @@ use crate::error_code::invalid_request;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use codex_app_server_protocol::BGR_VERSION;
 use codex_app_server_protocol::BgrCapabilitiesReadResponse;
+use codex_app_server_protocol::BgrMessageDeliverParams;
 use codex_app_server_protocol::BgrMessageKind;
 use codex_app_server_protocol::BgrMessageNotification;
 use codex_app_server_protocol::BgrMessageSendParams;
 use codex_app_server_protocol::BgrMessageSendResponse;
 use codex_app_server_protocol::BgrReportStatusArgs;
 use codex_app_server_protocol::BgrRole;
+use codex_app_server_protocol::BgrSender;
 use codex_app_server_protocol::BgrThreadBindParams;
 use codex_app_server_protocol::BgrThreadInspectParams;
 use codex_app_server_protocol::BgrThreadStateResponse;
@@ -41,6 +43,7 @@ impl BgrRequestProcessor {
             durable_mailbox: false,
             restart_recovery: false,
             reviewer_sandbox: false,
+            host_delivery: true,
             cross_host_delivery: false,
             task_dispatch: false,
             max_queries_per_attempt: 128,
@@ -94,11 +97,23 @@ impl BgrRequestProcessor {
         if sender.cancelled {
             return Err(invalid_request("BGR sender is cancelled"));
         }
+        self.deliver(BgrMessageDeliverParams {
+            thread_id: params.thread_id,
+            sender: BgrSender::from(&sender.identity),
+            envelope: params.envelope,
+        })
+        .await
+    }
+
+    pub(crate) async fn deliver(
+        &self,
+        params: BgrMessageDeliverParams,
+    ) -> Result<BgrMessageSendResponse, JSONRPCErrorError> {
         let message_id = params.envelope.message_id.clone();
         let delivered = self
             .thread(&params.thread_id)
             .await?
-            .deliver_bgr(&sender.identity, params.envelope)
+            .deliver_bgr(&params.sender, params.envelope)
             .await
             .map_err(|e| invalid_request(e.to_string()))?;
         Ok(BgrMessageSendResponse {

@@ -8552,6 +8552,37 @@
         ],
         "type": "string"
       },
+      "BgrSender": {
+        "additionalProperties": false,
+        "description": "Controller-attested sender on the trusted host bridge, not a worker assignment.",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "epoch": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "role": {
+            "$ref": "#/definitions/v2/BgrRole"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "teamId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentId",
+          "epoch",
+          "role",
+          "sessionId",
+          "teamId"
+        ],
+        "type": "object"
+      },
       "BgrSnapshot": {
         "properties": {
           "cancelled": {

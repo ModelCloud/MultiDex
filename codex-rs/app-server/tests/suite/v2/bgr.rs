@@ -27,11 +27,11 @@ async fn rpc<T: DeserializeOwned>(
 
 fn identity(thread: &str, role: BgrRole) -> BgrIdentity {
     BgrIdentity {
-        team_id: "team".into(),
+        team_id: "0".repeat(32),
         agent_id: if role == BgrRole::Brain { "a" } else { "b" }.repeat(32),
         session_id: thread.into(),
-        task_id: "task".into(),
-        attempt_id: "attempt".into(),
+        task_id: "3".repeat(32),
+        attempt_id: "4".repeat(32),
         epoch: 1,
         role,
     }
@@ -39,10 +39,33 @@ fn identity(thread: &str, role: BgrRole) -> BgrIdentity {
 
 #[tokio::test]
 async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_turn() -> Result<()> {
+    bgr_status_round_trip(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), false).await
+}
+
+#[tokio::test]
+async fn bgr_status_reply_preserves_null_query_anchor_with_observed_head() -> Result<()> {
+    bgr_status_round_trip(None, false).await
+}
+
+#[tokio::test]
+async fn bgr_external_brain_status_reply_preserves_query_anchor_at_safe_boundary() -> Result<()> {
+    bgr_status_round_trip(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), true).await
+}
+
+#[tokio::test]
+async fn bgr_external_brain_status_reply_preserves_null_anchor_at_safe_boundary() -> Result<()> {
+    bgr_status_round_trip(None, true).await
+}
+
+async fn bgr_status_round_trip(query_head_sha: Option<&str>, external_brain: bool) -> Result<()> {
+    let query_id = "c".repeat(32);
+    let reply_id = "d".repeat(32);
+    let correlation_id = "e".repeat(32);
+    let observed_head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let status = json!({
-        "messageId": "reply-one", "inReplyTo": "query-one",
+        "messageId": reply_id, "inReplyTo": query_id,
         "payload": { "currentAction": "continuing task", "completed": ["held tool"],
-            "pending": ["assignment remains active"], "blockers": [], "headSha": null,
+            "pending": ["assignment remains active"], "blockers": [], "headSha": observed_head_sha,
             "dirty": null, "coverageLimits": ["self-reported current state"] }
     });
     let server = create_mock_responses_server_sequence(vec![
@@ -79,26 +102,45 @@ async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_tur
     assert!(!capabilities.reviewer_sandbox);
     assert!(!capabilities.durable_mailbox);
     assert!(!capabilities.restart_recovery);
+    assert!(capabilities.host_delivery);
+    assert!(!capabilities.cross_host_delivery);
 
-    let brain: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({})).await?;
+    let brain: Option<ThreadStartResponse> = if external_brain {
+        None
+    } else {
+        Some(rpc(&mut mcp, "thread/start", json!({})).await?)
+    };
     let worker: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({"dynamicTools": [
         capabilities.report_tool,
         {"type": "function", "name": "hold_work", "description": "Work which must not be interrupted", "inputSchema": {"type": "object", "properties": {}}}
     ]})).await?;
-    let brain_identity = identity(&"1".repeat(32), BgrRole::Brain);
+    let brain_sender = BgrSender {
+        team_id: "0".repeat(32),
+        agent_id: "a".repeat(32),
+        session_id: "1".repeat(32),
+        epoch: 1,
+        role: BgrRole::Brain,
+    };
     let worker_identity = identity(&"2".repeat(32), BgrRole::Grunt);
     assert_ne!(worker_identity.session_id, worker.thread.id);
-    for (id, binding) in [
-        (&brain.thread.id, &brain_identity),
-        (&worker.thread.id, &worker_identity),
-    ] {
+    if let Some(brain) = &brain {
         let _: BgrThreadStateResponse = rpc(
             &mut mcp,
             "bgr/thread/bind",
-            json!({"threadId": id, "identity": binding}),
+            json!({"threadId": brain.thread.id, "identity": identity(&brain_sender.session_id, BgrRole::Brain)}),
         )
         .await?;
+    } else {
+        let threads: ThreadLoadedListResponse =
+            rpc(&mut mcp, "thread/loaded/list", json!({})).await?;
+        assert_eq!(threads.data, vec![worker.thread.id.clone()]);
     }
+    let _: BgrThreadStateResponse = rpc(
+        &mut mcp,
+        "bgr/thread/bind",
+        json!({"threadId": worker.thread.id, "identity": worker_identity}),
+    )
+    .await?;
     let turn: TurnStartResponse = rpc(&mut mcp, "turn/start", json!({"threadId": worker.thread.id,
         "input": [{"type": "text", "text": "Perform the assigned task; call hold_work, report status when asked, then continue."}]})).await?;
     let request = timeout(TIMEOUT, mcp.read_stream_until_request_message()).await??;
@@ -110,21 +152,75 @@ async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_tur
 
     let envelope = BgrEnvelope {
         version: BGR_VERSION,
-        message_id: "query-one".into(),
-        sender_agent_id: brain_identity.agent_id.clone(),
+        message_id: query_id.clone(),
+        sender_agent_id: brain_sender.agent_id.clone(),
         recipient_agent_id: worker_identity.agent_id.clone(),
         identity: worker_identity.clone(),
         kind: BgrMessageKind::StatusQuery,
-        correlation_id: "corr-one".into(),
+        correlation_id: correlation_id.clone(),
         in_reply_to: None,
         payload: json!({"scope": "now"}),
-        head_sha: None,
+        head_sha: query_head_sha.map(str::to_owned),
     };
-    let send = json!({"sourceThreadId": brain.thread.id, "threadId": worker.thread.id, "envelope": envelope});
-    let receipt: BgrMessageSendResponse = rpc(&mut mcp, "bgr/message/send", send.clone()).await?;
+    let (method, send) = if let Some(brain) = &brain {
+        (
+            "bgr/message/send",
+            json!({"sourceThreadId": brain.thread.id, "threadId": worker.thread.id, "envelope": envelope}),
+        )
+    } else {
+        let send = json!({"threadId": worker.thread.id,
+            "sender": brain_sender, "envelope": envelope});
+        let mut stale_identity = worker_identity.clone();
+        stale_identity.attempt_id = "stale-attempt".into();
+        for (field, value) in [
+            ("agentId", json!("spoofed-agent")),
+            ("teamId", json!("other-team")),
+            ("epoch", json!(2)),
+            ("role", json!("grunt")),
+            ("sessionId", json!("")),
+            ("taskId", json!("not-a-sender-field")),
+        ] {
+            let mut invalid = send.clone();
+            invalid["sender"][field] = value;
+            let id = mcp
+                .send_raw_request("bgr/message/deliver", Some(invalid))
+                .await?;
+            let error = timeout(
+                TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(id)),
+            )
+            .await??;
+            assert!(
+                error.error.message.contains("BGR")
+                    || error.error.message.contains("unknown field")
+            );
+        }
+        for (field, value) in [
+            (
+                "payload",
+                json!({"scope": "since_time", "since_time": "2026-11-03T00:00:00Z"}),
+            ),
+            ("kind", json!("task")),
+            ("identity", json!(stale_identity)),
+        ] {
+            let mut invalid = send.clone();
+            invalid["envelope"][field] = value;
+            let id = mcp
+                .send_raw_request("bgr/message/deliver", Some(invalid))
+                .await?;
+            let error = timeout(
+                TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(id)),
+            )
+            .await??;
+            assert!(error.error.message.contains("BGR"));
+        }
+        ("bgr/message/deliver", send)
+    };
+    let receipt: BgrMessageSendResponse = rpc(&mut mcp, method, send.clone()).await?;
     assert!(receipt.accepted);
     assert!(!receipt.duplicate);
-    let duplicate: BgrMessageSendResponse = rpc(&mut mcp, "bgr/message/send", send).await?;
+    let duplicate: BgrMessageSendResponse = rpc(&mut mcp, method, send).await?;
     assert!(duplicate.duplicate);
     let snapshot: BgrThreadStateResponse = rpc(
         &mut mcp,
@@ -147,9 +243,16 @@ async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_tur
     .await?;
     let reply: BgrMessageNotification =
         timeout(TIMEOUT, mcp.read_notification("bgr/message")).await??;
-    assert_eq!(reply.envelope.correlation_id, "corr-one");
-    assert_eq!(reply.envelope.in_reply_to.as_deref(), Some("query-one"));
+    assert_eq!(reply.envelope.correlation_id, correlation_id);
+    assert_eq!(
+        reply.envelope.in_reply_to.as_deref(),
+        Some(query_id.as_str())
+    );
+    assert_eq!(reply.envelope.head_sha.as_deref(), query_head_sha);
+    assert_eq!(reply.envelope.payload["headSha"], observed_head_sha);
     assert_eq!(reply.envelope.identity, worker_identity);
+    assert_eq!(reply.envelope.sender_agent_id, worker_identity.agent_id);
+    assert_eq!(reply.envelope.recipient_agent_id, brain_sender.agent_id);
     assert_eq!(reply.thread_id, worker.thread.id);
     let completed: TurnCompletedNotification =
         timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
@@ -180,7 +283,7 @@ async fn bgr_status_receipt_does_not_interrupt_tool_and_reply_continues_same_tur
     let bodies = server.received_requests().await.unwrap();
     assert_eq!(bodies.len(), 3);
     let after_boundary: Value = bodies[1].body_json()?;
-    assert!(after_boundary["input"].to_string().contains("query-one"));
+    assert!(after_boundary["input"].to_string().contains(&query_id));
     assert!(
         after_boundary["input"]
             .to_string()
@@ -270,14 +373,25 @@ async fn bgr_capabilities_require_experimental_api() -> Result<()> {
         }),
     )
     .await?;
-    let id = mcp
-        .send_raw_request("bgr/capabilities/read", Some(json!({})))
-        .await?;
-    let error = timeout(
-        TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(id)),
-    )
-    .await??;
-    assert!(error.error.message.contains("experimental"));
+    let target = identity("worker-session", BgrRole::Grunt);
+    let sender = BgrSender::from(&identity("claude-brain-session", BgrRole::Brain));
+    for (method, params) in [
+        ("bgr/capabilities/read", json!({})),
+        (
+            "bgr/message/deliver",
+            json!({"threadId": "unloaded-native-thread", "sender": sender,
+            "envelope": {"version": 1, "messageId": "query", "senderAgentId": sender.agent_id,
+                "recipientAgentId": target.agent_id, "identity": target, "kind": "status_query",
+                "correlationId": "correlation", "payload": {"scope": "now"}}}),
+        ),
+    ] {
+        let id = mcp.send_raw_request(method, Some(params)).await?;
+        let error = timeout(
+            TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(id)),
+        )
+        .await??;
+        assert!(error.error.message.contains("experimental"));
+    }
     Ok(())
 }

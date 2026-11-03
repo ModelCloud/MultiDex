@@ -9,6 +9,7 @@ use codex_protocol::bgr::BgrIdentity;
 use codex_protocol::bgr::BgrMessageKind;
 use codex_protocol::bgr::BgrReportStatusArgs;
 use codex_protocol::bgr::BgrRole;
+use codex_protocol::bgr::BgrSender;
 use codex_protocol::bgr::BgrSnapshot;
 use codex_protocol::bgr::BgrStatusQuery;
 use codex_protocol::error::CodexErr;
@@ -82,8 +83,15 @@ impl BgrRuntime {
         Ok(())
     }
 
-    fn validate_query(&self, sender: &BgrIdentity, envelope: &BgrEnvelope) -> Result<bool> {
+    fn validate_query(&self, sender: &BgrSender, envelope: &BgrEnvelope) -> Result<bool> {
         self.check_identity(&envelope.identity)?;
+        if [&sender.team_id, &sender.agent_id, &sender.session_id]
+            .into_iter()
+            .any(|id| !valid_id(id))
+            || sender.epoch == 0
+        {
+            return Err(invalid("invalid BGR sender identity or zero epoch"));
+        }
         if envelope.version != BGR_VERSION || envelope.kind != BgrMessageKind::StatusQuery {
             return Err(invalid("only BGR v1 status_query delivery is supported"));
         }
@@ -153,7 +161,7 @@ impl BgrRuntime {
             kind: BgrMessageKind::StatusReply,
             correlation_id: query.correlation_id.clone(),
             in_reply_to: Some(query.message_id.clone()),
-            head_sha: report.payload.head_sha.clone(),
+            head_sha: query.head_sha.clone(),
             payload: serde_json::to_value(report.payload).map_err(|e| invalid(e.to_string()))?,
         };
         if let Some(previous) = self.replies.get(&query.message_id) {
@@ -248,7 +256,7 @@ impl CodexThread {
         clippy::await_holding_invalid_type,
         reason = "queue submission and query registration must be atomic with replies and cancellation; never waits for worker progress"
     )]
-    pub async fn deliver_bgr(&self, sender: &BgrIdentity, envelope: BgrEnvelope) -> Result<bool> {
+    pub async fn deliver_bgr(&self, sender: &BgrSender, envelope: BgrEnvelope) -> Result<bool> {
         let mut binding = self.bgr.lock().await;
         let runtime = binding
             .as_mut()
@@ -352,6 +360,10 @@ mod tests {
         }
     }
 
+    fn sender() -> BgrSender {
+        BgrSender::from(&identity(BgrRole::Brain))
+    }
+
     fn report(id: &str) -> BgrReportStatusArgs {
         BgrReportStatusArgs {
             message_id: format!("reply-{id}"),
@@ -372,7 +384,7 @@ mod tests {
     fn bgr_duplicate_queries_and_reports_are_content_checked() {
         let mut state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
         let message = query("one");
-        let sender = identity(BgrRole::Brain);
+        let sender = sender();
         assert!(state.validate_query(&sender, &message).unwrap());
         state
             .queries
@@ -388,6 +400,26 @@ mod tests {
         assert!(state.report(conflict).is_err());
         assert_eq!(state.snapshot().pending.len(), 0);
         assert_eq!(state.snapshot().replies.len(), 1);
+    }
+
+    #[test]
+    fn bgr_replies_preserve_query_anchor_and_observed_head() {
+        for anchor in [Some("anchor-a"), None] {
+            let mut state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
+            let mut message = query("one");
+            message.head_sha = anchor.map(str::to_owned);
+            state.queries.insert(message.message_id.clone(), message);
+            let mut status = report("one");
+            status.payload.head_sha = Some("observed-b".into());
+
+            let (reply, fresh) = state.report(status.clone()).unwrap();
+            assert!(fresh);
+            assert_eq!(reply.head_sha.as_deref(), anchor);
+            assert_eq!(reply.payload["headSha"], "observed-b");
+            assert_eq!(reply.in_reply_to.as_deref(), Some("one"));
+            assert_eq!(reply.correlation_id, "corr-one");
+            assert_eq!(state.report(status).unwrap(), (reply, false));
+        }
     }
 
     #[test]
@@ -414,7 +446,7 @@ mod tests {
     #[test]
     fn bgr_fences_target_sender_role_epoch_and_team() {
         let state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
-        let sender = identity(BgrRole::Brain);
+        let sender = sender();
         for field in ["epoch", "attempt", "session", "task", "team", "agent"] {
             let mut message = query("one");
             match field {
@@ -427,12 +459,13 @@ mod tests {
             }
             assert!(state.validate_query(&sender, &message).is_err());
         }
-        for field in ["epoch", "team", "role", "agent"] {
+        for field in ["epoch", "team", "role", "agent", "session"] {
             let mut spoofed = sender.clone();
             match field {
                 "epoch" => spoofed.epoch += 1,
                 "team" => spoofed.team_id.push('x'),
                 "role" => spoofed.role = BgrRole::Grunt,
+                "session" => spoofed.session_id.clear(),
                 _ => spoofed.agent_id.push('x'),
             }
             assert!(state.validate_query(&spoofed, &query("one")).is_err());
@@ -443,24 +476,16 @@ mod tests {
     fn bgr_cancelled_attempt_and_unsupported_scope_are_rejected() {
         let mut state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
         for payload in [
-            json!({"scope": "since_time", "since": "2026-11-03T00:00:00Z"}),
-            json!({"scope": "since_commit", "commit": "abc"}),
+            json!({"scope": "since_time", "since_time": "2026-11-03T00:00:00Z"}),
+            json!({"scope": "since_commit", "since_commit": "abc"}),
             json!({"scope": "now", "instructions": "untyped work"}),
         ] {
             let mut message = query("one");
             message.payload = payload;
-            assert!(
-                state
-                    .validate_query(&identity(BgrRole::Brain), &message)
-                    .is_err()
-            );
+            assert!(state.validate_query(&sender(), &message).is_err());
         }
         state.cancelled = true;
-        assert!(
-            state
-                .validate_query(&identity(BgrRole::Brain), &query("one"))
-                .is_err()
-        );
+        assert!(state.validate_query(&sender(), &query("one")).is_err());
         assert!(state.report(report("one")).is_err());
     }
 
@@ -490,7 +515,7 @@ mod tests {
         assert!(state.report(conflict).is_err());
         assert!(
             state
-                .validate_query(&identity(BgrRole::Brain), &query("reply-one"))
+                .validate_query(&sender(), &query("reply-one"))
                 .is_err()
         );
         let mut huge = report("two");
@@ -500,10 +525,6 @@ mod tests {
             let id = format!("q{i}");
             state.queries.insert(id.clone(), query(&id));
         }
-        assert!(
-            state
-                .validate_query(&identity(BgrRole::Brain), &query("extra"))
-                .is_err()
-        );
+        assert!(state.validate_query(&sender(), &query("extra")).is_err());
     }
 }

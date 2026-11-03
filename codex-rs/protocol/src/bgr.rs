@@ -32,13 +32,38 @@ pub struct BgrIdentity {
     pub role: BgrRole,
 }
 
+/// Controller-attested sender on the trusted host bridge, not a worker assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrSender {
+    pub team_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    #[ts(type = "number")]
+    pub epoch: u64,
+    pub role: BgrRole,
+}
+
+impl From<&BgrIdentity> for BgrSender {
+    fn from(identity: &BgrIdentity) -> Self {
+        Self {
+            team_id: identity.team_id.clone(),
+            agent_id: identity.agent_id.clone(),
+            session_id: identity.session_id.clone(),
+            epoch: identity.epoch,
+            role: identity.role,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export_to = "v2/")]
 pub enum BgrStatusQuery {
     Now {},
-    SinceTime { since: String },
-    SinceCommit { commit: String },
+    SinceTime { since_time: String },
+    SinceCommit { since_commit: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -115,4 +140,41 @@ pub fn report_tool() -> crate::dynamic_tools::DynamicToolSpec {
         input_schema: serde_json::json!(schemars::schema_for!(BgrReportStatusArgs)),
         defer_loading: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn bgr_reserved_scopes_preserve_host_payload_field_names() {
+        for (query, payload) in [
+            (
+                BgrStatusQuery::SinceTime {
+                    since_time: "2026-11-03T00:00:00Z".into(),
+                },
+                json!({"scope": "since_time", "since_time": "2026-11-03T00:00:00Z"}),
+            ),
+            (
+                BgrStatusQuery::SinceCommit {
+                    since_commit: "anchor-a".into(),
+                },
+                json!({"scope": "since_commit", "since_commit": "anchor-a"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&query).unwrap(), payload);
+            assert_eq!(
+                serde_json::from_value::<BgrStatusQuery>(payload).unwrap(),
+                query
+            );
+        }
+        for legacy in [
+            json!({"scope": "since_time", "since": "2026-11-03T00:00:00Z"}),
+            json!({"scope": "since_commit", "commit": "anchor-a"}),
+        ] {
+            assert!(serde_json::from_value::<BgrStatusQuery>(legacy).is_err());
+        }
+    }
 }

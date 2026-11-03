@@ -22,6 +22,7 @@ pub struct BgrCapabilitiesReadResponse {
     pub durable_mailbox: bool,
     pub restart_recovery: bool,
     pub reviewer_sandbox: bool,
+    pub host_delivery: bool,
     pub cross_host_delivery: bool,
     pub task_dispatch: bool,
     pub max_queries_per_attempt: u32,
@@ -48,6 +49,16 @@ pub struct BgrThreadInspectParams {
 pub struct BgrMessageSendParams {
     pub source_thread_id: String,
     pub thread_id: String,
+    pub envelope: BgrEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrMessageDeliverParams {
+    pub thread_id: String,
+    /// The host authenticates and authorizes this sender before calling the bridge.
+    pub sender: BgrSender,
     pub envelope: BgrEnvelope,
 }
 
@@ -113,5 +124,26 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap(), envelope);
         envelope["instructions"] = json!("arbitrary untyped assignment");
         assert!(serde_json::from_value::<BgrEnvelope>(envelope).is_err());
+    }
+
+    #[test]
+    fn bgr_host_delivery_is_experimental_thread_scoped_and_has_no_source_thread() {
+        let mut value = json!({"id": 1, "method": "bgr/message/deliver", "params": {
+            "threadId": "worker-thread",
+            "sender": {"teamId": "team", "agentId": "brain", "sessionId": "claude-session", "epoch": 1, "role": "brain"},
+            "envelope": {"version": 1, "messageId": "query", "senderAgentId": "brain", "recipientAgentId": "worker",
+                "identity": {"teamId": "team", "agentId": "worker", "sessionId": "host-worker-session", "taskId": "task", "attemptId": "attempt", "epoch": 1, "role": "grunt"},
+                "kind": "status_query", "correlationId": "correlation", "payload": {"scope": "now"}}
+        }});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.experimental_reason(), Some("bgr/message/deliver"));
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "worker-thread".into()
+            })
+        );
+        value["params"]["sender"]["taskId"] = json!("not-an-assignment");
+        assert!(serde_json::from_value::<ClientRequest>(value).is_err());
     }
 }
