@@ -1085,6 +1085,9 @@
             "guardian_ext": {
               "type": "boolean"
             },
+            "guardian_include_additional_context": {
+              "type": "boolean"
+            },
             "guardian_native_multi_agent_history": {
               "type": "boolean"
             },
@@ -7966,6 +7969,9 @@
           "type": "boolean"
         },
         "guardian_ext": {
+          "type": "boolean"
+        },
+        "guardian_include_additional_context": {
           "type": "boolean"
         },
         "guardian_native_multi_agent_history": {
