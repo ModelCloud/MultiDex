@@ -1,6 +1,10 @@
 mod managed;
+mod model_catalog;
 mod shared_instructions;
 mod shutdown;
+
+#[cfg(test)]
+pub(crate) use model_catalog::multidex_model_catalog_for_config;
 
 pub use shutdown::AgentTreeShutdown;
 pub use shutdown::AgentTreeShutdownFailure;
@@ -15,11 +19,11 @@ use crate::agent::LocalAgentControl;
 use crate::agent::api::AgentConfigUpdate;
 use crate::agent::api::AgentControl;
 use crate::agent::control::AgentControlInit;
+use crate::agent::host::InheritedSessionId;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
-use crate::config::ThreadStoreConfig;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_requests;
@@ -41,7 +45,6 @@ use crate::tasks::interrupted_turn_history_marker;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
-use codex_agent_message_board_extension::local_board_options;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
@@ -73,8 +76,6 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
 use codex_login::default_client::originator;
-use codex_message_board::LocalAgentMessageBoard;
-use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::manager::RefreshStrategy;
@@ -84,7 +85,6 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -103,7 +103,6 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
-use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
@@ -439,6 +438,7 @@ struct ThreadSpawnRequest {
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
     options: StartThreadOptions,
     auth_manager: Arc<AuthManager>,
+    inherited_runtime_auth: Option<crate::runtime_auth::RuntimeAuthSlot>,
     agent_control: AgentControlInit,
     parent_thread_id: Option<ThreadId>,
     parent_originator: Option<String>,
@@ -462,6 +462,7 @@ impl ThreadSpawnRequest {
             startup: None,
             options,
             auth_manager,
+            inherited_runtime_auth: None,
             agent_control: agent_control.into(),
             parent_thread_id: None,
             parent_originator: None,
@@ -531,8 +532,9 @@ pub(crate) struct ThreadManagerState {
     thread_id_generator: ThreadIdGenerator,
     agent_control_factory: Option<AgentControlFactory>,
     auth_manager: Arc<AuthManager>,
-    models_manager: SharedModelsManager,
-    /// Provider id `models_manager` was built for; threads on another provider get a manager
+    runtime_auth: crate::runtime_auth::RuntimeAuthSlot,
+    model_catalog: model_catalog::ThreadModelCatalog,
+    /// Provider id `model_catalog` was built for; threads on another provider get a manager
     /// built from their own config instead.
     default_model_provider_id: String,
     git_root_discovery: Arc<GitRootDiscovery>,
@@ -556,145 +558,9 @@ pub(crate) struct ThreadManagerState {
     ops_log: Option<SharedCapturedOps>,
 }
 
-pub fn build_models_manager(
-    config: &Config,
-    auth_manager: Arc<AuthManager>,
-) -> SharedModelsManager {
-    let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
-    let mut manager = provider.models_manager(
-        config.codex_home.to_path_buf(),
-        config.model_catalog.clone(),
-    );
-    // Built-in endpoint entries augment discovery; only a user catalog replaces it.
-    if config.model_catalog.is_none()
-        && let Some(catalog) = multidex_model_catalog_for_config(config)
-    {
-        let additional_models = catalog
-            .models
-            .into_iter()
-            .filter(|model| {
-                codex_model_provider_info::is_multidex_model(&model.slug)
-                    || codex_model_provider_info::is_openrouter_model(&model.slug)
-                    || codex_model_provider_info::is_lithos_model(&model.slug)
-            })
-            .collect();
-        let default_model =
-            if codex_model_provider_info::is_multidex_provider_id(&config.model_provider_id) {
-                Some("DS v4.1 Flash 1017".to_string())
-            } else if config.model_provider_id == codex_model_provider_info::OPENROUTER_PROVIDER_ID
-            {
-                Some(codex_model_provider_info::OPENROUTER_DSV41_FLASH_MODEL_ID.to_string())
-            } else if config.model_provider_id == codex_model_provider_info::LITHOS_PROVIDER_ID {
-                Some(codex_model_provider_info::LITHOS_MODEL_IDS[0].to_string())
-            } else {
-                None
-            };
-        manager = Arc::new(codex_models_manager::manager::ModelsManagerOverlay::new(
-            manager,
-            additional_models,
-            default_model,
-        ));
-    }
-    manager.set_api_key_model_discovery_enabled(
-        config.features.enabled(Feature::ApiKeyModelDiscovery),
-    );
-    manager
-}
-
-fn multidex_model_catalog_for_config(
-    config: &Config,
-) -> Option<codex_protocol::openai_models::ModelsResponse> {
-    config.model_catalog.clone().or_else(|| {
-        // Expose registered endpoint models even while OpenAI is selected so
-        // the app-server picker can switch providers without restarting.
-        let has_multidex =
-            codex_model_provider_info::is_multidex_provider_id(&config.model_provider_id)
-                || config
-                    .model_providers
-                    .keys()
-                    .any(|key| codex_model_provider_info::is_multidex_provider_id(key));
-        let has_openrouter = config
-            .model_providers
-            .contains_key(codex_model_provider_info::OPENROUTER_PROVIDER_ID);
-        let has_lithos = config
-            .model_providers
-            .contains_key(codex_model_provider_info::LITHOS_PROVIDER_ID);
-        (has_multidex || has_openrouter || has_lithos).then(|| {
-            let mut catalog = codex_models_manager::model_info::multidex_model_catalog();
-            catalog.models.retain(|model| {
-                (has_multidex || !codex_model_provider_info::is_multidex_model(&model.slug))
-                    && (has_openrouter
-                        || !codex_model_provider_info::is_openrouter_model(&model.slug))
-                    && (has_lithos || !codex_model_provider_info::is_lithos_model(&model.slug))
-            });
-            catalog
-        })
-    })
-}
-
-pub fn thread_store_from_config(
-    config: &Config,
-    state_db: Option<StateDbHandle>,
-) -> Arc<dyn ThreadStore> {
-    match &config.experimental_thread_store {
-        ThreadStoreConfig::Local => {
-            let compression_enabled = config
-                .features
-                .enabled(Feature::LocalThreadStoreCompression);
-            let background_migration_enabled = config
-                .features
-                .enabled(Feature::BackgroundPaginatedRolloutMigration);
-            let has_state_db = state_db.is_some();
-            let sqlite = config.sqlite_config().clone();
-            let store = Arc::new(
-                LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db)
-                    .with_thread_data_cleanup(move |thread_ids| {
-                        let sqlite = sqlite.clone();
-                        Box::pin(async move {
-                            let boards = thread_ids.into_iter().map(Into::into).collect::<Vec<_>>();
-                            LocalAgentMessageBoard::delete_boards(
-                                &sqlite,
-                                &local_board_options(),
-                                &boards,
-                            )
-                            .await
-                            .map_err(|err| {
-                                ThreadStoreError::Internal {
-                                    message: format!(
-                                        "failed to delete agent message boards: {err}"
-                                    ),
-                                }
-                            })
-                        })
-                    }),
-            );
-            if has_state_db && background_migration_enabled {
-                let startup_store = Arc::clone(&store);
-                let codex_home = config.codex_home.to_path_buf();
-                tokio::spawn(async move {
-                    if let Err(err) = startup_store.migrate_rollouts_on_startup().await {
-                        warn!("failed to migrate legacy rollouts on startup: {err}");
-                    }
-                    if compression_enabled {
-                        codex_rollout::spawn_rollout_compression_worker(
-                            codex_home,
-                            codex_rollout::RolloutCompressionTrigger::Startup,
-                        );
-                    }
-                });
-            } else if compression_enabled {
-                codex_rollout::spawn_rollout_compression_worker(
-                    config.codex_home.to_path_buf(),
-                    codex_rollout::RolloutCompressionTrigger::Startup,
-                );
-            }
-            store
-        }
-        ThreadStoreConfig::InMemory { id } => {
-            Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
-        }
-    }
-}
+pub use model_catalog::StartupModels;
+pub use model_catalog::build_models_manager;
+pub use model_catalog::build_startup_models;
 
 /// Constructs the default image store that preserves inline images.
 pub fn passthrough_image_store() -> Arc<dyn AttachmentStore> {
@@ -714,8 +580,7 @@ impl ThreadManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,
-        auth_manager: Arc<AuthManager>,
-        models_manager: SharedModelsManager,
+        startup: StartupModels,
         codex_apps_tools_cache: CodexAppsToolsCache,
         session_source: SessionSource,
         environment_manager: Arc<EnvironmentManager>,
@@ -725,10 +590,15 @@ impl ThreadManager {
         image_store: Arc<dyn AttachmentStore>,
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
-        installation_id: String,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
+        let StartupModels {
+            credentials: auth_manager,
+            runtime_auth,
+            installation_id,
+            catalog: model_catalog,
+        } = startup;
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
@@ -766,7 +636,8 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
-                models_manager,
+                runtime_auth,
+                model_catalog,
                 default_model_provider_id: config.model_provider_id.clone(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
@@ -971,14 +842,25 @@ impl ThreadManager {
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         Self {
             state: Arc::new(ThreadManagerState {
+                runtime_auth: Default::default(),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
-                models_manager: create_model_provider(provider.clone(), Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
-                default_model_provider_id: provider.name.clone(),
+                model_catalog: model_catalog::ThreadModelCatalog::new(
+                    provider,
+                    /*catalog*/ None,
+                    Arc::new(codex_models_manager::manager::ModelCatalogSettings::disk(
+                        codex_home,
+                    )),
+                    /*api_key_model_discovery_default*/ false,
+                    codex_model_provider::ProviderAuthContext {
+                        credentials: Arc::clone(&auth_manager),
+                        runtime_auth: None,
+                    },
+                ),
+                default_model_provider_id: OPENAI_PROVIDER_ID.to_string(),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -1036,7 +918,7 @@ impl ThreadManager {
 
     /// Starts the local rollout migration path after a runtime feature enablement.
     ///
-    /// Startup config handles the initial launch in [`thread_store_from_config`]. This covers
+    /// Startup config handles the initial launch in [`crate::ThreadStoreBuilder::build`]. This covers
     /// clients that decide to enable background migration after constructing the app-server.
     pub fn start_background_rollout_migration(&self) {
         let Some(store) = self
@@ -1119,7 +1001,31 @@ impl ThreadManager {
     }
 
     pub fn get_models_manager(&self) -> SharedModelsManager {
-        self.state.models_manager.clone()
+        self.state.model_catalog.manager.clone()
+    }
+
+    /// Select the app-server catalog using the same owner as thread requests.
+    pub fn models_manager_for_config(&self, config: &Config) -> SharedModelsManager {
+        let credentials = self.auth_manager();
+        let runtime = crate::runtime_auth::runtime_for_config(
+            &self.state.runtime_auth,
+            config,
+            Arc::clone(&credentials),
+            &self.state.installation_id,
+        );
+        self.state.model_catalog.for_config(
+            config,
+            config.model_catalog.as_ref(),
+            credentials,
+            runtime,
+            /*same_owner*/ true,
+        )
+    }
+
+    pub fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
+        self.state
+            .model_catalog
+            .set_api_key_model_discovery_enabled(enabled);
     }
 
     pub async fn list_models(
@@ -1128,13 +1034,14 @@ impl ThreadManager {
         http_client_factory: codex_http_client::HttpClientFactory,
     ) -> Vec<ModelPreset> {
         self.state
-            .models_manager
+            .model_catalog
+            .manager
             .list_models(refresh_strategy, http_client_factory)
             .await
     }
 
     pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        self.state.models_manager.list_collaboration_modes()
+        self.state.model_catalog.manager.list_collaboration_modes()
     }
 
     pub async fn list_thread_ids(&self) -> Vec<ThreadId> {
@@ -1162,25 +1069,24 @@ impl ThreadManager {
         }
     }
 
-    /// Board hosts may reach internal runtimes only through a matching explicit connection.
-    pub(crate) async fn get_thread_for_board(
+    /// Finds a registered runtime whose host-owned extension data matches the supplied scope.
+    /// Unlike `get_thread`, this can return internal runtimes, but only after validating their
+    /// explicit extension attachment. It never loads a missing runtime.
+    pub async fn get_thread_with_extension<T: Send + Sync + 'static>(
         &self,
         thread_id: ThreadId,
-        connection: &codex_message_board::LocalBoardConnection,
+        matches: impl FnOnce(&T) -> bool,
     ) -> CodexResult<Arc<CodexThread>> {
-        self.state
-            .threads
-            .read()
-            .await
+        let threads = self.state.threads.read().await;
+        let thread = threads
             .get(&thread_id)
-            .filter(|thread| {
-                thread
-                    .thread_extension_data()
-                    .get::<codex_message_board::LocalBoardConnection>()
-                    .is_some_and(|other| connection.same_board(&other))
-            })
-            .cloned()
-            .ok_or(CodexErr::ThreadNotFound(thread_id))
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let extension = thread.thread_extension_data().get::<T>();
+        if extension.as_deref().is_some_and(matches) {
+            Ok(Arc::clone(thread))
+        } else {
+            Err(CodexErr::ThreadNotFound(thread_id))
+        }
     }
 
     /// Updates metadata for loaded and cold threads through one entrypoint.
@@ -2014,30 +1920,13 @@ impl ThreadManagerState {
     }
 
     pub(crate) fn shared_models_manager(&self) -> SharedModelsManager {
-        Arc::clone(&self.models_manager)
+        Arc::clone(&self.model_catalog.manager)
     }
 
-    /// The provider id `self.models_manager` was built for. Threads pinned to a different
+    /// The provider id the shared catalog was built for. Threads pinned to a different
     /// provider need their own manager built from their effective config.
     pub(crate) fn default_model_provider_id(&self) -> &str {
         &self.default_model_provider_id
-    }
-
-    /// Manager for a spawned or resumed thread: the shared manager serves the default
-    /// provider; any other provider gets a fresh manager built from the thread's config so
-    /// cold restore keeps a cross-provider child on its own catalog.
-    fn models_manager_for_spawn(
-        &self,
-        config: &Config,
-        auth_manager: &Arc<AuthManager>,
-        originator: &str,
-    ) -> SharedModelsManager {
-        let base = if config.model_provider_id == self.default_model_provider_id {
-            Arc::clone(&self.models_manager)
-        } else {
-            build_models_manager(config, Arc::clone(auth_manager))
-        };
-        base.for_originator(originator).unwrap_or(base)
     }
 
     pub(crate) async fn load_latest_model_context(
@@ -2073,7 +1962,7 @@ impl ThreadManagerState {
                 .session
                 .services
                 .local_agent_runtime
-                .pin_v2_residency(self, &thread)
+                .pin_v2_residency(&thread)
                 .await?
         } else {
             None
@@ -2269,8 +2158,9 @@ impl ThreadManagerState {
         (options.client_mcp_extensions, options.prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
         let forked = matches!(options.initial_history, InitialHistory::Forked(_));
-        let mut request =
-            ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
+        let (auth_manager, runtime_auth) = self.inherited_child_auth(parent_thread_id).await;
+        let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
+        request.inherited_runtime_auth = Some(runtime_auth);
         request.parent_thread_id = parent_thread_id;
         request.inherited_exec_policy = inherited_exec_policy;
         if forked {
@@ -2291,8 +2181,9 @@ impl ThreadManagerState {
         options.reserved_thread_id.ok_or_else(|| {
             CodexErr::InvalidRequest("prepared child startup requires a reserved thread ID".into())
         })?;
-        let mut request =
-            ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
+        let (auth_manager, runtime_auth) = self.inherited_child_auth(Some(parent_thread_id)).await;
+        let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
+        request.inherited_runtime_auth = Some(runtime_auth);
         request.ready_notification = ThreadReadyNotification::Defer;
         request.parent_thread_id = Some(parent_thread_id);
         let history_initialization = match &request.options.initial_history {
@@ -2363,6 +2254,23 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread(request)).await
     }
 
+    async fn inherited_child_auth(
+        &self,
+        parent_thread_id: Option<ThreadId>,
+    ) -> (Arc<AuthManager>, crate::runtime_auth::RuntimeAuthSlot) {
+        let threads = self.threads.read().await;
+        match parent_thread_id.and_then(|id| threads.get(&id)) {
+            Some(parent) => (
+                Arc::clone(&parent.session.services.auth_manager),
+                Arc::clone(&parent.session.services.runtime_auth),
+            ),
+            None => (
+                Arc::clone(&self.auth_manager),
+                Arc::clone(&self.runtime_auth),
+            ),
+        }
+    }
+
     async fn inherited_child_settings(
         &self,
         parent_thread_id: Option<ThreadId>,
@@ -2414,6 +2322,7 @@ impl ThreadManagerState {
             startup,
             options,
             auth_manager,
+            inherited_runtime_auth,
             agent_control,
             parent_thread_id,
             parent_originator,
@@ -2475,6 +2384,15 @@ impl ThreadManagerState {
         }
         let inherited_environments = captured_environments.or(inherited_environments);
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
+        if thread_extension_init.get::<InheritedSessionId>().is_some()
+            && (!matches!(&initial_history, InitialHistory::New)
+                || session_source.is_non_root_agent())
+        {
+            return Err(CodexErr::InvalidRequest(
+                "an inherited agent session ID requires a fresh thread started directly by the host"
+                    .to_string(),
+            ));
+        }
         // Older callers and saved reviewers identify isolation through their source.
         // New internal callers supply an explicit runtime policy before startup.
         let isolation = thread_extension_init
@@ -2706,8 +2624,36 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        let models_manager =
-            self.models_manager_for_spawn(&config, &auth_manager, &startup_context.originator);
+        // Resume may supply a different credential owner. Keep its runtime separate from the
+        // harness default, and let sessions using that parent's credentials inherit its owner.
+        let runtime_auth = if let Some(runtime_auth) = inherited_runtime_auth {
+            runtime_auth
+        } else if Arc::ptr_eq(&auth_manager, &self.auth_manager) {
+            Arc::clone(&self.runtime_auth)
+        } else {
+            let threads = self.threads.read().await;
+            parent_thread_id
+                .or(forked_from_thread_id)
+                .and_then(|id| threads.get(&id))
+                .filter(|parent| Arc::ptr_eq(&parent.session.services.auth_manager, &auth_manager))
+                .map(|parent| Arc::clone(&parent.session.services.runtime_auth))
+                .unwrap_or_default()
+        };
+        let runtime = crate::runtime_auth::runtime_for_config(
+            &runtime_auth,
+            &config,
+            Arc::clone(&auth_manager),
+            &self.installation_id,
+        );
+        let manager = self.model_catalog.for_thread(
+            &config,
+            Arc::clone(&auth_manager),
+            runtime,
+            Arc::ptr_eq(&auth_manager, &self.auth_manager),
+        );
+        let models_manager = manager
+            .for_originator(&startup_context.originator)
+            .unwrap_or(manager);
         let spawn_result = Session::spawn(SessionSpawnArgs {
             attached_thread,
             startup,
@@ -2717,6 +2663,7 @@ impl ThreadManagerState {
             instructions: startup_context.instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
+            runtime_auth,
             models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
@@ -2743,7 +2690,7 @@ impl ThreadManagerState {
             },
             forked_from_thread_id,
             parent_thread_id,
-            thread_source: thread_source.clone(),
+            thread_source,
             originator: startup_context.originator,
             agent_control,
             dynamic_tools,
@@ -2798,17 +2745,6 @@ impl ThreadManagerState {
             {
                 warn!(%thread_id, %source_thread_id, %error, "failed to copy fork attachments");
             }
-        }
-        // Enable Full Access form input only after session startup so a required MCP server cannot
-        // block startup while waiting for form input.
-        if session
-            .services
-            .client_mcp_extensions
-            .contains(OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID)
-            && matches!(thread_source.as_ref(), Some(ThreadSource::User))
-            && !tracked_session_source.is_non_root_agent()
-        {
-            session.services.mcp_runtime.enable_full_access_form_input();
         }
         let finalize_result = self
             .finalize_thread_spawn(session, io, tracked_session_source, initial_host_config)

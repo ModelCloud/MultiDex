@@ -282,6 +282,7 @@ async fn apply_requested_spawn_agent_model_overrides(
         Some(crate::thread_manager::build_models_manager(
             config,
             std::sync::Arc::clone(&session.services.auth_manager),
+            /*runtime*/ None,
         ))
     } else {
         None

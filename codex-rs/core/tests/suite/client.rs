@@ -6,10 +6,10 @@ use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::ThreadStoreBuilder;
 use codex_core::TurnInputRequest;
 use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::resolve_installation_id;
-use codex_core::thread_store_from_config;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_history::RolloutItem;
@@ -26,6 +26,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_models_manager::manager::ModelCatalogSettings;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ResponseItemId;
@@ -2200,12 +2201,14 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         SessionSource::Exec,
     );
     let client = ModelClient::new(
-        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
-            "unused-api-key",
-        ))),
+        codex_model_provider::create_model_provider(
+            provider,
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "unused-api-key",
+            ))),
+        ),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        provider,
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
@@ -2453,8 +2456,12 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         .expect("resolve installation id");
     let thread_manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        codex_core::build_models_manager(&config, auth_manager),
+        codex_core::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            installation_id,
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         codex_core::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2462,9 +2469,8 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         Arc::new(codex_core::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         codex_core::passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        installation_id,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -3712,10 +3718,9 @@ async fn azure_responses_request_stores_and_preserves_prefixed_item_ids() {
     );
 
     let client = ModelClient::new(
-        /*auth_manager*/ None,
+        codex_model_provider::create_model_provider(provider.clone(), /*auth_manager*/ None),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        provider.clone(),
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
