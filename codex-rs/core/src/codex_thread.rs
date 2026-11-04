@@ -245,7 +245,24 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.io.submit(op).await
+        self.submit_with_trace(op, None).await
+    }
+
+    fn ensure_bgr_reviewer_op_allowed(&self, op: &Op) -> CodexResult<()> {
+        if self.is_bgr_reviewer() && !crate::bgr::allows_reviewer_op(op) {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer operation is forbidden".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_bgr_reviewer(&self) -> bool {
+        self.session
+            .services
+            .thread_extension_data
+            .get::<crate::bgr::BgrReviewerIsolation>()
+            .is_some()
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -456,6 +473,7 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        self.ensure_bgr_reviewer_op_allowed(&op)?;
         self.io
             .submit_with_trace(
                 op, trace, /*parent_turn_id*/ None, /*root_turn_id*/ None,
@@ -660,6 +678,14 @@ impl CodexThread {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        let request = request.into();
+        if self.is_bgr_reviewer()
+            && !crate::bgr::allows_reviewer_settings(&request.request.thread_settings)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer settings are immutable except model routing".into(),
+            ));
+        }
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.ensure_execution_capacity_for_turn_start(
                 self.session.services.agent_control.as_ref(),
@@ -770,12 +796,14 @@ impl CodexThread {
             request: thread_settings,
             turn_extension_init,
         } = thread_settings.into();
+        let op = Op::ThreadSettings {
+            thread_settings,
+            reply: Some(reply),
+        };
+        self.ensure_bgr_reviewer_op_allowed(&op)?;
         self.io
             .submit(WithTurnExtensionData {
-                request: Op::ThreadSettings {
-                    thread_settings,
-                    reply: Some(reply),
-                },
+                request: op,
                 turn_extension_init,
             })
             .await?;
@@ -805,6 +833,11 @@ impl CodexThread {
         &self,
         tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     ) -> CodexResult<()> {
+        if self.is_bgr_reviewer() {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer tool policy is immutable".into(),
+            ));
+        }
         let (reply, result) = oneshot::channel();
         self.io
             .submit(Op::ReplaceDynamicTools { tools, reply })

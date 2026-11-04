@@ -22,8 +22,65 @@ use codex_protocol::protocol::SessionSource;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
+mod reviewer;
+
 const MAX_MESSAGES: usize = 128;
 pub(crate) struct BgrBinding;
+pub(crate) struct BgrReviewerIsolation;
+
+pub(crate) fn allows_reviewer_op(op: &Op) -> bool {
+    match op {
+        Op::TurnInput { request, .. } => return allows_reviewer_settings(&request.thread_settings),
+        Op::ThreadSettings {
+            thread_settings, ..
+        }
+        | Op::RecoverTurn {
+            thread_settings, ..
+        } => return allows_reviewer_settings(thread_settings),
+        _ => {}
+    }
+    matches!(
+        op,
+        Op::Interrupt
+            | Op::InterruptIfNoPendingInput { .. }
+            | Op::TurnInput { .. }
+            | Op::RecoverTurn { .. }
+            | Op::SuspendTurnAndShutdown { .. }
+            | Op::ThreadSettings { .. }
+            | Op::InterAgentCommunication { .. }
+            | Op::DynamicToolResponse { .. }
+            | Op::Compact
+            | Op::Shutdown
+    )
+}
+
+pub(crate) fn allows_reviewer_settings(
+    settings: &codex_protocol::protocol::ThreadSettingsOverrides,
+) -> bool {
+    use codex_protocol::protocol::ThreadSettingsOverrides;
+    matches!(
+        settings,
+        ThreadSettingsOverrides {
+            environments: None,
+            runtime_workspace_roots: None,
+            profile_workspace_roots: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            permission_profile: None,
+            active_permission_profile: None,
+            windows_sandbox_level: None,
+            collaboration_mode: None,
+            personality: None,
+            disabled_plugin_ids: None,
+            model: _,
+            model_provider: _,
+            effort: _,
+            summary: _,
+            service_tier: _,
+        }
+    )
+}
 
 pub(crate) fn is_delegation_tool(name: &str) -> bool {
     matches!(
@@ -52,6 +109,7 @@ pub(crate) struct BgrRuntime {
     replies: BTreeMap<String, BgrEnvelope>,
     peers: BTreeMap<String, BgrIdentity>,
     outgoing: BTreeMap<String, BgrEnvelope>,
+    review_head_sha: Option<String>,
 }
 
 fn invalid(message: impl Into<String>) -> CodexErr {
@@ -140,8 +198,12 @@ fn validate_envelope(envelope: &BgrEnvelope) -> Result<()> {
 
 impl BgrRuntime {
     fn new(identity: BgrIdentity) -> Result<Self> {
+        Self::new_with_reviewer(identity, false)
+    }
+
+    fn new_with_reviewer(identity: BgrIdentity, reviewer: bool) -> Result<Self> {
         validate_identity(&identity)?;
-        if identity.role == BgrRole::Reviewer {
+        if identity.role == BgrRole::Reviewer && !reviewer {
             return Err(invalid(
                 "reviewer sandbox enforcement is not supported by BGR v1",
             ));
@@ -155,6 +217,7 @@ impl BgrRuntime {
             replies: BTreeMap::new(),
             peers: BTreeMap::new(),
             outgoing: BTreeMap::new(),
+            review_head_sha: None,
         })
     }
 
@@ -180,6 +243,7 @@ impl BgrRuntime {
     }
 
     fn validate_message(&self, sender: &BgrSender, envelope: &BgrEnvelope) -> Result<bool> {
+        self.check_review_head(envelope)?;
         let Some(target) = &envelope.recipient_identity else {
             return self.validate_query(sender, envelope);
         };
@@ -190,7 +254,8 @@ impl BgrRuntime {
             || envelope.sender_agent_id != sender.agent_id
             || envelope.recipient_agent_id != target.agent_id
             || self.peers.get(&sender.agent_id) != Some(&envelope.identity)
-            || (envelope.kind == BgrMessageKind::Cancel && sender.role != BgrRole::Brain)
+            || (matches!(envelope.kind, BgrMessageKind::Task | BgrMessageKind::Cancel)
+                && sender.role != BgrRole::Brain)
         {
             return Err(invalid(
                 "BGR source, recipient, role or assignment fence mismatch",
@@ -273,12 +338,14 @@ impl BgrRuntime {
 
     fn emit(&mut self, envelope: BgrEnvelope) -> Result<(BgrEnvelope, bool)> {
         self.check_identity(&self.identity)?;
+        self.check_review_head(&envelope)?;
         validate_envelope(&envelope)?;
         if envelope.identity != self.identity
             || envelope.sender_agent_id != self.identity.agent_id
             || envelope.recipient_identity.as_ref() != self.peers.get(&envelope.recipient_agent_id)
             || envelope.recipient_identity.is_none()
-            || (envelope.kind == BgrMessageKind::Cancel && self.identity.role != BgrRole::Brain)
+            || (matches!(envelope.kind, BgrMessageKind::Task | BgrMessageKind::Cancel)
+                && self.identity.role != BgrRole::Brain)
         {
             return Err(invalid("BGR outgoing peer or source identity mismatch"));
         }
@@ -347,6 +414,17 @@ impl BgrRuntime {
         }
         if self.cancelled {
             return Err(invalid("BGR assignment is cancelled"));
+        }
+        Ok(())
+    }
+
+    fn check_review_head(&self, envelope: &BgrEnvelope) -> Result<()> {
+        if self
+            .review_head_sha
+            .as_ref()
+            .is_some_and(|head| envelope.head_sha.as_ref() != Some(head))
+        {
+            return Err(invalid("reviewer message must preserve frozen review head"));
         }
         Ok(())
     }
@@ -422,7 +500,7 @@ impl BgrRuntime {
         if query.kind != BgrMessageKind::StatusQuery {
             return Err(invalid("status reports require a status_query"));
         }
-        if query.payload["scope"] != "now"
+        if (query.recipient_identity.is_some() || query.payload["scope"] != "now")
             && !report
                 .payload
                 .coverage_limits
@@ -455,6 +533,16 @@ impl BgrRuntime {
             > MAX_BYTES
         {
             return Err(invalid("oversized BGR status reply envelope"));
+        }
+        if envelope.recipient_identity.is_some() {
+            if self.outgoing.values().any(|previous| {
+                previous.kind == BgrMessageKind::StatusReply
+                    && previous.in_reply_to == envelope.in_reply_to
+                    && previous != &envelope
+            }) {
+                return Err(invalid("BGR query already answered with different content"));
+            }
+            return self.emit(envelope);
         }
         if let Some(previous) = self.replies.get(&query.message_id) {
             return if previous == &envelope {
@@ -870,6 +958,53 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bgr_general_now_report_rejects_missing_limits_at_source_and_routes_to_brain() {
+        let brain_id = identity(BgrRole::Brain);
+        let worker_id = identity(BgrRole::Grunt);
+        let mut brain = BgrRuntime::new(brain_id.clone()).unwrap();
+        let mut worker = BgrRuntime::new(worker_id.clone()).unwrap();
+        brain.set_peers(&brain_id, vec![worker_id.clone()]).unwrap();
+        worker.set_peers(&worker_id, vec![brain_id]).unwrap();
+        let (query, _) = brain
+            .send_message(BgrSendMessageArgs {
+                message_id: "general-now".into(),
+                recipient_agent_id: worker_id.agent_id.clone(),
+                kind: BgrMessageKind::StatusQuery,
+                correlation_id: "status-correlation".into(),
+                in_reply_to: None,
+                payload: json!({"scope":"now"}),
+                head_sha: None,
+            })
+            .unwrap();
+        assert!(worker.validate_message(&sender(), &query).unwrap());
+        worker.queries.insert(query.message_id.clone(), query);
+        let before = worker.snapshot();
+        for limits in [vec![], vec![" ".into()]] {
+            let mut invalid = report("general-now");
+            invalid.payload.coverage_limits = limits;
+            assert!(worker.report(invalid).is_err());
+            assert_eq!(worker.snapshot(), before);
+        }
+        let valid = report("general-now");
+        let (reply, fresh) = worker.report(valid.clone()).unwrap();
+        assert!(fresh);
+        assert_eq!(
+            worker.report(valid.clone()).unwrap(),
+            (reply.clone(), false)
+        );
+        assert_eq!(worker.outgoing.get(&reply.message_id), Some(&reply));
+        assert!(
+            brain
+                .validate_message(&BgrSender::from(&worker_id), &reply)
+                .unwrap()
+        );
+        let mut conflict = valid;
+        conflict.message_id = "another-status-reply".into();
+        assert!(worker.report(conflict).is_err());
+        assert_eq!(worker.outgoing.len(), 1);
     }
 
     #[test]

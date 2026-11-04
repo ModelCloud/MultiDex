@@ -28,7 +28,10 @@ pub struct BgrCapabilitiesReadResponse {
     pub durable_mailbox: bool,
     pub restart_recovery: bool,
     pub reviewer_sandbox: bool,
+    pub reviewer_start: bool,
+    pub review_snapshot_tool: codex_protocol::dynamic_tools::DynamicToolSpec,
     pub host_delivery: bool,
+    pub host_record: bool,
     pub cross_host_delivery: bool,
     pub task_dispatch: bool,
     pub max_queries_per_attempt: u32,
@@ -78,12 +81,21 @@ pub struct BgrMessageDeliverParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrMessageRecordParams {
+    pub thread_id: String,
+    pub identity: BgrIdentity,
+    pub envelope: BgrEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BgrMessageSendResponse {
     pub message_id: String,
     pub duplicate: bool,
-    /// Acceptance into a process-local queue, not delivery or a durable receipt.
+    /// Process-local acceptance (source metadata for record), not consumption or durability.
     pub accepted: bool,
 }
 
@@ -92,6 +104,15 @@ pub struct BgrMessageSendResponse {
 #[ts(export_to = "v2/")]
 pub struct BgrThreadStateResponse {
     pub snapshot: BgrSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BgrReviewerStartResponse {
+    pub thread_id: String,
+    pub snapshot: BgrSnapshot,
+    pub review: BgrReviewManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

@@ -1029,6 +1029,7 @@ impl MessageProcessor {
 
         let (turn_admission, recheck_turn_admission) = match &codex_request {
             ClientRequest::ThreadStart { .. }
+            | ClientRequest::BgrReviewerStart { .. }
             | ClientRequest::ThreadFork { .. }
             | ClientRequest::ThreadResume { .. }
             | ClientRequest::ThreadRevert { .. }
@@ -1336,6 +1337,11 @@ impl MessageProcessor {
                 .peers(params)
                 .await
                 .map(|response| Some(ClientResponsePayload::BgrThreadPeers(response))),
+            ClientRequest::BgrReviewerStart { params, .. } => self
+                .thread_processor
+                .bgr_reviewer_start(request_id.clone(), params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrReviewerStart(response))),
             ClientRequest::BgrMessageSend { params, .. } => self
                 .bgr_processor
                 .send(params)
@@ -1346,6 +1352,11 @@ impl MessageProcessor {
                 .deliver(params)
                 .await
                 .map(|response| Some(ClientResponsePayload::BgrMessageDeliver(response))),
+            ClientRequest::BgrMessageRecord { params, .. } => self
+                .bgr_processor
+                .record(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrMessageRecord(response))),
             ClientRequest::BgrThreadInspect { params, .. } => self
                 .bgr_processor
                 .inspect(params)

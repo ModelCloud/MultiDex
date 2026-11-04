@@ -1198,6 +1198,37 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
+    pub(crate) async fn bgr_reviewer_start(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::BgrReviewerStartParams,
+    ) -> Result<codex_app_server_protocol::BgrReviewerStartResponse, JSONRPCErrorError> {
+        let (new_thread, review) = self
+            .thread_manager
+            .start_bgr_reviewer(self.config.as_ref().clone(), params)
+            .await
+            .map_err(|error| invalid_request(error.to_string()))?;
+        let thread_id = new_thread.thread_id;
+        if let Err(error) = self
+            .ensure_conversation_listener(thread_id, request_id.connection_id, false)
+            .await
+        {
+            let _ = new_thread.thread.shutdown_and_wait().await;
+            self.thread_manager.remove_thread(&thread_id).await;
+            return Err(error);
+        }
+        let snapshot = new_thread
+            .thread
+            .inspect_bgr()
+            .await
+            .map_err(|error| invalid_request(error.to_string()))?;
+        Ok(codex_app_server_protocol::BgrReviewerStartResponse {
+            thread_id: thread_id.to_string(),
+            snapshot,
+            review,
+        })
+    }
+
     fn listener_task_context(&self) -> ListenerTaskContext {
         ListenerTaskContext {
             thread_manager: Arc::clone(&self.thread_manager),

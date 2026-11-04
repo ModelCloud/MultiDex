@@ -18,6 +18,687 @@ use tokio::time::timeout;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 #[tokio::test]
+async fn bgr_host_records_source_before_routing_between_separate_app_servers() -> Result<()> {
+    let brain_server=create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![responses::ev_response_created("answer"),responses::ev_function_call("answer","bgr_reply_message",&json!({"messageId":"answer","inReplyTo":"question","kind":"answer","payload":{"text":"Confirmed scope."}}).to_string()),responses::ev_completed("answer")]),
+        create_final_assistant_message_sse_response("Answer sent.")?,
+        create_final_assistant_message_sse_response("Worker result received.")?,
+    ]).await;
+    let worker_server=create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![responses::ev_response_created("question"),responses::ev_function_call("question","bgr_reply_message",&json!({"messageId":"question","inReplyTo":"task","kind":"question","payload":{"text":"Confirm scope?"}}).to_string()),responses::ev_completed("question")]),
+        create_final_assistant_message_sse_response("Awaiting clarification.")?,
+        responses::sse(vec![responses::ev_response_created("result"),responses::ev_function_call("result","bgr_reply_message",&json!({"messageId":"result","inReplyTo":"task","kind":"result","payload":{"text":"Completed."}}).to_string()),responses::ev_completed("result")]),
+        create_final_assistant_message_sse_response("Work complete.")?,
+    ]).await;
+    let brain_home = TempDir::new()?;
+    let worker_home = TempDir::new()?;
+    for (home, server) in [(&brain_home, &brain_server), (&worker_home, &worker_server)] {
+        MockResponsesConfig::new(&server.uri())
+            .disable_feature(Feature::Collab)
+            .disable_feature(Feature::MultiAgentV2)
+            .enable_feature(Feature::DeferMailboxPreemption)
+            .write(home.path())?;
+    }
+    let mut brain = TestAppServer::builder()
+        .with_codex_home(brain_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    let mut worker = TestAppServer::builder()
+        .with_codex_home(worker_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(TIMEOUT, brain.initialize()).await??;
+    timeout(TIMEOUT, worker.initialize()).await??;
+    let capabilities: BgrCapabilitiesReadResponse =
+        rpc(&mut brain, "bgr/capabilities/read", json!({})).await?;
+    assert!(capabilities.host_record);
+    let mut brain_id = identity("brain", BgrRole::Brain);
+    brain_id.task_id = None;
+    brain_id.attempt_id = None;
+    let worker_id = identity("worker", BgrRole::Grunt);
+    let mut threads = Vec::new();
+    for (mcp, bound, peer) in [
+        (&mut brain, &brain_id, &worker_id),
+        (&mut worker, &worker_id, &brain_id),
+    ] {
+        let started:ThreadStartResponse=rpc(mcp,"thread/start",json!({"dynamicTools":[capabilities.report_tool,capabilities.send_tool,capabilities.reply_tool]})).await?;
+        rpc::<BgrThreadStateResponse>(
+            mcp,
+            "bgr/thread/bind",
+            json!({"threadId":started.thread.id,"identity":bound}),
+        )
+        .await?;
+        rpc::<BgrThreadStateResponse>(
+            mcp,
+            "bgr/thread/peers",
+            json!({"threadId":started.thread.id,"identity":bound,"peers":[peer]}),
+        )
+        .await?;
+        threads.push(started.thread.id);
+    }
+    let task = BgrEnvelope {
+        version: BGR_VERSION,
+        message_id: "task".into(),
+        sender_agent_id: brain_id.agent_id.clone(),
+        recipient_agent_id: worker_id.agent_id.clone(),
+        identity: brain_id.clone(),
+        recipient_identity: Some(worker_id.clone()),
+        kind: BgrMessageKind::Task,
+        correlation_id: "correlation".into(),
+        in_reply_to: None,
+        payload: json!({"text":"Perform work and clarify scope."}),
+        head_sha: Some("a".repeat(40)),
+    };
+    let record = json!({"threadId":threads[0],"identity":brain_id,"envelope":task});
+    for mut invalid in [record.clone(), record.clone(), record.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        match invalid.0 {
+            0 => invalid.1["identity"]["epoch"] = json!(2),
+            1 => {
+                invalid.1["envelope"]["recipientIdentity"]["attemptId"] = json!("stale");
+            }
+            _ => {
+                invalid.1["envelope"]["identity"]["agentId"] = json!("spoofed");
+            }
+        }
+        let id = brain
+            .send_raw_request("bgr/message/record", Some(invalid.1))
+            .await?;
+        timeout(
+            TIMEOUT,
+            brain.read_stream_until_error_message(RequestId::Integer(id)),
+        )
+        .await??;
+    }
+    let first: BgrMessageSendResponse =
+        rpc(&mut brain, "bgr/message/record", record.clone()).await?;
+    assert!(first.accepted && !first.duplicate);
+    let duplicate: BgrMessageSendResponse =
+        rpc(&mut brain, "bgr/message/record", record.clone()).await?;
+    assert!(duplicate.accepted && duplicate.duplicate);
+    let mut conflict = record.clone();
+    conflict["envelope"]["payload"] = json!({"text":"changed"});
+    let id = brain
+        .send_raw_request("bgr/message/record", Some(conflict))
+        .await?;
+    timeout(
+        TIMEOUT,
+        brain.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    let source: BgrThreadStateResponse = rpc(
+        &mut brain,
+        "bgr/thread/inspect",
+        json!({"threadId":threads[0]}),
+    )
+    .await?;
+    assert_eq!(source.snapshot.replies, vec![task.clone()]);
+    assert!(source.snapshot.pending.is_empty());
+    assert!(brain_server.received_requests().await.unwrap().is_empty());
+    assert!(worker_server.received_requests().await.unwrap().is_empty());
+    rpc::<BgrMessageSendResponse>(
+        &mut worker,
+        "bgr/message/deliver",
+        json!({"threadId":threads[1],"sender":BgrSender::from(&brain_id),"envelope":task}),
+    )
+    .await?;
+    let mut callbacks = Vec::new();
+    for (index, kind) in [
+        BgrMessageKind::Question,
+        BgrMessageKind::Answer,
+        BgrMessageKind::Result,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (source, target, target_thread, sender) = if index == 1 {
+            (&mut brain, &mut worker, &threads[1], &brain_id)
+        } else {
+            (&mut worker, &mut brain, &threads[0], &worker_id)
+        };
+        let callback: BgrMessageNotification =
+            timeout(TIMEOUT, source.read_notification("bgr/message")).await??;
+        assert_eq!(callback.envelope.kind, kind);
+        assert_eq!(callback.envelope.correlation_id, "correlation");
+        assert_eq!(callback.envelope.head_sha, Some("a".repeat(40)));
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, source.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        rpc::<BgrMessageSendResponse>(target,"bgr/message/deliver",json!({"threadId":target_thread,"sender":BgrSender::from(sender),"envelope":callback.envelope})).await?;
+        callbacks.push(callback);
+    }
+    let completed: TurnCompletedNotification =
+        timeout(TIMEOUT, brain.read_notification("turn/completed")).await??;
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+    let mut progress = task.clone();
+    progress.message_id = "late-progress".into();
+    progress.kind = BgrMessageKind::Progress;
+    progress.in_reply_to = Some("task".into());
+    progress.identity = worker_id.clone();
+    progress.sender_agent_id = worker_id.agent_id.clone();
+    progress.recipient_identity = Some(brain_id.clone());
+    progress.recipient_agent_id = brain_id.agent_id.clone();
+    let mut stale = worker_id.clone();
+    stale.attempt_id = Some("stale-attempt".into());
+    let mut stale_progress = progress.clone();
+    stale_progress.identity = stale.clone();
+    let id = worker
+        .send_raw_request(
+            "bgr/message/record",
+            Some(json!({"threadId":threads[1],"identity":stale,"envelope":stale_progress})),
+        )
+        .await?;
+    timeout(
+        TIMEOUT,
+        worker.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    rpc::<BgrThreadStateResponse>(
+        &mut worker,
+        "bgr/thread/cancel",
+        json!({"threadId":threads[1],"identity":worker_id}),
+    )
+    .await?;
+    let before: BgrThreadStateResponse = rpc(
+        &mut worker,
+        "bgr/thread/inspect",
+        json!({"threadId":threads[1]}),
+    )
+    .await?;
+    let id = worker
+        .send_raw_request(
+            "bgr/message/record",
+            Some(json!({"threadId":threads[1],"identity":worker_id,"envelope":progress})),
+        )
+        .await?;
+    let error = timeout(
+        TIMEOUT,
+        worker.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    assert!(error.error.message.contains("cancelled"));
+    let after: BgrThreadStateResponse = rpc(
+        &mut worker,
+        "bgr/thread/inspect",
+        json!({"threadId":threads[1]}),
+    )
+    .await?;
+    assert_eq!(before, after);
+    assert_eq!(brain_server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(worker_server.received_requests().await.unwrap().len(), 4);
+    if let Some(path) = std::env::var_os("BGR_RECORD_TRANSCRIPT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(
+                &json!({"capabilities":capabilities,"record":{"params":record,"result":first,"duplicate":duplicate},"callbacks":callbacks,"providerRequestCounts":{"brain":3,"worker":4}}),
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bgr_two_isolated_reviewers_and_grunt_clarify_and_return_out_of_order_results() -> Result<()>
+{
+    let repository = TempDir::new()?;
+    let private = TempDir::new()?;
+    let secret = private.path().join("private-token");
+    std::fs::write(&secret, "FORGE_CREDENTIAL_CANARY_DO_NOT_EXPOSE")?;
+    let git = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .output()?;
+        anyhow::ensure!(output.status.success(), "fixture git failed: {args:?}");
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    };
+    git(&["init"])?;
+    std::fs::write(
+        repository.path().join("review.rs"),
+        "pub const VALUE: u32 = 1;\n",
+    )?;
+    git(&["add", "review.rs"])?;
+    git(&["commit", "-m", "immutable base"])?;
+    let base = git(&["rev-parse", "HEAD"])?;
+    std::fs::write(
+        repository.path().join("review.rs"),
+        "pub const VALUE: u32 = 2;\n",
+    )?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, repository.path().join("escape"))?;
+    git(&["add", "."])?;
+    git(&["commit", "-m", "immutable head"])?;
+    let head = git(&["rev-parse", "HEAD"])?;
+    // Repository diff helpers must never run in the trusted snapshot extractor.
+    let external_marker = private.path().join("external-helper-ran");
+    let textconv_marker = private.path().join("textconv-helper-ran");
+    std::fs::write(
+        repository.path().join(".gitattributes"),
+        "review.rs diff=credential_probe\n",
+    )?;
+    git(&[
+        "config",
+        "diff.credential_probe.textconv",
+        &format!("touch {}", textconv_marker.display()),
+    ])?;
+    git(&[
+        "config",
+        "diff.external",
+        &format!("touch {}", external_marker.display()),
+    ])?;
+    git(&[
+        "config",
+        "core.pager",
+        &format!("touch {}", external_marker.display()),
+    ])?;
+    let mut servers = Vec::new();
+    for index in 0..3 {
+        let question = json!({"messageId":format!("{:032x}",0x300+index),"inReplyTo":format!("{:032x}",0x100+index),
+            "kind":"question","payload":{"text":"Is VALUE=2 the intended contract?"}});
+        let result = json!({"messageId":format!("{:032x}",0x400+index),"inReplyTo":format!("{:032x}",0x100+index),
+            "kind":"result","payload":{"outcome":if index==1 {"incomplete"} else {"no_findings"},
+                "findings":[],"coverageLimits":["No tests executed; immutable source inspection only."]}});
+        let mut sequence = Vec::new();
+        if index < 2 {
+            let mut calls = vec![responses::ev_response_created("snapshot")];
+            for (read, path) in [
+                "head/review.rs",
+                "/etc/passwd",
+                "../private-token",
+                "base/../../private-token",
+                "head/escape",
+                "runtime/auth.json",
+                "head/sibling-findings.json",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                calls.push(responses::ev_function_call(
+                    &format!("read-{read}"),
+                    BGR_REVIEW_SNAPSHOT_TOOL,
+                    &json!({"path":path}).to_string(),
+                ));
+            }
+            calls.push(responses::ev_function_call(
+                "forbidden-shell",
+                "exec_command",
+                &json!({"cmd":format!("cat {}", secret.display())}).to_string(),
+            ));
+            calls.push(responses::ev_function_call(
+                "forbidden-spawn",
+                "spawn_agent",
+                "{\"message\":\"Bypass controller\"}",
+            ));
+            calls.push(responses::ev_function_call(
+                "forbidden-mcp",
+                "read_mcp_resource",
+                "{\"server\":\"forge\",\"uri\":\"file:///auth.json\"}",
+            ));
+            calls.push(responses::ev_function_call("forbidden-write", "apply_patch", "{\"patch\":\"*** Begin Patch\\n*** Add File: forbidden-write\\n+bad\\n*** End Patch\"}"));
+            calls.push(responses::ev_completed("snapshot"));
+            sequence.push(responses::sse(calls));
+        }
+        sequence.extend([
+            responses::sse(vec![
+                responses::ev_response_created("question"),
+                responses::ev_function_call("question", BGR_REPLY_TOOL, &question.to_string()),
+                responses::ev_completed("question"),
+            ]),
+            create_final_assistant_message_sse_response(
+                "Waiting for factual clarification from the brain.",
+            )?,
+            responses::sse(vec![
+                responses::ev_response_created("result"),
+                responses::ev_function_call("result", BGR_REPLY_TOOL, &result.to_string()),
+                responses::ev_completed("result"),
+            ]),
+            create_final_assistant_message_sse_response(
+                "Independent review result sealed for host publication.",
+            )?,
+        ]);
+        servers.push(create_mock_responses_server_sequence_unchecked(sequence).await);
+    }
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&servers[0].uri())
+        .disable_feature(Feature::Collab)
+        .disable_feature(Feature::MultiAgentV2)
+        .enable_feature(Feature::DeferMailboxPreemption)
+        .with_root_config("developer_instructions = \"HOST_PRIVATE_INSTRUCTION_CANARY\"")
+        .with_extra_config(&format!(
+            r#"
+[model_providers.reviewer_b]
+name = "Independent mock reviewer B"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+[model_providers.grunt]
+name = "Independent mock grunt"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+            servers[1].uri(),
+            servers[2].uri()
+        ))
+        .write(home.path())?;
+    std::fs::write(home.path().join("AGENTS.md"), "PRIVATE_CONVERSATION_CANARY")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    mcp.initialize().await?;
+    let capabilities: BgrCapabilitiesReadResponse =
+        rpc(&mut mcp, "bgr/capabilities/read", json!({})).await?;
+    let brain = identity(&"a".repeat(32), BgrRole::Brain);
+    let mut participants = Vec::new();
+    let review = json!({"repository":repository.path(),"baseSha":base,"headSha":head});
+    let mut trace = json!({"capabilities":capabilities,"review":review,"starts":[],"rejections":[],"questions":[],"answers":[],"results":[],"providerRequests":[]});
+    for index in 0..3 {
+        let role = if index < 2 {
+            BgrRole::Reviewer
+        } else {
+            BgrRole::Grunt
+        };
+        let mut bound = identity(&format!("{:032x}", index + 0x10), role);
+        bound.agent_id = format!("{:032x}", index + 0x20);
+        bound.attempt_id = Some(format!("{:032x}", index + 0x30));
+        let thread_id = if index < 2 {
+            let params = json!({"identity":bound,"peers":[brain],"review":review,"modelProvider":if index==0 {"mock_provider"} else {"reviewer_b"}});
+            if index == 0 {
+                for key in ["dynamicTools", "config", "instructions", "cwd", "env"] {
+                    let mut unsafe_params = params.clone();
+                    unsafe_params[key] = json!({});
+                    let id = mcp
+                        .send_raw_request("bgr/reviewer/start", Some(unsafe_params))
+                        .await?;
+                    let error = timeout(
+                        TIMEOUT,
+                        mcp.read_stream_until_error_message(RequestId::Integer(id)),
+                    )
+                    .await??;
+                    trace["rejections"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"field":key,"error":error.error}));
+                }
+                for (field, value) in [
+                    ("identity", json!({"role":"grunt"})),
+                    ("review", json!({"headSha":"HEAD"})),
+                    ("review", json!({"headSha":"0".repeat(40)})),
+                    ("modelProvider", json!("unknown-review-provider")),
+                ] {
+                    let mut unsafe_params = params.clone();
+                    if value.is_object() {
+                        for (key, value) in value.as_object().unwrap() {
+                            unsafe_params[field][key] = value.clone();
+                        }
+                    } else {
+                        unsafe_params[field] = value;
+                    }
+                    let id = mcp
+                        .send_raw_request("bgr/reviewer/start", Some(unsafe_params))
+                        .await?;
+                    let error = timeout(
+                        TIMEOUT,
+                        mcp.read_stream_until_error_message(RequestId::Integer(id)),
+                    )
+                    .await??;
+                    trace["rejections"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"field":field,"error":error.error}));
+                }
+                for server in &servers {
+                    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+                }
+            }
+            let started: BgrReviewerStartResponse =
+                rpc(&mut mcp, "bgr/reviewer/start", params.clone()).await?;
+            let shell_id = mcp
+                .send_raw_request(
+                    "thread/shellCommand",
+                    Some(json!({"threadId":started.thread_id,"command":"echo forbidden"})),
+                )
+                .await?;
+            let error = timeout(
+                TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(shell_id)),
+            )
+            .await??;
+            assert!(error.error.message.contains("forbidden"));
+            for (method, params) in [
+                (
+                    "thread/settings/update",
+                    json!({"threadId":started.thread_id,"sandboxPolicy":{"type":"dangerFullAccess"}}),
+                ),
+                (
+                    "turn/start",
+                    json!({"threadId":started.thread_id,"cwd":home.path(),"input":[{"type":"text","text":"unsafe runtime override"}]}),
+                ),
+            ] {
+                let id = mcp.send_raw_request(method, Some(params)).await?;
+                let error = timeout(
+                    TIMEOUT,
+                    mcp.read_stream_until_error_message(RequestId::Integer(id)),
+                )
+                .await??;
+                trace["rejections"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"method":method,"error":error.error}));
+            }
+            assert_eq!(started.snapshot.identity, bound);
+            assert_eq!(started.review.base_sha, base);
+            assert_eq!(started.review.head_sha, head);
+            assert!(
+                started
+                    .review
+                    .changed_files
+                    .contains(&"review.rs".to_string())
+            );
+            trace["starts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"params":params,"result":started}));
+            started.thread_id
+        } else {
+            let started: ThreadStartResponse = rpc(&mut mcp,"thread/start",json!({"modelProvider":"grunt","dynamicTools":[capabilities.report_tool,capabilities.send_tool,capabilities.reply_tool]})).await?;
+            rpc::<BgrThreadStateResponse>(
+                &mut mcp,
+                "bgr/thread/bind",
+                json!({"threadId":started.thread.id,"identity":bound}),
+            )
+            .await?;
+            rpc::<BgrThreadStateResponse>(
+                &mut mcp,
+                "bgr/thread/peers",
+                json!({"threadId":started.thread.id,"identity":bound,"peers":[brain]}),
+            )
+            .await?;
+            started.thread.id
+        };
+        participants.push((thread_id, bound));
+    }
+    assert_ne!(participants[0].0, participants[1].0);
+    assert_ne!(participants[0].1, participants[1].1);
+    std::fs::write(
+        repository.path().join("review.rs"),
+        "WORKTREE_MUTATION_CANARY",
+    )?;
+    for (index, (thread_id, bound)) in participants.iter().enumerate() {
+        let task = BgrEnvelope {
+            version: BGR_VERSION,
+            message_id: format!("{:032x}", index + 0x100),
+            sender_agent_id: brain.agent_id.clone(),
+            recipient_agent_id: bound.agent_id.clone(),
+            identity: brain.clone(),
+            recipient_identity: Some(bound.clone()),
+            kind: BgrMessageKind::Task,
+            correlation_id: format!("{:032x}", index + 0x200),
+            in_reply_to: None,
+            payload: json!({"text":"Read the frozen snapshot, ask the brain a factual question, then wait for its answer before reporting."}),
+            head_sha: Some(head.clone()),
+        };
+        let delivery =
+            json!({"threadId":thread_id,"sender":BgrSender::from(&brain),"envelope":task});
+        if index < 2 {
+            let mut wrong_head = delivery.clone();
+            wrong_head["envelope"]["headSha"] = json!(base);
+            let id = mcp
+                .send_raw_request("bgr/message/deliver", Some(wrong_head))
+                .await?;
+            let error = timeout(
+                TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(id)),
+            )
+            .await??;
+            assert!(error.error.message.contains("frozen review head"));
+            assert_eq!(servers[index].received_requests().await.unwrap().len(), 0);
+        }
+        let receipt: BgrMessageSendResponse =
+            rpc(&mut mcp, "bgr/message/deliver", delivery.clone()).await?;
+        assert!(receipt.accepted && !receipt.duplicate);
+        assert!(
+            rpc::<BgrMessageSendResponse>(&mut mcp, "bgr/message/deliver", delivery)
+                .await?
+                .duplicate
+        );
+        let question: BgrMessageNotification =
+            timeout(TIMEOUT, mcp.read_notification("bgr/message")).await??;
+        assert_eq!(question.envelope.identity, *bound);
+        assert_eq!(question.envelope.kind, BgrMessageKind::Question);
+        assert_eq!(question.envelope.head_sha, Some(head.clone()));
+        trace["questions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(question)?);
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        if index < 2 {
+            rpc::<Value>(
+                &mut mcp,
+                "thread/settings/update",
+                json!({"threadId":thread_id,"model":"mock-model"}),
+            )
+            .await?;
+        }
+    }
+    for index in [1, 2, 0] {
+        let (thread_id, bound) = &participants[index];
+        let answer = BgrEnvelope {
+            version: BGR_VERSION,
+            message_id: format!("{:032x}", index + 0x500),
+            sender_agent_id: brain.agent_id.clone(),
+            recipient_agent_id: bound.agent_id.clone(),
+            identity: brain.clone(),
+            recipient_identity: Some(bound.clone()),
+            kind: BgrMessageKind::Answer,
+            correlation_id: format!("{:032x}", index + 0x200),
+            in_reply_to: Some(format!("{:032x}", index + 0x300)),
+            payload: json!({"text":"Confirmed: VALUE=2 is the intended public contract."}),
+            head_sha: Some(head.clone()),
+        };
+        let params =
+            json!({"threadId":thread_id,"sender":BgrSender::from(&brain),"envelope":answer});
+        let receipt: BgrMessageSendResponse =
+            rpc(&mut mcp, "bgr/message/deliver", params.clone()).await?;
+        assert!(receipt.accepted && !receipt.duplicate);
+        trace["answers"].as_array_mut().unwrap().push(params);
+        let result: BgrMessageNotification =
+            timeout(TIMEOUT, mcp.read_notification("bgr/message")).await??;
+        assert_eq!(result.envelope.identity, *bound);
+        assert_eq!(result.envelope.recipient_identity, Some(brain.clone()));
+        assert_eq!(result.envelope.kind, BgrMessageKind::Result);
+        assert_eq!(
+            result.envelope.correlation_id,
+            format!("{:032x}", index + 0x200)
+        );
+        assert_eq!(result.envelope.head_sha, Some(head.clone()));
+        assert_eq!(
+            result.envelope.payload["outcome"],
+            if index == 1 {
+                "incomplete"
+            } else {
+                "no_findings"
+            }
+        );
+        trace["results"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(result)?);
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+    }
+    for (index, server) in servers.iter().enumerate() {
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), if index < 2 { 5 } else { 4 });
+        let bodies = requests
+            .iter()
+            .map(wiremock::Request::body_json::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if index < 2 {
+            for body in &bodies {
+                let exposed = body["tools"].as_array().unwrap();
+                assert_eq!(exposed.len(), 4, "reviewer leaked tools: {exposed:?}");
+                for tool in exposed {
+                    assert!(
+                        [
+                            BGR_REPORT_TOOL,
+                            BGR_SEND_TOOL,
+                            BGR_REPLY_TOOL,
+                            BGR_REVIEW_SNAPSHOT_TOOL
+                        ]
+                        .contains(&tool["name"].as_str().unwrap()),
+                        "unexpected reviewer tool {tool}"
+                    );
+                }
+                let input = body.to_string();
+                for forbidden in [
+                    "FORGE_CREDENTIAL_CANARY_DO_NOT_EXPOSE",
+                    "HOST_PRIVATE_INSTRUCTION_CANARY",
+                    "PRIVATE_CONVERSATION_CANARY",
+                    "WORKTREE_MUTATION_CANARY",
+                ] {
+                    assert!(!input.contains(forbidden), "reviewer exposed {forbidden}");
+                }
+            }
+            let observed = bodies[1]["input"].to_string();
+            assert!(observed.contains("pub const VALUE: u32 = 2;"));
+            assert!(observed.contains("path outside frozen review snapshot"));
+        }
+        assert!(
+            bodies[if index < 2 { 3 } else { 2 }]["input"]
+                .to_string()
+                .contains("VALUE=2 is the intended public contract")
+        );
+        trace["providerRequests"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"identity":participants[index].1,"count":requests.len(),"bodies":bodies}));
+    }
+    assert!(
+        !external_marker.exists() && !textconv_marker.exists(),
+        "git snapshot invoked external helper"
+    );
+    if let Ok(path) = std::env::var("BGR_REVIEWER_TRANSCRIPT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&trace)?)?;
+    }
+    eprintln!(
+        "BGR_REVIEWER_TRACE: 2 isolated reviewers + grunt, provider requests [5,5,4], results B/grunt/A"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn bgr_general_external_brain_clarification_callbacks_and_cancel_are_fenced() -> Result<()> {
     for cancel in [false, true] {
         let question = json!({"messageId": "worker-question", "inReplyTo": "assignment", "kind": "question", "payload": {"text": "Which behavior is intended?"}});
@@ -266,7 +947,8 @@ async fn bgr_two_grunts_reply_out_of_order_and_reject_unfenced_general_messages(
     timeout(TIMEOUT, mcp.initialize()).await??;
     let capabilities: BgrCapabilitiesReadResponse =
         rpc(&mut mcp, "bgr/capabilities/read", json!({})).await?;
-    assert!(!capabilities.reviewer_sandbox);
+    assert!(capabilities.reviewer_sandbox);
+    assert!(capabilities.reviewer_start);
     assert!(capabilities.task_dispatch);
     let mut trace = json!({"capabilities": capabilities, "bindings": [], "rejections": [], "queries": [], "notifications": []});
     let brain: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({})).await?;
@@ -625,7 +1307,8 @@ async fn bgr_status_round_trip(
         capabilities.status_scopes,
         vec!["now", "since_time", "since_commit"]
     );
-    assert!(!capabilities.reviewer_sandbox);
+    assert!(capabilities.reviewer_sandbox);
+    assert!(capabilities.reviewer_start);
     assert!(!capabilities.durable_mailbox);
     assert!(!capabilities.restart_recovery);
     assert!(capabilities.host_delivery);
@@ -967,8 +1650,18 @@ async fn bgr_capabilities_require_experimental_api() -> Result<()> {
     .await?;
     let target = identity("worker-session", BgrRole::Grunt);
     let sender = BgrSender::from(&identity("claude-brain-session", BgrRole::Brain));
+    let mut reviewer = target.clone();
+    reviewer.role = BgrRole::Reviewer;
     for (method, params) in [
         ("bgr/capabilities/read", json!({})),
+        (
+            "bgr/message/record",
+            json!({"threadId":"unloaded-native-thread","identity":target,"envelope":{"version":1,"messageId":"record","senderAgentId":sender.agent_id,"recipientAgentId":target.agent_id,"identity":target,"kind":"status_query","correlationId":"correlation","payload":{"scope":"now"}}}),
+        ),
+        (
+            "bgr/reviewer/start",
+            json!({"identity":reviewer,"peers":[],"review":{"repository":".","baseSha":"a".repeat(40),"headSha":"b".repeat(40)}}),
+        ),
         (
             "bgr/message/deliver",
             json!({"threadId": "unloaded-native-thread", "sender": sender,

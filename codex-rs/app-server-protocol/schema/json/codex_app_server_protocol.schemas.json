@@ -8559,6 +8559,55 @@
         "title": "BgrMessageNotification",
         "type": "object"
       },
+      "BgrReviewInput": {
+        "additionalProperties": false,
+        "properties": {
+          "baseSha": {
+            "type": "string"
+          },
+          "headSha": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "baseSha",
+          "headSha",
+          "repository"
+        ],
+        "type": "object"
+      },
+      "BgrReviewManifest": {
+        "properties": {
+          "baseSha": {
+            "type": "string"
+          },
+          "changedFiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "coverageLimits": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "headSha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "baseSha",
+          "changedFiles",
+          "coverageLimits",
+          "headSha"
+        ],
+        "type": "object"
+      },
       "BgrRole": {
         "enum": [
           "brain",

@@ -5,6 +5,7 @@ use codex_app_server_protocol::BgrCapabilitiesReadResponse;
 use codex_app_server_protocol::BgrMessageDeliverParams;
 use codex_app_server_protocol::BgrMessageKind;
 use codex_app_server_protocol::BgrMessageNotification;
+use codex_app_server_protocol::BgrMessageRecordParams;
 use codex_app_server_protocol::BgrMessageSendParams;
 use codex_app_server_protocol::BgrMessageSendResponse;
 use codex_app_server_protocol::BgrReportStatusArgs;
@@ -36,7 +37,7 @@ impl BgrRequestProcessor {
     pub(crate) fn capabilities(&self) -> BgrCapabilitiesReadResponse {
         BgrCapabilitiesReadResponse {
             version: BGR_VERSION,
-            roles: vec![BgrRole::Brain, BgrRole::Grunt],
+            roles: vec![BgrRole::Brain, BgrRole::Grunt, BgrRole::Reviewer],
             status_scopes: vec!["now".into(), "since_time".into(), "since_commit".into()],
             message_kinds: vec![
                 BgrMessageKind::Task,
@@ -60,8 +61,11 @@ impl BgrRequestProcessor {
             live_reattach: true,
             durable_mailbox: false,
             restart_recovery: false,
-            reviewer_sandbox: false,
+            reviewer_sandbox: true,
+            reviewer_start: true,
+            review_snapshot_tool: codex_protocol::bgr::review_snapshot_tool(),
             host_delivery: true,
+            host_record: true,
             cross_host_delivery: false,
             task_dispatch: true,
             max_queries_per_attempt: 128,
@@ -161,6 +165,26 @@ impl BgrRequestProcessor {
         })
     }
 
+    pub(crate) async fn record(
+        &self,
+        params: BgrMessageRecordParams,
+    ) -> Result<BgrMessageSendResponse, JSONRPCErrorError> {
+        if params.identity != params.envelope.identity {
+            return Err(invalid_request("BGR record source identity mismatch"));
+        }
+        let (envelope, fresh) = self
+            .thread(&params.thread_id)
+            .await?
+            .record_bgr_message(params.envelope)
+            .await
+            .map_err(|error| invalid_request(error.to_string()))?;
+        Ok(BgrMessageSendResponse {
+            message_id: envelope.message_id,
+            accepted: true,
+            duplicate: !fresh,
+        })
+    }
+
     pub(crate) async fn cancel(
         &self,
         params: BgrThreadBindParams,
@@ -199,6 +223,25 @@ pub(crate) async fn on_status_report(
     thread: Arc<CodexThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
 ) {
+    if params.tool == codex_protocol::bgr::BGR_REVIEW_SNAPSHOT_TOOL {
+        let result = match serde_json::from_value(params.arguments) {
+            Ok(args) => thread.read_bgr_review_snapshot(args).await,
+            Err(error) => Err(codex_protocol::error::CodexErr::InvalidRequest(
+                error.to_string(),
+            )),
+        };
+        let (success, text) = match result {
+            Ok(value) => (true, value.to_string()),
+            Err(error) => (false, error.to_string()),
+        };
+        let _ = thread.submit(codex_protocol::protocol::Op::DynamicToolResponse {
+            id: params.call_id,
+            response: codex_protocol::dynamic_tools::DynamicToolResponse {
+                success, content_items: vec![codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText { text }],
+            },
+        }).await;
+        return;
+    }
     let result = match params.tool.as_str() {
         codex_protocol::bgr::BGR_SEND_TOOL => match serde_json::from_value(params.arguments) {
             Ok(args) => thread.send_bgr_message(args).await,

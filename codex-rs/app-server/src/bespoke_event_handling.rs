@@ -1138,6 +1138,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         codex_protocol::bgr::BGR_REPORT_TOOL
                             | codex_protocol::bgr::BGR_SEND_TOOL
                             | codex_protocol::bgr::BGR_REPLY_TOOL
+                            | codex_protocol::bgr::BGR_REVIEW_SNAPSHOT_TOOL
                     )
                     && conversation.inspect_bgr().await.is_ok()
                 {

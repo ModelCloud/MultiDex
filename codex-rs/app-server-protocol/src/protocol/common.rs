@@ -568,6 +568,13 @@ client_request_definitions! {
         manual_payload_conversion: manual,
         response: v2::BgrThreadStateResponse,
     },
+    #[experimental("bgr/reviewer/start")]
+    BgrReviewerStart => "bgr/reviewer/start" {
+        params: v2::BgrReviewerStartParams,
+        serialization: None,
+        manual_payload_conversion: manual,
+        response: v2::BgrReviewerStartResponse,
+    },
     #[experimental("bgr/message/send")]
     BgrMessageSend => "bgr/message/send" {
         params: v2::BgrMessageSendParams,
@@ -577,6 +584,13 @@ client_request_definitions! {
     #[experimental("bgr/message/deliver")]
     BgrMessageDeliver => "bgr/message/deliver" {
         params: v2::BgrMessageDeliverParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrMessageSendResponse,
+    },
+    #[experimental("bgr/message/record")]
+    BgrMessageRecord => "bgr/message/record" {
+        params: v2::BgrMessageRecordParams,
         serialization: thread_id(params.thread_id),
         manual_payload_conversion: manual,
         response: v2::BgrMessageSendResponse,

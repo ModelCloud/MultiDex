@@ -9,6 +9,61 @@ pub const BGR_VERSION: u32 = 1;
 pub const BGR_REPORT_TOOL: &str = "bgr_report_status";
 pub const BGR_SEND_TOOL: &str = "bgr_send_message";
 pub const BGR_REPLY_TOOL: &str = "bgr_reply_message";
+pub const BGR_REVIEW_SNAPSHOT_TOOL: &str = "bgr_read_review_snapshot";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrReviewInput {
+    pub repository: String,
+    pub base_sha: String,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrReviewerStartParams {
+    pub identity: BgrIdentity,
+    pub peers: Vec<BgrIdentity>,
+    pub review: BgrReviewInput,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BgrReviewManifest {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub changed_files: Vec<String>,
+    pub coverage_limits: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrReadReviewSnapshotArgs {
+    pub path: Option<String>,
+    pub start_line: Option<usize>,
+    pub max_lines: Option<usize>,
+}
+
+pub fn review_snapshot_tool() -> crate::dynamic_tools::DynamicToolSpec {
+    message_tool(
+        BGR_REVIEW_SNAPSHOT_TOOL,
+        "Read the immutable review manifest/diff or changed source. No path returns the manifest and diff preview. Use path diff, base/<path>, or head/<path>; startLine is 1-based and maxLines is at most 200. No filesystem, shell, credentials, or sibling review access.",
+        serde_json::json!({
+            "type":"object", "properties": {
+                "path":{"type":"string"},
+                "startLine":{"type":"integer", "minimum":1},
+                "maxLines":{"type":"integer", "minimum":1,"maximum":200}
+            }, "additionalProperties":false
+        }),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]

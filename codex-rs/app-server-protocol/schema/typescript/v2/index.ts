@@ -58,6 +58,8 @@ export type { BgrEnvelope } from "./BgrEnvelope";
 export type { BgrIdentity } from "./BgrIdentity";
 export type { BgrMessageKind } from "./BgrMessageKind";
 export type { BgrMessageNotification } from "./BgrMessageNotification";
+export type { BgrReviewInput } from "./BgrReviewInput";
+export type { BgrReviewManifest } from "./BgrReviewManifest";
 export type { BgrRole } from "./BgrRole";
 export type { BgrSender } from "./BgrSender";
 export type { BgrSnapshot } from "./BgrSnapshot";

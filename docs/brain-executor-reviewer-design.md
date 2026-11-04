@@ -33,21 +33,22 @@ sender; model-authored sender claims must never be forwarded unchecked.
 | `bgr/thread/cancel`                 | `{threadId, identity}` -> `{snapshot}`                                       | Fence the assignment immediately and submit native interruption; acknowledgement does not prove every external process has exited |
 | `bgr/message` (server notification) | `{threadId, envelope}`                                                       | Accepted model-tool callback, including questions, progress, results and status replies                                           |
 
-Capabilities are `version:1`, `roles:["brain","grunt"]`,
+Capabilities are `version:1`, `roles:["brain","grunt","reviewer"]`,
 `statusScopes:["now","since_time","since_commit"]`, and
 `messageKinds:["task","question","answer","progress","result","cancel","status_query","status_reply"]`.
 `generalMessaging`, `messageCallbacks`, `taskDispatch`, `liveReattach`, and
-`hostDelivery` are **true**. `durableMailbox`, `restartRecovery`, `reviewerSandbox`,
+`hostDelivery`, `reviewerStart`, and `reviewerSandbox` are **true**.
+`durableMailbox`, `restartRecovery`,
 `crossHostDelivery`, and `consumptionReceipts` remain **false**. The response
-includes exact `reportTool`, `sendTool`, and `replyTool` specifications and
+includes exact `reportTool`, `sendTool`, `replyTool`, and `reviewSnapshotTool` specifications and
 `maxQueriesPerAttempt:128`.
 
 Scoped status uses `{scope:"since_time",since_time:"<RFC3339 timestamp>"}` or
 `{scope:"since_commit",since_commit:"<40-hex commit>"}`. It requests a model
 self-summary restricted to evidence available in that thread. Scoped replies
-must include nonempty `coverageLimits`, explicitly naming missing evidence;
+and all general-message replies must include nonempty `coverageLimits`, explicitly naming missing evidence;
 the backend does not collect or attest historical activity. `statusEvidence`
-advertises this limitation. Review/publication jobs remain unsupported here.
+advertises this limitation. Trusted publication remains controller-owned.
 `hostDelivery` means the authenticated controller can deliver queries into a
 local worker process. It does not provide backend networking, remote discovery,
 durable transport, or cross-host delivery; `crossHostDelivery` remains false.
@@ -55,6 +56,19 @@ Ordinary native turn/item/usage events remain available, but `turn/completed`
 is not an attestation of task success.
 
 ### General-message extension
+
+Per-session app-server processes negotiate `hostRecord:true`. For a host-authored
+general message, persist the controller outbox first, then call
+`bgr/message/record {threadId:<source>,identity:<source identity>,envelope}` in the
+source process before `bgr/message/deliver` in the destination process. Record
+returns `{messageId,accepted,duplicate}` after the same source/peer/correlation/
+size/replay fences as a model send. It emits no model request, mailbox item or
+callback. Exact retries are idempotent; changed content/identity, stale peers and
+cancelled attempts reject without modifying metadata. This establishes native
+source correlation for later question/result callbacks without a fake proxy or
+requiring both endpoints in one `ThreadManager`. It is metadata acknowledgement,
+not durable consumption. Model-authored BGR tool sends already record their source;
+do not rely on a deliberately failing same-process send for remote routing.
 
 Legacy status envelopes without `recipientIdentity` retain their original wire
 semantics below. General messages use `identity` as the authenticated **source**
@@ -91,6 +105,57 @@ boundaries. They do not terminate a running tool, start concurrent turns, or res
 context. A brain's explicit `cancel` fences queued BGR mail before interruption;
 late callbacks are denied. Complete serialized envelopes are limited to 32 KiB,
 with bounded retained incoming/outgoing IDs and exact-content deduplication.
+
+### Isolated reviewers
+
+Reviewers cannot use ordinary `bgr/thread/bind`. Create each fresh reviewer atomically:
+
+```text
+bgr/reviewer/start {
+  identity:<reviewer identity>, peers:[<brain identity>],
+  review:{repository:string,baseSha:40hex,headSha:40hex},
+  model?:string,modelProvider?:string,reasoningEffort?:ReasoningEffort
+} -> {threadId,snapshot,review:{baseSha,headSha,changedFiles,coverageLimits}}
+bgr_read_review_snapshot {path?:string,startLine?:integer,maxLines?:integer}
+```
+
+The host authorizes repository/base/head and remains privileged. The backend
+validates commit objects and captures immutable changed-file blobs/diff without
+following worktree files. Git external diff, textconv, pagers, replacement
+objects and inherited environment credentials are disabled. Symlinks, submodules,
+and non-text blobs are excluded with explicit coverage limits. Capture rejects
+more than 512 changed paths, any object/diff over 2 MiB, or a snapshot over 16 MiB.
+
+No path (or `diff`) reads the manifest and frozen diff; `base/<path>` and
+`head/<path>` read only frozen changed-file contents. Output is bounded to 200
+lines and 24 KiB per read. Absolute paths, traversal, symlinks, URLs, unchanged
+files, runtime/home metadata and sibling findings cannot be read. Source is
+untrusted data, not instructions. Review coverage is source-only; no tests run.
+
+Creation uses native `SessionIsolation::Isolated`, a fresh temporary runtime
+home, cleared private/project/developer/skill/memory context, read-only permissions,
+and an immutable native `ToolPolicy` allowing only the four advertised BGR tools.
+There is no shell, patch/write, MCP, network, or nested delegation tool. Native
+shell/review/reload operations and replacement tool catalogs are denied. Later
+turn/settings changes may select model/provider/reasoning/service tier, but cannot
+change environments, permissions, roots, collaboration context, or tool ceilings.
+
+All reviewer envelopes must preserve the captured head SHA and communicate only
+with their one authorized brain. The brain must provide factual clarifications,
+not sibling findings. Final `result` callbacks use the original task correlation
+and must also be emitted for no-findings or incomplete coverage. Durable review
+sealing, sibling-result withholding, adjudication and publication remain owned by
+the controller. Native acceptance is not a durable seal or consumption receipt.
+
+The native simulated-provider regression starts two fresh reviewers on the same
+real Git fixture and a grunt, exercises snapshot/denied tools and clarification,
+then receives results in reviewer-B/grunt/reviewer-A order. To reproduce:
+
+```sh
+cd codex-rs
+cargo test -p codex-app-server --test all bgr
+cargo test -p codex-core --lib bgr
+```
 
 ### Start, bind, query, report
 

@@ -12,13 +12,15 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 ## Experimental host-managed worker messaging
 
 The app-server exposes an opt-in BGR v1 bridge for host-managed brain/grunt
-threads: identity-fenced tasks, clarification/progress/result callbacks,
+threads and isolated reviewers: identity-fenced tasks, clarification/progress/result callbacks,
 correlated status self-summaries, safe-boundary replies, and live
 attempt inspection/cancellation. Trusted host delivery supports external brains
 without a proxy native brain thread. Cancellation fences queued BGR queries as
 well as late replies, without dropping unrelated mailbox/input. Omnigent remains
-the scheduler and durable ledger. Reviewer enforcement and restart recovery are
-not yet supported. See the
+the scheduler and durable ledger. Atomic reviewer creation freezes exact Git
+base/head source and exposes only snapshot/BGR tools, with no shell, MCP,
+delegation, ambient instructions, or arbitrary filesystem access. Restart
+recovery remains unsupported. See the
 [implemented contract and capability limits](docs/brain-executor-reviewer-design.md#implemented-backend-contract-version-1).
 
 ## Quickstart

@@ -344,6 +344,26 @@
       ],
       "type": "string"
     },
+    "BgrReviewInput": {
+      "additionalProperties": false,
+      "properties": {
+        "baseSha": {
+          "type": "string"
+        },
+        "headSha": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "baseSha",
+        "headSha",
+        "repository"
+      ],
+      "type": "object"
+    },
     "BgrRole": {
       "enum": [
         "brain",
