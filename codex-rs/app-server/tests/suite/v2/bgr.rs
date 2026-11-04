@@ -17,13 +17,244 @@ use tokio::time::timeout;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+#[tokio::test]
+async fn bgr_two_grunts_reply_out_of_order_and_reject_unsupported_review_flows() -> Result<()> {
+    let query_ids = ["10".repeat(16), "20".repeat(16)];
+    let correlations = ["30".repeat(16), "40".repeat(16)];
+    let anchor = "a".repeat(40);
+    let mut simulated = vec![
+        responses::sse(vec![
+            responses::ev_response_created("hold-one"),
+            responses::ev_function_call("hold-one", "hold_work", "{}"),
+            responses::ev_completed("hold-one"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("hold-two"),
+            responses::ev_function_call("hold-two", "hold_work", "{}"),
+            responses::ev_completed("hold-two"),
+        ]),
+    ];
+    for index in (0..2).rev() {
+        let report = json!({"messageId": format!("reply-{index}"), "inReplyTo": query_ids[index],
+            "payload": {"currentAction": format!("grunt-{index} continuing"),
+                "completed": ["held work"], "pending": ["assignment"], "blockers": [],
+                "headSha": "b".repeat(40), "dirty": false, "coverageLimits": ["simulated provider"]}});
+        simulated.push(responses::sse(vec![
+            responses::ev_response_created("report"),
+            responses::ev_function_call("report", BGR_REPORT_TOOL, &report.to_string()),
+            responses::ev_completed("report"),
+        ]));
+        simulated.push(create_final_assistant_message_sse_response(
+            "Continuing assignment.",
+        )?);
+    }
+    let server = create_mock_responses_server_sequence_unchecked(simulated).await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::Collab)
+        .disable_feature(Feature::MultiAgentV2)
+        .enable_feature(Feature::DeferMailboxPreemption)
+        .write(home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(TIMEOUT, mcp.initialize()).await??;
+    let capabilities: BgrCapabilitiesReadResponse =
+        rpc(&mut mcp, "bgr/capabilities/read", json!({})).await?;
+    assert!(!capabilities.reviewer_sandbox);
+    assert!(!capabilities.task_dispatch);
+    let mut trace = json!({"capabilities": capabilities, "bindings": [], "rejections": [], "queries": [], "notifications": []});
+    let brain: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({})).await?;
+    let brain_identity = identity(&"1".repeat(32), BgrRole::Brain);
+    rpc::<BgrThreadStateResponse>(
+        &mut mcp,
+        "bgr/thread/bind",
+        json!({"threadId": brain.thread.id, "identity": brain_identity}),
+    )
+    .await?;
+    let mut workers = Vec::new();
+    for index in 0..2 {
+        let worker: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({"dynamicTools": [capabilities.report_tool, {
+            "type": "function", "name": "hold_work", "description": "Hold work until released by the host", "inputSchema": {"type": "object"}
+        }]})).await?;
+        let mut worker_identity = identity(&format!("{:032x}", index + 2), BgrRole::Grunt);
+        worker_identity.agent_id = if index == 0 { "b" } else { "c" }.repeat(32);
+        worker_identity.task_id = format!("{:032x}", index + 4);
+        worker_identity.attempt_id = format!("{:032x}", index + 6);
+        let bound: BgrThreadStateResponse = rpc(
+            &mut mcp,
+            "bgr/thread/bind",
+            json!({"threadId": worker.thread.id, "identity": worker_identity}),
+        )
+        .await?;
+        trace["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"threadId": worker.thread.id, "result": bound}));
+        let turn: TurnStartResponse = rpc(&mut mcp, "turn/start", json!({"threadId": worker.thread.id,
+            "input": [{"type": "text", "text": "Perform assigned work; call hold_work, report status when asked, then continue."}]})).await?;
+        let ServerRequest::DynamicToolCall { request_id, params } =
+            timeout(TIMEOUT, mcp.read_stream_until_request_message()).await??
+        else {
+            panic!("expected held worker tool")
+        };
+        assert_eq!(params.tool, "hold_work");
+        assert_eq!(params.thread_id, worker.thread.id);
+        assert_eq!(params.turn_id, turn.turn.id);
+        workers.push((worker, worker_identity, turn, request_id));
+    }
+    let mut participants = vec![
+        (brain.thread.id.clone(), brain_identity.clone()),
+        (workers[0].0.thread.id.clone(), workers[0].1.clone()),
+    ];
+    for index in 0..2 {
+        let reviewer: ThreadStartResponse = rpc(
+            &mut mcp,
+            "thread/start",
+            json!({"dynamicTools": [capabilities.report_tool]}),
+        )
+        .await?;
+        let mut reviewer_identity = identity(&format!("{:032x}", index + 8), BgrRole::Reviewer);
+        reviewer_identity.agent_id = format!("{:032x}", index + 10);
+        let params = json!({"threadId": reviewer.thread.id, "identity": reviewer_identity});
+        let id = mcp
+            .send_raw_request("bgr/thread/bind", Some(params.clone()))
+            .await?;
+        let rejected = timeout(
+            TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(id)),
+        )
+        .await??;
+        assert!(rejected.error.message.contains("reviewer"));
+        trace["rejections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"method": "bgr/thread/bind", "params": params, "error": rejected.error}));
+        participants.push((reviewer.thread.id, reviewer_identity));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    for (source, target) in [(0, 1), (1, 0), (0, 2), (2, 0), (0, 3), (3, 0)] {
+        for kind in ["task", "question", "answer", "result", "command"] {
+            let envelope = json!({"version": 1, "messageId": "unsupported", "senderAgentId": participants[source].1.agent_id,
+                "recipientAgentId": participants[target].1.agent_id, "identity": participants[target].1,
+                "kind": kind, "correlationId": "unsupported-correlation", "headSha": anchor,
+                "payload": {"instruction": "Review this immutable snapshot", "headSha": anchor}});
+            let (method, params) = if source == 1 {
+                (
+                    "bgr/message/send",
+                    json!({"sourceThreadId": participants[source].0, "threadId": participants[target].0, "envelope": envelope}),
+                )
+            } else {
+                (
+                    "bgr/message/deliver",
+                    json!({"threadId": participants[target].0, "sender": BgrSender::from(&participants[source].1), "envelope": envelope}),
+                )
+            };
+            let before = server.received_requests().await.unwrap().len();
+            let id = mcp.send_raw_request(method, Some(params.clone())).await?;
+            let rejected = timeout(
+                TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(id)),
+            )
+            .await??;
+            let after = server.received_requests().await.unwrap().len();
+            assert_eq!(after, before, "rejected {kind} invoked provider");
+            trace["rejections"].as_array_mut().unwrap().push(
+                json!({"method": method, "params": params, "error": rejected.error,
+                "providerRequestsBefore": before, "providerRequestsAfter": after}),
+            );
+        }
+    }
+    for (index, (worker, worker_identity, _, _)) in workers.iter().enumerate() {
+        let envelope = json!({"version": 1, "messageId": query_ids[index], "senderAgentId": brain_identity.agent_id,
+            "recipientAgentId": worker_identity.agent_id, "identity": worker_identity, "kind": "status_query",
+            "correlationId": correlations[index], "headSha": anchor, "payload": {"scope": "now"}});
+        let (method, params) = if index == 0 {
+            (
+                "bgr/message/deliver",
+                json!({"threadId": worker.thread.id, "sender": BgrSender::from(&brain_identity), "envelope": envelope}),
+            )
+        } else {
+            (
+                "bgr/message/send",
+                json!({"sourceThreadId": brain.thread.id, "threadId": worker.thread.id, "envelope": envelope}),
+            )
+        };
+        let receipt: BgrMessageSendResponse = rpc(&mut mcp, method, params.clone()).await?;
+        assert!(receipt.accepted);
+        assert!(!receipt.duplicate);
+        trace["queries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"method": method, "params": params, "result": receipt}));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    for index in (0..2).rev() {
+        let (worker, worker_identity, turn, request_id) = &workers[index];
+        mcp.send_response(
+            request_id.clone(),
+            serde_json::to_value(DynamicToolCallResponse {
+                success: true,
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "held work complete".into(),
+                }],
+            })?,
+        )
+        .await?;
+        let reply: BgrMessageNotification =
+            timeout(TIMEOUT, mcp.read_notification("bgr/message")).await??;
+        assert_eq!(reply.thread_id, worker.thread.id);
+        assert_eq!(reply.envelope.identity, *worker_identity);
+        assert_eq!(reply.envelope.sender_agent_id, worker_identity.agent_id);
+        assert_eq!(reply.envelope.recipient_agent_id, brain_identity.agent_id);
+        assert_eq!(
+            reply.envelope.in_reply_to.as_deref(),
+            Some(query_ids[index].as_str())
+        );
+        assert_eq!(reply.envelope.correlation_id, correlations[index]);
+        assert_eq!(reply.envelope.head_sha.as_deref(), Some(anchor.as_str()));
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, mcp.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.id, turn.turn.id);
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+        let snapshot: BgrThreadStateResponse = rpc(
+            &mut mcp,
+            "bgr/thread/inspect",
+            json!({"threadId": worker.thread.id}),
+        )
+        .await?;
+        assert!(snapshot.snapshot.pending.is_empty());
+        assert_eq!(snapshot.snapshot.replies, vec![reply.envelope.clone()]);
+        trace["notifications"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"method": "bgr/message", "params": reply, "completed": completed}));
+    }
+    let bodies = server.received_requests().await.unwrap();
+    assert_eq!(bodies.len(), 6);
+    for (request_index, worker_index) in [(2, 1), (4, 0)] {
+        let body: Value = bodies[request_index].body_json()?;
+        let input = body["input"].to_string();
+        assert!(input.contains(&query_ids[worker_index]));
+        assert!(!input.contains(&query_ids[1 - worker_index]));
+    }
+    trace["providerRequests"] = bodies.iter().map(|request| {
+        let body: Value = request.body_json().unwrap();
+        json!({"model": body["model"], "input": body["input"].as_array().unwrap().iter().filter(|item| item["role"] != "developer").collect::<Vec<_>>()})
+    }).collect();
+    eprintln!("BGR_VALIDATION_TRACE: {trace}");
+    Ok(())
+}
+
 async fn rpc<T: DeserializeOwned>(
     mcp: &mut TestAppServer,
     method: &str,
     params: Value,
 ) -> Result<T> {
     let id = mcp.send_raw_request(method, Some(params)).await?;
-    Ok(timeout(TIMEOUT, mcp.read_response(id)).await??)
+    timeout(TIMEOUT, mcp.read_response(id)).await?
 }
 
 fn identity(thread: &str, role: BgrRole) -> BgrIdentity {
@@ -353,7 +584,10 @@ async fn bgr_status_round_trip(
             mcp.read_notification::<BgrMessageNotification>("bgr/message"),
         )
         .await;
-        let bodies = server.received_requests().await.unwrap();
+        let bodies = server
+            .received_requests()
+            .await
+            .expect("captured native Responses requests");
         eprintln!(
             "BGR_CANCEL_TRACE: {} requests; reply={reply:?}",
             bodies.len()
@@ -428,7 +662,10 @@ async fn bgr_status_round_trip(
     )
     .await?;
     assert!(cancelled.snapshot.cancelled);
-    let bodies = server.received_requests().await.unwrap();
+    let bodies = server
+        .received_requests()
+        .await
+        .expect("captured native Responses requests");
     assert_eq!(bodies.len(), 3);
     let after_boundary: Value = bodies[1].body_json()?;
     assert!(after_boundary["input"].to_string().contains(&query_id));
