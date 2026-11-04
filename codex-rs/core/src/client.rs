@@ -264,6 +264,55 @@ fn sanitize_plaintext_compaction_for_official_provider(
     }
 }
 
+/// Wafer's DeepSeek endpoint rejects literal DeepSeek image control tokens even
+/// when they occur in quoted user text (for example in an old error report).
+/// Keep the transcript unchanged and escape only the outgoing request copy.
+fn escape_deepseek_image_token_for_openrouter(input: &mut [ResponseItem]) {
+    const TOKEN: &str = "<｜deepseek_image｜>";
+    const ESCAPED: &str = "<\\uFF5Cdeepseek_image\\uFF5C>";
+    for item in input {
+        if let ResponseItem::Message { role, content, .. } = item {
+            if role != "user" {
+                continue;
+            }
+            for part in content {
+                if let ContentItem::InputText { text } = part
+                    && text.contains(TOKEN)
+                {
+                    *text = text.replace(TOKEN, ESCAPED);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod deepseek_image_token_tests {
+    use super::*;
+
+    #[test]
+    fn escapes_quoted_token_only_in_outgoing_user_text() {
+        let token = "<｜deepseek_image｜>";
+        let message = |role: &str| ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
+            id: None,
+            role: role.to_string(),
+            content: vec![ContentItem::InputText {
+                text: token.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let mut input = vec![message("user"), message("assistant")];
+        escape_deepseek_image_token_for_openrouter(&mut input);
+        assert!(matches!(&input[0], ResponseItem::Message { content, .. } if
+            matches!(&content[0], ContentItem::InputText { text } if text == "<\\uFF5Cdeepseek_image\\uFF5C>")));
+        assert!(matches!(&input[1], ResponseItem::Message { content, .. } if
+            matches!(&content[0], ContentItem::InputText { text } if text == token)));
+    }
+}
+
 fn sanitize_tool_redeclarations(
     input: &mut Vec<ResponseItem>,
     current_tools: &mut Vec<serde_json::Value>,
@@ -1360,6 +1409,11 @@ impl ModelClient {
             &mut input,
             self.state.provider.info().multidex_compatibility,
         );
+        if self.state.provider.info().is_openrouter()
+            && model_info.slug.contains("deepseek-v4.1-flash")
+        {
+            escape_deepseek_image_token_for_openrouter(&mut input);
+        }
         let is_openai = self.state.provider.info().is_openai();
         // These prompt-only items are rebuilt on every request. Hash their visible payloads
         // within the thread so retries and resumed sessions preserve their identity.
