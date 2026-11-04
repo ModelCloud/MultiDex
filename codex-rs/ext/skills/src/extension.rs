@@ -347,7 +347,7 @@ where
             let mcp_resources = session_store
                 .get::<SkillsSessionState>()
                 .and_then(|state| state.mcp_resources.clone());
-            let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
+            let host_snapshot = HostSkillsSnapshot::for_step(input.step_store, turn_store);
             let host_catalog_in_world_state =
                 turn_store.get::<HostSkillsCatalogInWorldState>().is_some();
             let Some(step_state) = input.step_store.get::<SkillsStepState>() else {
@@ -541,7 +541,14 @@ impl<C> SkillsExtension<C> {
         let context = match entry.authority.kind {
             SkillSourceKind::Cloud => SkillReadContext::Cloud { mcp_resources },
             SkillSourceKind::Custom(_) => SkillReadContext::Custom { mcp_resources },
-            SkillSourceKind::Host => SkillReadContext::Host { host_snapshot },
+            SkillSourceKind::Host => SkillReadContext::Host {
+                host_snapshot,
+                accessors: input
+                    .environments
+                    .iter()
+                    .map(|environment| environment.fs)
+                    .collect(),
+            },
             SkillSourceKind::Executor => {
                 let fs = entry
                     .main_prompt

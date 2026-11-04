@@ -84,6 +84,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
+use codex_file_system::EnvironmentAccess;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_hooks::ModelRequestHookEvent::PostModelRequest;
@@ -130,6 +131,7 @@ use codex_skills::build_skill_name_counts;
 use codex_skills::collect_explicit_skill_mentions;
 use codex_skills::tool_kind_for_path;
 use codex_skills_extension::HostSkillPrompts;
+use codex_skills_extension::HostSkillsSnapshot;
 use codex_skills_extension::InjectedHostSkillPrompts;
 use codex_skills_extension::validate_required_skills;
 use codex_thread_store::PersistContext;
@@ -1083,6 +1085,12 @@ pub(crate) async fn run_hooks_and_record_inputs(
             .await;
         }
     }
+    // The batch has left the input queue. Persist every accepted item before the
+    // optional lookup can suspend this task long enough for an interrupt to abort it.
+    if !input.is_empty() {
+        let ids = std::mem::take(&mut sess.state.lock().await.pending_audio_duration_ids);
+        super::file_audio::resolve(sess, ids).await;
+    }
     Ok(blocked_input && !accepted_user_input)
 }
 
@@ -1230,7 +1238,8 @@ async fn required_mcp_servers_for_input(
     } else {
         HashMap::new()
     };
-    let skills_snapshot = turn_context.skills_snapshot();
+    let environments = sess.services.turn_environments.snapshot().await;
+    let skills_snapshot = sess.host_skills_for_step(turn_context, &environments).await;
     let skills_outcome = skills_snapshot.outcome();
     let mentioned_skills =
         collect_explicit_skill_mentions(user_input, skills_outcome, &connector_slug_counts);
@@ -1301,7 +1310,8 @@ async fn build_skills_and_plugins(
     } else {
         Vec::new()
     };
-    let skills_snapshot = turn_context.skills_snapshot();
+    let skills_snapshot =
+        HostSkillsSnapshot::for_step(&step_context.extension_data, &turn_context.extension_data)?;
     let skills_outcome = skills_snapshot.outcome();
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
     let extension_injection_items =
@@ -1323,11 +1333,18 @@ async fn build_skills_and_plugins(
     let injected_host_skill_prompts = turn_context
         .extension_data
         .get::<InjectedHostSkillPrompts>();
+    let environments = step_context.environments();
+    let accessors = environments
+        .iter()
+        .map(|(_, access)| access as &dyn EnvironmentAccess)
+        .collect::<Vec<_>>();
     let HostSkillPrompts {
         fragments,
         injected: injected_host_skills,
         warnings: host_skill_warnings,
-    } = skills_snapshot.load_skill_prompts(&mentioned_skills).await;
+    } = skills_snapshot
+        .load_skill_prompts(&mentioned_skills, &accessors)
+        .await;
     emit_explicit_skill_invocations(
         sess,
         turn_context,

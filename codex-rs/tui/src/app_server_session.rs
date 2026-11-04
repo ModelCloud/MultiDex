@@ -1275,6 +1275,12 @@ impl AppServerSession {
             // Active-session config has already adopted the server's roots. Fork does
             // not restore saved roots when omitted, so preserve this explicit selection.
             params.runtime_workspace_roots = Some(config.workspace_roots.clone());
+            if selected_profile.is_none() {
+                params.approvals_reviewer = None;
+                if let Some(overrides) = params.config.as_mut() {
+                    overrides.remove("approvals_reviewer");
+                }
+            }
         }
         if self.thread_params_mode() == ThreadParamsMode::Remote
             && permission_mode == ForkPermissionMode::InheritSaved

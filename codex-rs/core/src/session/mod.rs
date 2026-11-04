@@ -245,6 +245,9 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 pub(crate) mod async_compaction;
+pub(crate) mod file_audio;
+pub(crate) use file_audio::FileAudioDurations;
+
 mod code_mode_warning;
 mod config_refresh;
 pub(crate) mod context_window;
@@ -796,6 +799,9 @@ impl Session {
                 "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
             ));
         }
+        let requested_approvals_reviewer = config
+            .requested_approvals_reviewer
+            .unwrap_or(config.approvals_reviewer);
         let trusted_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source)
             && !matches!(conversation_history, InitialHistory::Resumed(_));
         if config
@@ -822,13 +828,17 @@ impl Session {
                     );
                 }
             }
-            config
-                .config_layer_stack
-                .requirements()
-                .approvals_reviewer
-                .can_set(&ApprovalsReviewer::AutoReview)
-                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
-            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        }
+        let reviewer = crate::config::resolve_guardian_reviewer(
+            requested_approvals_reviewer,
+            (!trusted_guardian_reviewer).then_some(model.as_str()),
+            config.config_layer_stack.requirements(),
+        )
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        {
+            let config = Arc::make_mut(&mut config);
+            config.requested_approvals_reviewer = Some(requested_approvals_reviewer);
+            config.approvals_reviewer = reviewer;
         }
         if allow_provider_model_fallback
             && let Some(requested_model) = config.model.as_ref()
@@ -1986,7 +1996,8 @@ impl Session {
             .zip(metadata)
             .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
             .collect();
-        // Ordinary replay needs no reviewer or network refresh. Only an opaque
+        file_audio::resolve(self, file_audio::file_ids(&history).cloned().collect()).await;
+        // Ordinary replay needs no reviewer refresh. Only an opaque
         // checkpoint can make reconstruction depend on reviewer compatibility.
         let reviewer_compaction_hash = if codex_history::CompactionCheckpoint::latest(&history)
             .is_some_and(codex_history::CompactionCheckpoint::is_usable)
@@ -4102,6 +4113,9 @@ impl Session {
                 }
             }
             state
+                .pending_audio_duration_ids
+                .extend(file_audio::file_ids(&items).cloned());
+            state
                 .history
                 .record_annotated_items(&mut items, model_info.truncation_policy.into());
         }
@@ -4351,6 +4365,18 @@ impl Session {
             let extension_data =
                 codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
             extension_data.insert_arc(Arc::clone(&settings.model_info.model));
+            extension_data.insert_arc(
+                self.host_skills_for_step(&turn_context, &environments)
+                    .await,
+            );
+            if turn_context
+                .config
+                .features
+                .enabled(Feature::SkillCatalogDeltas)
+                && let Some(grants) = turn_context.turn_skill_filesystem_grants(&environments)
+            {
+                extension_data.insert(grants);
+            }
             if let Some(messages) = settings
                 .model_info
                 .model_messages
@@ -5331,6 +5357,7 @@ impl Session {
                     .cloned()
                     .collect(),
                 crate::compact_remote_v2::RETAINED_MESSAGE_TOKEN_BUDGET,
+                &history.file_audio_durations,
             );
         let window = {
             let mut state = self.state.lock().await;
