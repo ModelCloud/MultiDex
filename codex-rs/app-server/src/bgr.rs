@@ -12,6 +12,7 @@ use codex_app_server_protocol::BgrRole;
 use codex_app_server_protocol::BgrSender;
 use codex_app_server_protocol::BgrThreadBindParams;
 use codex_app_server_protocol::BgrThreadInspectParams;
+use codex_app_server_protocol::BgrThreadPeersParams;
 use codex_app_server_protocol::BgrThreadStateResponse;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -36,16 +37,33 @@ impl BgrRequestProcessor {
         BgrCapabilitiesReadResponse {
             version: BGR_VERSION,
             roles: vec![BgrRole::Brain, BgrRole::Grunt],
-            status_scopes: vec!["now".into()],
-            message_kinds: vec![BgrMessageKind::StatusQuery, BgrMessageKind::StatusReply],
+            status_scopes: vec!["now".into(), "since_time".into(), "since_commit".into()],
+            message_kinds: vec![
+                BgrMessageKind::Task,
+                BgrMessageKind::Question,
+                BgrMessageKind::Answer,
+                BgrMessageKind::Progress,
+                BgrMessageKind::Result,
+                BgrMessageKind::Cancel,
+                BgrMessageKind::StatusQuery,
+                BgrMessageKind::StatusReply,
+            ],
             report_tool: report_tool(),
+            send_tool: codex_app_server_protocol::send_tool(),
+            reply_tool: codex_app_server_protocol::reply_tool(),
+            general_messaging: true,
+            message_callbacks: true,
+            consumption_receipts: false,
+            status_evidence:
+                "model_self_summary_with_explicit_missing_evidence; no backend history attestation"
+                    .into(),
             live_reattach: true,
             durable_mailbox: false,
             restart_recovery: false,
             reviewer_sandbox: false,
             host_delivery: true,
             cross_host_delivery: false,
-            task_dispatch: false,
+            task_dispatch: true,
             max_queries_per_attempt: 128,
         }
     }
@@ -84,6 +102,19 @@ impl BgrRequestProcessor {
         Ok(BgrThreadStateResponse { snapshot })
     }
 
+    pub(crate) async fn peers(
+        &self,
+        params: BgrThreadPeersParams,
+    ) -> Result<BgrThreadStateResponse, JSONRPCErrorError> {
+        let snapshot = self
+            .thread(&params.thread_id)
+            .await?
+            .set_bgr_peers(&params.identity, params.peers)
+            .await
+            .map_err(|error| invalid_request(error.to_string()))?;
+        Ok(BgrThreadStateResponse { snapshot })
+    }
+
     pub(crate) async fn send(
         &self,
         params: BgrMessageSendParams,
@@ -96,6 +127,13 @@ impl BgrRequestProcessor {
             .map_err(|e| invalid_request(e.to_string()))?;
         if sender.cancelled {
             return Err(invalid_request("BGR sender is cancelled"));
+        }
+        if params.envelope.recipient_identity.is_some() {
+            self.thread(&params.source_thread_id)
+                .await?
+                .record_bgr_message(params.envelope.clone())
+                .await
+                .map_err(|error| invalid_request(error.to_string()))?;
         }
         self.deliver(BgrMessageDeliverParams {
             thread_id: params.thread_id,
@@ -161,11 +199,25 @@ pub(crate) async fn on_status_report(
     thread: Arc<CodexThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
 ) {
-    let result = match serde_json::from_value::<BgrReportStatusArgs>(params.arguments) {
-        Ok(report) => thread.report_bgr_status(report).await,
-        Err(error) => Err(codex_protocol::error::CodexErr::InvalidRequest(
-            error.to_string(),
-        )),
+    let result = match params.tool.as_str() {
+        codex_protocol::bgr::BGR_SEND_TOOL => match serde_json::from_value(params.arguments) {
+            Ok(args) => thread.send_bgr_message(args).await,
+            Err(error) => Err(codex_protocol::error::CodexErr::InvalidRequest(
+                error.to_string(),
+            )),
+        },
+        codex_protocol::bgr::BGR_REPLY_TOOL => match serde_json::from_value(params.arguments) {
+            Ok(args) => thread.reply_bgr_message(args).await,
+            Err(error) => Err(codex_protocol::error::CodexErr::InvalidRequest(
+                error.to_string(),
+            )),
+        },
+        _ => match serde_json::from_value::<BgrReportStatusArgs>(params.arguments) {
+            Ok(report) => thread.report_bgr_status(report).await,
+            Err(error) => Err(codex_protocol::error::CodexErr::InvalidRequest(
+                error.to_string(),
+            )),
+        },
     };
     let (success, text) = match result {
         Ok((envelope, fresh)) => {
@@ -181,7 +233,7 @@ pub(crate) async fn on_status_report(
             }
             (
                 true,
-                "Status reply accepted by the process-local bridge. Continue the same assignment."
+                "BGR message accepted by the process-local bridge, not acknowledged as consumed. Continue the same assignment."
                     .to_string(),
             )
         }

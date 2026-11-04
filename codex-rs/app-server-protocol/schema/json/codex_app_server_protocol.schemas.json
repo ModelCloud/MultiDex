@@ -8454,6 +8454,17 @@
           "recipientAgentId": {
             "type": "string"
           },
+          "recipientIdentity": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BgrIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "General messages authenticate `identity` as source and fence this exact target."
+          },
           "senderAgentId": {
             "type": "string"
           },
@@ -8482,7 +8493,10 @@
             "type": "string"
           },
           "attemptId": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "epoch": {
             "format": "uint64",
@@ -8497,7 +8511,10 @@
             "type": "string"
           },
           "taskId": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "teamId": {
             "type": "string"
@@ -8505,11 +8522,9 @@
         },
         "required": [
           "agentId",
-          "attemptId",
           "epoch",
           "role",
           "sessionId",
-          "taskId",
           "teamId"
         ],
         "type": "object"

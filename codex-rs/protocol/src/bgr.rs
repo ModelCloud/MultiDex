@@ -7,6 +7,8 @@ use ts_rs::TS;
 
 pub const BGR_VERSION: u32 = 1;
 pub const BGR_REPORT_TOOL: &str = "bgr_report_status";
+pub const BGR_SEND_TOOL: &str = "bgr_send_message";
+pub const BGR_REPLY_TOOL: &str = "bgr_reply_message";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -25,8 +27,12 @@ pub struct BgrIdentity {
     pub agent_id: String,
     /// Host session identity, not the native thread UUID used by RPC threadId.
     pub session_id: String,
-    pub task_id: String,
-    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attempt_id: Option<String>,
     #[ts(type = "number")]
     pub epoch: u64,
     pub role: BgrRole,
@@ -90,6 +96,10 @@ pub struct BgrEnvelope {
     pub recipient_agent_id: String,
     /// The target assignment for queries; the reporting assignment for replies.
     pub identity: BgrIdentity,
+    /// General messages authenticate `identity` as source and fence this exact target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub recipient_identity: Option<BgrIdentity>,
     pub kind: BgrMessageKind,
     pub correlation_id: String,
     pub in_reply_to: Option<String>,
@@ -119,6 +129,58 @@ pub struct BgrReportStatusArgs {
     pub message_id: String,
     pub in_reply_to: String,
     pub payload: BgrStatusReply,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrSendMessageArgs {
+    pub message_id: String,
+    pub recipient_agent_id: String,
+    pub kind: BgrMessageKind,
+    pub correlation_id: String,
+    pub in_reply_to: Option<String>,
+    pub payload: serde_json::Value,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrReplyMessageArgs {
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub kind: BgrMessageKind,
+    pub payload: serde_json::Value,
+}
+
+pub fn send_tool() -> crate::dynamic_tools::DynamicToolSpec {
+    message_tool(
+        BGR_SEND_TOOL,
+        "Send a BGR message to a host-authorized peer. Source identity is derived natively. The host routes asynchronously; acceptance is not consumption. Continue the same assignment.",
+        serde_json::json!(schemars::schema_for!(BgrSendMessageArgs)),
+    )
+}
+
+pub fn reply_tool() -> crate::dynamic_tools::DynamicToolSpec {
+    message_tool(
+        BGR_REPLY_TOOL,
+        "Reply to an accepted BGR message. Recipient, correlation and immutable anchor are derived natively from inReplyTo. Questions, progress and results can share a task anchor; continue the same assignment.",
+        serde_json::json!(schemars::schema_for!(BgrReplyMessageArgs)),
+    )
+}
+
+fn message_tool(
+    name: &str,
+    description: &str,
+    input_schema: serde_json::Value,
+) -> crate::dynamic_tools::DynamicToolSpec {
+    crate::dynamic_tools::DynamicToolSpec::Function(crate::dynamic_tools::DynamicToolFunctionSpec {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+        defer_loading: false,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

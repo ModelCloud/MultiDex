@@ -1,6 +1,6 @@
 # BGR: role-constrained brain, grunt, and reviewer execution
 
-Status: **experimental first backend slice implemented**. The next section is
+Status: **experimental native messaging implemented; reviewer factory pending**. The next section is
 the actual supported wire contract. Later sections retain the broader design;
 their conceptual fields are not automatically supported configuration/API fields.
 
@@ -25,28 +25,72 @@ sender; model-authored sender claims must never be forwarded unchecked.
 | ----------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `bgr/capabilities/read`             | `{}` -> capabilities below                                                   | Negotiate before starting managed threads                                                                                         |
 | `bgr/thread/bind`                   | `{threadId, identity}` -> `{snapshot}`                                       | Bind a fresh, delegation-disabled normal thread; exact repeated binding is idempotent                                             |
-| `bgr/message/send`                  | `{sourceThreadId, threadId, envelope}` -> `{messageId, accepted, duplicate}` | Queue a validated `status_query`; returns without waiting for worker output                                                       |
+| `bgr/message/send`                  | `{sourceThreadId, threadId, envelope}` -> `{messageId, accepted, duplicate}` | Queue a validated message; returns without waiting for worker output                                                              |
 | `bgr/message/deliver`               | `{threadId, sender, envelope}` -> `{messageId, accepted, duplicate}`         | Trusted host delivery to a worker; no native brain thread or second model required                                                |
 | `bgr/thread/inspect`                | `{threadId}` -> `{snapshot}`                                                 | Inspect/reconcile an already live attempt; never cold-starts a replacement                                                        |
+| `bgr/thread/peers`                  | `{threadId, identity, peers:[BgrIdentity]}` -> `{snapshot}`                  | Replace this attempt's exact peer ACL; not membership or scheduling                                                               |
 | `bgr/thread/checkpoint`             | `{threadId, identity}` -> `{snapshot}`                                       | Validate the complete identity and flush the native rollout; not an atomic durable BGR checkpoint                                 |
 | `bgr/thread/cancel`                 | `{threadId, identity}` -> `{snapshot}`                                       | Fence the assignment immediately and submit native interruption; acknowledgement does not prove every external process has exited |
-| `bgr/message` (server notification) | `{threadId, envelope}`                                                       | Typed status reply emitted by the native worker tool; also retained in `inspect`                                                  |
+| `bgr/message` (server notification) | `{threadId, envelope}`                                                       | Accepted model-tool callback, including questions, progress, results and status replies                                           |
 
 Capabilities are `version:1`, `roles:["brain","grunt"]`,
-`statusScopes:["now"]`, `messageKinds:["status_query","status_reply"]`,
-`liveReattach:true`, `hostDelivery:true`, `maxQueriesPerAttempt:128`, and the exact `reportTool`
-dynamic-tool specification. `durableMailbox`, `restartRecovery`,
-`reviewerSandbox`, `crossHostDelivery`, and `taskDispatch` are all **false**.
-Other declared message kinds and scopes are reserved, not implemented. Neither
-progress/result envelopes nor review/publication jobs are accepted by send.
-Reserved scoped payloads use the host's `since_time` and `since_commit` field
-names (for example, `{scope:"since_time",since_time:"<UTC timestamp>"}`), but
-both scopes are rejected until advertised as supported.
+`statusScopes:["now","since_time","since_commit"]`, and
+`messageKinds:["task","question","answer","progress","result","cancel","status_query","status_reply"]`.
+`generalMessaging`, `messageCallbacks`, `taskDispatch`, `liveReattach`, and
+`hostDelivery` are **true**. `durableMailbox`, `restartRecovery`, `reviewerSandbox`,
+`crossHostDelivery`, and `consumptionReceipts` remain **false**. The response
+includes exact `reportTool`, `sendTool`, and `replyTool` specifications and
+`maxQueriesPerAttempt:128`.
+
+Scoped status uses `{scope:"since_time",since_time:"<RFC3339 timestamp>"}` or
+`{scope:"since_commit",since_commit:"<40-hex commit>"}`. It requests a model
+self-summary restricted to evidence available in that thread. Scoped replies
+must include nonempty `coverageLimits`, explicitly naming missing evidence;
+the backend does not collect or attest historical activity. `statusEvidence`
+advertises this limitation. Review/publication jobs remain unsupported here.
 `hostDelivery` means the authenticated controller can deliver queries into a
 local worker process. It does not provide backend networking, remote discovery,
 durable transport, or cross-host delivery; `crossHostDelivery` remains false.
 Ordinary native turn/item/usage events remain available, but `turn/completed`
 is not an attestation of task success.
+
+### General-message extension
+
+Legacy status envelopes without `recipientIdentity` retain their original wire
+semantics below. General messages use `identity` as the authenticated **source**
+and add `recipientIdentity` as the exact **target** identity. The redundant
+`senderAgentId` and `recipientAgentId` must match those identities. Brain
+identities may omit both `taskId` and `attemptId`; grunt/reviewer identities must
+provide both. Never fabricate a brain assignment.
+
+Start general-message threads with the advertised `reportTool`, `sendTool`, and
+`replyTool` unchanged, then bind before history and call `bgr/thread/peers` with
+the exact authorized peers. Only same-team/epoch brain-to-worker edges are
+allowed, never worker-to-worker edges. Peer replacement immediately fences old
+identities, including replay attempts. Ordinary reviewer binding remains denied.
+
+The model tools are:
+
+```text
+bgr_send_message {messageId,recipientAgentId,kind,correlationId,payload,inReplyTo?,headSha?}
+bgr_reply_message {messageId,inReplyTo,kind,payload}
+```
+
+`send` derives source identity and selects only an authorized peer. `reply`
+derives recipient, correlation and immutable head anchor from the accepted
+incoming message. Answer/progress/result/status-reply messages require a known
+`inReplyTo`; answers require questions and status replies require status queries.
+Payloads are JSON objects; arbitrary strings and unconstrained extra envelope
+fields are rejected. A host-authorized `task` may contain textual instructions
+inside its typed payload. Native receipt means process-local acceptance, **not
+boundary consumption or durable delivery**. The host owns persistence/routing of
+outgoing `bgr/message` notifications to the brain, including external brains.
+
+Non-cancel messages reuse the existing cancellable mailbox and safe native turn
+boundaries. They do not terminate a running tool, start concurrent turns, or reset
+context. A brain's explicit `cancel` fences queued BGR mail before interruption;
+late callbacks are denied. Complete serialized envelopes are limited to 32 KiB,
+with bounded retained incoming/outgoing IDs and exact-content deduplication.
 
 ### Start, bind, query, report
 
@@ -64,8 +108,9 @@ is not an attestation of task success.
    Reviewer binding is rejected, not silently
    downgraded. Team membership and uniqueness across threads are host-owned.
    A bound thread cannot be rebound to a new task/attempt; allocate a new thread.
-3. Start the host-authorized task using native `turn/start`. Arbitrary task
-   text is **not** accepted as BGR message payload. Native nested delegation
+3. For the legacy status path, start the host-authorized task using native
+   `turn/start`. Unfenced task envelopes are not accepted; use the general-message
+   extension for task dispatch. Native nested delegation
    tools are disabled by the required feature configuration; host-provided
    tools, shell policy, credentials, and worktree ceilings remain host-owned.
 4. Deliver a host-authorized query targeting the complete worker identity.
@@ -168,8 +213,8 @@ session. Fence the old attempt externally and allocate a clean replacement
 with a new native session/attempt identity. Reviewer retries likewise require
 fresh independent sessions once reviewer enforcement is implemented.
 
-Remaining stages: scoped history coverage, role-constrained job dispatch,
-reviewer isolation, typed progress/results, durable replay/acknowledgement,
+Remaining stages: attested historical coverage, reviewer isolation,
+durable replay/acknowledgement,
 restart recovery and broader configuration-ceiling enforcement. These are
 deliberately not advertised by this first slice.
 

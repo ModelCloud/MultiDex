@@ -561,6 +561,13 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::BgrThreadStateResponse,
     },
+    #[experimental("bgr/thread/peers")]
+    BgrThreadPeers => "bgr/thread/peers" {
+        params: v2::BgrThreadPeersParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrThreadStateResponse,
+    },
     #[experimental("bgr/message/send")]
     BgrMessageSend => "bgr/message/send" {
         params: v2::BgrMessageSendParams,

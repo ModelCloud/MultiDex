@@ -7,8 +7,10 @@ use codex_protocol::bgr::BGR_VERSION;
 use codex_protocol::bgr::BgrEnvelope;
 use codex_protocol::bgr::BgrIdentity;
 use codex_protocol::bgr::BgrMessageKind;
+use codex_protocol::bgr::BgrReplyMessageArgs;
 use codex_protocol::bgr::BgrReportStatusArgs;
 use codex_protocol::bgr::BgrRole;
+use codex_protocol::bgr::BgrSendMessageArgs;
 use codex_protocol::bgr::BgrSender;
 use codex_protocol::bgr::BgrSnapshot;
 use codex_protocol::bgr::BgrStatusQuery;
@@ -21,6 +23,24 @@ use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 const MAX_MESSAGES: usize = 128;
+pub(crate) struct BgrBinding;
+
+pub(crate) fn is_delegation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent"
+            | "spawn_agents_on_csv"
+            | "send_input"
+            | "wait"
+            | "wait_agent"
+            | "resume_agent"
+            | "close_agent"
+            | "send_message"
+            | "followup_task"
+            | "interrupt_agent"
+            | "list_agents"
+    )
+}
 const MAX_BYTES: usize = 32 * 1024;
 
 pub(crate) struct BgrRuntime {
@@ -30,10 +50,12 @@ pub(crate) struct BgrRuntime {
     sequence: u32,
     queries: BTreeMap<String, BgrEnvelope>,
     replies: BTreeMap<String, BgrEnvelope>,
+    peers: BTreeMap<String, BgrIdentity>,
+    outgoing: BTreeMap<String, BgrEnvelope>,
 }
 
 fn invalid(message: impl Into<String>) -> CodexErr {
-    CodexErr::InvalidRequest(message.into())
+    CodexErr::InvalidRequest(format!("BGR: {}", message.into()))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -44,21 +66,81 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c))
 }
 
-impl BgrRuntime {
-    fn new(identity: BgrIdentity) -> Result<Self> {
-        if [
-            &identity.team_id,
-            &identity.agent_id,
-            &identity.session_id,
-            &identity.task_id,
-            &identity.attempt_id,
-        ]
+fn validate_identity(identity: &BgrIdentity) -> Result<()> {
+    if [&identity.team_id, &identity.agent_id, &identity.session_id]
         .into_iter()
         .any(|id| !valid_id(id))
-            || identity.epoch == 0
-        {
-            return Err(invalid("invalid BGR identity or zero epoch"));
+        || identity.epoch == 0
+        || identity.task_id.as_ref().is_some_and(|id| !valid_id(id))
+        || identity.attempt_id.as_ref().is_some_and(|id| !valid_id(id))
+        || (identity.role != BgrRole::Brain
+            && (identity.task_id.is_none() || identity.attempt_id.is_none()))
+        || identity.task_id.is_some() != identity.attempt_id.is_some()
+    {
+        return Err(invalid("invalid BGR identity, assignment or zero epoch"));
+    }
+    Ok(())
+}
+
+fn validate_envelope(envelope: &BgrEnvelope) -> Result<()> {
+    if envelope.version != BGR_VERSION
+        || !valid_id(&envelope.message_id)
+        || !valid_id(&envelope.correlation_id)
+        || envelope
+            .in_reply_to
+            .as_ref()
+            .is_some_and(|id| !valid_id(id))
+        || !envelope.payload.is_object()
+        || envelope
+            .head_sha
+            .as_ref()
+            .is_some_and(|sha| sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || serde_json::to_vec(envelope)
+            .map_err(|error| invalid(error.to_string()))?
+            .len()
+            > MAX_BYTES
+    {
+        return Err(invalid("invalid or oversized BGR envelope"));
+    }
+    if envelope.kind == BgrMessageKind::StatusQuery {
+        let query: BgrStatusQuery = serde_json::from_value(envelope.payload.clone())
+            .map_err(|error| invalid(format!("invalid BGR status query: {error}")))?;
+        match query {
+            BgrStatusQuery::Now {} => {}
+            BgrStatusQuery::SinceTime { since_time } => {
+                chrono::DateTime::parse_from_rfc3339(&since_time)
+                    .map_err(|_| invalid("since_time requires an RFC3339 timestamp"))?;
+            }
+            BgrStatusQuery::SinceCommit { since_commit } => {
+                if since_commit.len() != 40
+                    || !since_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(invalid("since_commit requires a full 40-hex commit"));
+                }
+            }
         }
+    }
+    if envelope.kind == BgrMessageKind::StatusReply {
+        let reply: codex_protocol::bgr::BgrStatusReply =
+            serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| invalid(format!("invalid BGR status reply: {error}")))?;
+        if reply.current_action.trim().is_empty()
+            || !reply
+                .coverage_limits
+                .iter()
+                .any(|limit| !limit.trim().is_empty())
+        {
+            return Err(invalid(
+                "BGR status requires current action and explicit evidence limits",
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl BgrRuntime {
+    fn new(identity: BgrIdentity) -> Result<Self> {
+        validate_identity(&identity)?;
         if identity.role == BgrRole::Reviewer {
             return Err(invalid(
                 "reviewer sandbox enforcement is not supported by BGR v1",
@@ -71,6 +153,189 @@ impl BgrRuntime {
             sequence: 0,
             queries: BTreeMap::new(),
             replies: BTreeMap::new(),
+            peers: BTreeMap::new(),
+            outgoing: BTreeMap::new(),
+        })
+    }
+
+    fn set_peers(&mut self, identity: &BgrIdentity, peers: Vec<BgrIdentity>) -> Result<()> {
+        self.check_identity(identity)?;
+        if peers.len() > MAX_MESSAGES {
+            return Err(invalid("BGR peer limit exceeded"));
+        }
+        let mut authorized = BTreeMap::new();
+        for peer in peers {
+            validate_identity(&peer)?;
+            if peer.team_id != identity.team_id
+                || peer.epoch != identity.epoch
+                || peer.agent_id == identity.agent_id
+                || (peer.role == BgrRole::Brain) == (identity.role == BgrRole::Brain)
+                || authorized.insert(peer.agent_id.clone(), peer).is_some()
+            {
+                return Err(invalid("BGR peer identity, role, team or epoch mismatch"));
+            }
+        }
+        self.peers = authorized;
+        Ok(())
+    }
+
+    fn validate_message(&self, sender: &BgrSender, envelope: &BgrEnvelope) -> Result<bool> {
+        let Some(target) = &envelope.recipient_identity else {
+            return self.validate_query(sender, envelope);
+        };
+        validate_envelope(envelope)?;
+        validate_identity(&envelope.identity)?;
+        if target != &self.identity
+            || BgrSender::from(&envelope.identity) != *sender
+            || envelope.sender_agent_id != sender.agent_id
+            || envelope.recipient_agent_id != target.agent_id
+            || self.peers.get(&sender.agent_id) != Some(&envelope.identity)
+            || (envelope.kind == BgrMessageKind::Cancel && sender.role != BgrRole::Brain)
+        {
+            return Err(invalid(
+                "BGR source, recipient, role or assignment fence mismatch",
+            ));
+        }
+        if self.cancelled && envelope.kind != BgrMessageKind::Cancel {
+            return Err(invalid("BGR assignment is cancelled"));
+        }
+        if let Some(previous) = self.queries.get(&envelope.message_id) {
+            return if previous == envelope {
+                Ok(false)
+            } else {
+                Err(invalid("BGR message ID reused with different content"))
+            };
+        }
+        self.check_identity(target)?;
+        self.check_message_id(&envelope.message_id)?;
+        if self.queries.len() >= MAX_MESSAGES {
+            return Err(invalid("BGR incoming message limit reached"));
+        }
+        self.validate_correlation(envelope, &self.outgoing, true)?;
+        Ok(true)
+    }
+
+    fn check_message_id(&self, id: &str) -> Result<()> {
+        if self.queries.contains_key(id)
+            || self.outgoing.contains_key(id)
+            || self.replies.values().any(|reply| reply.message_id == id)
+        {
+            return Err(invalid("BGR message ID is already in use"));
+        }
+        Ok(())
+    }
+
+    fn validate_correlation(
+        &self,
+        envelope: &BgrEnvelope,
+        prior: &BTreeMap<String, BgrEnvelope>,
+        incoming: bool,
+    ) -> Result<()> {
+        if let Some(id) = &envelope.in_reply_to {
+            let request = prior
+                .get(id)
+                .ok_or_else(|| invalid("unknown BGR inReplyTo for this attempt"))?;
+            let peer = if incoming {
+                &request.recipient_agent_id
+            } else {
+                &request.sender_agent_id
+            };
+            let actual = if incoming {
+                &envelope.sender_agent_id
+            } else {
+                &envelope.recipient_agent_id
+            };
+            if peer != actual
+                || request.correlation_id != envelope.correlation_id
+                || request.head_sha != envelope.head_sha
+            {
+                return Err(invalid(
+                    "BGR reply peer, correlation or head anchor mismatch",
+                ));
+            }
+            if (envelope.kind == BgrMessageKind::Answer && request.kind != BgrMessageKind::Question)
+                || (envelope.kind == BgrMessageKind::StatusReply
+                    && request.kind != BgrMessageKind::StatusQuery)
+            {
+                return Err(invalid("BGR reply kind does not match the request"));
+            }
+        } else if !matches!(
+            envelope.kind,
+            BgrMessageKind::Task
+                | BgrMessageKind::Question
+                | BgrMessageKind::StatusQuery
+                | BgrMessageKind::Cancel
+        ) {
+            return Err(invalid("BGR answer/progress/result requires inReplyTo"));
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, envelope: BgrEnvelope) -> Result<(BgrEnvelope, bool)> {
+        self.check_identity(&self.identity)?;
+        validate_envelope(&envelope)?;
+        if envelope.identity != self.identity
+            || envelope.sender_agent_id != self.identity.agent_id
+            || envelope.recipient_identity.as_ref() != self.peers.get(&envelope.recipient_agent_id)
+            || envelope.recipient_identity.is_none()
+            || (envelope.kind == BgrMessageKind::Cancel && self.identity.role != BgrRole::Brain)
+        {
+            return Err(invalid("BGR outgoing peer or source identity mismatch"));
+        }
+        if let Some(previous) = self.outgoing.get(&envelope.message_id) {
+            return if previous == &envelope {
+                Ok((envelope, false))
+            } else {
+                Err(invalid(
+                    "BGR outgoing message ID reused with different content",
+                ))
+            };
+        }
+        self.check_message_id(&envelope.message_id)?;
+        if self.outgoing.len() >= MAX_MESSAGES {
+            return Err(invalid("BGR outgoing message limit reached"));
+        }
+        self.validate_correlation(&envelope, &self.queries, false)?;
+        self.outgoing
+            .insert(envelope.message_id.clone(), envelope.clone());
+        self.sequence += 1;
+        Ok((envelope, true))
+    }
+
+    fn send_message(&mut self, args: BgrSendMessageArgs) -> Result<(BgrEnvelope, bool)> {
+        let recipient = self
+            .peers
+            .get(&args.recipient_agent_id)
+            .ok_or_else(|| invalid("BGR recipient is not host-authorized"))?
+            .clone();
+        self.emit(BgrEnvelope {
+            version: BGR_VERSION,
+            message_id: args.message_id,
+            sender_agent_id: self.identity.agent_id.clone(),
+            recipient_agent_id: recipient.agent_id.clone(),
+            identity: self.identity.clone(),
+            recipient_identity: Some(recipient),
+            kind: args.kind,
+            correlation_id: args.correlation_id,
+            in_reply_to: args.in_reply_to,
+            payload: args.payload,
+            head_sha: args.head_sha,
+        })
+    }
+
+    fn reply_message(&mut self, args: BgrReplyMessageArgs) -> Result<(BgrEnvelope, bool)> {
+        let incoming = self
+            .queries
+            .get(&args.in_reply_to)
+            .ok_or_else(|| invalid("unknown BGR incoming message"))?;
+        self.send_message(BgrSendMessageArgs {
+            message_id: args.message_id,
+            recipient_agent_id: incoming.sender_agent_id.clone(),
+            kind: args.kind,
+            correlation_id: incoming.correlation_id.clone(),
+            in_reply_to: Some(args.in_reply_to),
+            payload: args.payload,
+            head_sha: incoming.head_sha.clone(),
         })
     }
 
@@ -115,9 +380,7 @@ impl BgrRuntime {
         let query: BgrStatusQuery = serde_json::from_value(envelope.payload.clone())
             .map_err(|error| invalid(format!("invalid BGR status query: {error}")))?;
         if !matches!(query, BgrStatusQuery::Now {}) {
-            return Err(invalid(
-                "scoped BGR history is not supported; only scope=now is available",
-            ));
+            validate_envelope(envelope)?;
         }
         if let Some(previous) = self.queries.get(&envelope.message_id) {
             return if previous == envelope {
@@ -130,6 +393,7 @@ impl BgrRuntime {
             .replies
             .values()
             .any(|reply| reply.message_id == envelope.message_id)
+            || self.outgoing.contains_key(&envelope.message_id)
         {
             return Err(invalid("BGR query message ID is already used by a reply"));
         }
@@ -155,12 +419,30 @@ impl BgrRuntime {
         let query = self.queries.get(&report.in_reply_to).ok_or_else(|| {
             invalid("unknown BGR status query; cannot report another attempt's query")
         })?;
+        if query.kind != BgrMessageKind::StatusQuery {
+            return Err(invalid("status reports require a status_query"));
+        }
+        if query.payload["scope"] != "now"
+            && !report
+                .payload
+                .coverage_limits
+                .iter()
+                .any(|limit| !limit.trim().is_empty())
+        {
+            return Err(invalid(
+                "scoped self-summary requires explicit missing-evidence limits",
+            ));
+        }
         let envelope = BgrEnvelope {
             version: BGR_VERSION,
             message_id: report.message_id,
             sender_agent_id: self.identity.agent_id.clone(),
             recipient_agent_id: query.sender_agent_id.clone(),
             identity: self.identity.clone(),
+            recipient_identity: query
+                .recipient_identity
+                .as_ref()
+                .map(|_| query.identity.clone()),
             kind: BgrMessageKind::StatusReply,
             correlation_id: query.correlation_id.clone(),
             in_reply_to: Some(query.message_id.clone()),
@@ -186,6 +468,7 @@ impl BgrRuntime {
             .values()
             .any(|reply| reply.message_id == envelope.message_id)
             || self.queries.contains_key(&envelope.message_id)
+            || self.outgoing.contains_key(&envelope.message_id)
         {
             return Err(invalid("BGR reply message ID is already in use"));
         }
@@ -203,10 +486,21 @@ impl BgrRuntime {
             pending: self
                 .queries
                 .iter()
-                .filter(|(id, _)| !self.replies.contains_key(*id))
+                .filter(|(id, _)| {
+                    !self.replies.contains_key(*id)
+                        && !self
+                            .outgoing
+                            .values()
+                            .any(|reply| reply.in_reply_to.as_ref() == Some(*id))
+                })
                 .map(|(_, query)| query.clone())
                 .collect(),
-            replies: self.replies.values().cloned().collect(),
+            replies: self
+                .replies
+                .values()
+                .chain(self.outgoing.values())
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -249,6 +543,10 @@ impl CodexThread {
             return Ok(existing.snapshot());
         }
         let snapshot = runtime.snapshot();
+        self.session
+            .services
+            .thread_extension_data
+            .insert(BgrBinding);
         *binding = Some(runtime);
         Ok(snapshot)
     }
@@ -262,6 +560,54 @@ impl CodexThread {
             .ok_or_else(|| invalid("thread has no live BGR binding"))
     }
 
+    pub async fn set_bgr_peers(
+        &self,
+        identity: &BgrIdentity,
+        peers: Vec<BgrIdentity>,
+    ) -> Result<BgrSnapshot> {
+        if !self.session.has_bgr_message_tools().await {
+            return Err(invalid(
+                "general BGR requires advertised sendTool and replyTool at thread/start",
+            ));
+        }
+        let mut binding = self.bgr.lock().await;
+        let runtime = binding
+            .as_mut()
+            .ok_or_else(|| invalid("thread has no live BGR binding"))?;
+        runtime.set_peers(identity, peers)?;
+        Ok(runtime.snapshot())
+    }
+
+    pub async fn send_bgr_message(&self, args: BgrSendMessageArgs) -> Result<(BgrEnvelope, bool)> {
+        self.bgr
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| invalid("thread has no live BGR binding"))?
+            .send_message(args)
+    }
+
+    pub async fn reply_bgr_message(
+        &self,
+        args: BgrReplyMessageArgs,
+    ) -> Result<(BgrEnvelope, bool)> {
+        self.bgr
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| invalid("thread has no live BGR binding"))?
+            .reply_message(args)
+    }
+
+    pub async fn record_bgr_message(&self, envelope: BgrEnvelope) -> Result<(BgrEnvelope, bool)> {
+        self.bgr
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| invalid("thread has no live BGR binding"))?
+            .emit(envelope)
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "queue submission and query registration must be atomic with replies and cancellation; never waits for worker progress"
@@ -271,12 +617,22 @@ impl CodexThread {
         let runtime = binding
             .as_mut()
             .ok_or_else(|| invalid("thread has no live BGR binding"))?;
-        if !runtime.validate_query(sender, &envelope)? {
+        if !runtime.validate_message(sender, &envelope)? {
             return Ok(false);
         }
         let content = serde_json::to_string(&envelope).map_err(|e| invalid(e.to_string()))?;
         if content.len() > MAX_BYTES {
             return Err(invalid("BGR envelope is too large"));
+        }
+        if envelope.kind == BgrMessageKind::Cancel {
+            runtime.mail_cancellation.cancel();
+            runtime.cancelled = true;
+            self.submit(Op::Interrupt).await?;
+            runtime
+                .queries
+                .insert(envelope.message_id.clone(), envelope);
+            runtime.sequence += 1;
+            return Ok(true);
         }
         let communication = InterAgentCommunication::new(
             AgentPath::root(),
@@ -347,8 +703,8 @@ mod tests {
             }
             .into(),
             session_id: "019b9048-a066-7000-8000-000000000001".into(),
-            task_id: "task".into(),
-            attempt_id: "attempt".into(),
+            task_id: (role != BgrRole::Brain).then(|| "task".into()),
+            attempt_id: (role != BgrRole::Brain).then(|| "attempt".into()),
             epoch: 1,
             role,
         }
@@ -361,6 +717,7 @@ mod tests {
             sender_agent_id: "brain".into(),
             recipient_agent_id: "grunt-one".into(),
             identity: identity(BgrRole::Grunt),
+            recipient_identity: None,
             kind: BgrMessageKind::StatusQuery,
             correlation_id: format!("corr-{id}"),
             in_reply_to: None,
@@ -409,6 +766,132 @@ mod tests {
         assert!(state.report(conflict).is_err());
         assert_eq!(state.snapshot().pending.len(), 0);
         assert_eq!(state.snapshot().replies.len(), 1);
+    }
+
+    #[test]
+    fn bgr_general_message_identity_replay_correlation_and_size_fences() {
+        let brain_id = identity(BgrRole::Brain);
+        let worker_id = identity(BgrRole::Grunt);
+        assert!(brain_id.task_id.is_none() && brain_id.attempt_id.is_none());
+        let mut brain = BgrRuntime::new(brain_id.clone()).unwrap();
+        let mut worker = BgrRuntime::new(worker_id.clone()).unwrap();
+        brain.set_peers(&brain_id, vec![worker_id.clone()]).unwrap();
+        worker
+            .set_peers(&worker_id, vec![brain_id.clone()])
+            .unwrap();
+        let args = BgrSendMessageArgs {
+            message_id: "task".into(),
+            recipient_agent_id: worker_id.agent_id.clone(),
+            kind: BgrMessageKind::Task,
+            correlation_id: "correlation".into(),
+            in_reply_to: None,
+            payload: json!({"text": "work"}),
+            head_sha: Some("a".repeat(40)),
+        };
+        let (task, fresh) = brain.send_message(args.clone()).unwrap();
+        assert!(fresh);
+        assert!(!brain.send_message(args.clone()).unwrap().1);
+        assert!(worker.validate_message(&sender(), &task).unwrap());
+        worker.queries.insert(task.message_id.clone(), task.clone());
+        assert!(!worker.validate_message(&sender(), &task).unwrap());
+        let (question, _) = worker
+            .reply_message(BgrReplyMessageArgs {
+                message_id: "question".into(),
+                in_reply_to: "task".into(),
+                kind: BgrMessageKind::Question,
+                payload: json!({"text": "clarify"}),
+            })
+            .unwrap();
+        assert!(
+            brain
+                .validate_message(&BgrSender::from(&worker_id), &question)
+                .unwrap()
+        );
+        brain
+            .queries
+            .insert(question.message_id.clone(), question.clone());
+        let (answer, _) = brain
+            .reply_message(BgrReplyMessageArgs {
+                message_id: "answer".into(),
+                in_reply_to: "question".into(),
+                kind: BgrMessageKind::Answer,
+                payload: json!({"text": "clarification"}),
+            })
+            .unwrap();
+        assert!(worker.validate_message(&sender(), &answer).unwrap());
+        for field in [
+            "correlation",
+            "anchor",
+            "reply",
+            "source",
+            "target",
+            "version",
+            "size",
+            "kind",
+        ] {
+            let mut invalid = answer.clone();
+            match field {
+                "correlation" => invalid.correlation_id = "wrong".into(),
+                "anchor" => invalid.head_sha = Some("b".repeat(40)),
+                "reply" => invalid.in_reply_to = Some("unknown".into()),
+                "source" => invalid.identity.session_id = "spoofed".into(),
+                "target" => {
+                    invalid.recipient_identity.as_mut().unwrap().attempt_id = Some("stale".into())
+                }
+                "version" => invalid.version = 2,
+                "size" => invalid.payload = json!({"text": "界".repeat(MAX_BYTES)}),
+                _ => invalid.kind = BgrMessageKind::StatusReply,
+            }
+            assert!(
+                worker.validate_message(&sender(), &invalid).is_err(),
+                "{field}"
+            );
+        }
+        let mut conflict = args;
+        conflict.payload = json!({"text": "changed"});
+        assert!(brain.send_message(conflict).is_err());
+        assert!(
+            worker
+                .set_peers(&worker_id, vec![worker_id.clone()])
+                .is_err()
+        );
+        worker.set_peers(&worker_id, vec![]).unwrap();
+        assert!(worker.validate_message(&sender(), &answer).is_err());
+        worker.set_peers(&worker_id, vec![brain_id]).unwrap();
+        worker.cancelled = true;
+        assert!(worker.validate_message(&sender(), &answer).is_err());
+        assert!(
+            worker
+                .reply_message(BgrReplyMessageArgs {
+                    message_id: "late".into(),
+                    in_reply_to: "task".into(),
+                    kind: BgrMessageKind::Result,
+                    payload: json!({"text": "late result"})
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bgr_scoped_status_is_explicitly_incomplete_self_summary() {
+        for payload in [
+            json!({"scope": "since_time", "since_time": "2026-11-03T00:00:00Z"}),
+            json!({"scope": "since_commit", "since_commit": "a".repeat(40)}),
+        ] {
+            let mut worker = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
+            let mut message = query("scope");
+            message.payload = payload;
+            assert!(worker.validate_query(&sender(), &message).unwrap());
+            worker.queries.insert(message.message_id.clone(), message);
+            let mut incomplete = report("scope");
+            incomplete.payload.coverage_limits.clear();
+            assert!(worker.report(incomplete.clone()).is_err());
+            incomplete.payload.coverage_limits = vec![
+                "No complete historical evidence; summary is limited to this fresh model context."
+                    .into(),
+            ];
+            assert!(worker.report(incomplete).unwrap().1);
+        }
     }
 
     #[test]
@@ -510,9 +993,9 @@ mod tests {
             let mut message = query("one");
             match field {
                 "epoch" => message.identity.epoch += 1,
-                "attempt" => message.identity.attempt_id.push('x'),
+                "attempt" => message.identity.attempt_id = Some("stale-attempt".into()),
                 "session" => message.identity.session_id.push('x'),
-                "task" => message.identity.task_id.push('x'),
+                "task" => message.identity.task_id = Some("stale-task".into()),
                 "team" => message.identity.team_id.push('x'),
                 _ => message.identity.agent_id.push('x'),
             }
@@ -535,7 +1018,7 @@ mod tests {
     fn bgr_cancelled_attempt_and_unsupported_scope_are_rejected() {
         let mut state = BgrRuntime::new(identity(BgrRole::Grunt)).unwrap();
         for payload in [
-            json!({"scope": "since_time", "since_time": "2026-11-03T00:00:00Z"}),
+            json!({"scope": "since_time", "since_time": "not-a-time"}),
             json!({"scope": "since_commit", "since_commit": "abc"}),
             json!({"scope": "now", "instructions": "untyped work"}),
         ] {

@@ -762,6 +762,16 @@ impl Session {
             && (!require_report_tool || state.persisted_dynamic_tools.contains(&codex_protocol::bgr::report_tool()))
     }
 
+    pub(crate) async fn has_bgr_message_tools(&self) -> bool {
+        let state = self.state.lock().await;
+        state
+            .persisted_dynamic_tools
+            .contains(&codex_protocol::bgr::send_tool())
+            && state
+                .persisted_dynamic_tools
+                .contains(&codex_protocol::bgr::reply_tool())
+    }
+
     pub(crate) async fn model_client_for_provider(
         &self,
         provider: &SharedModelProvider,

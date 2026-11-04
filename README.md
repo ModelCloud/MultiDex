@@ -9,10 +9,11 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
-## Experimental host-managed worker status
+## Experimental host-managed worker messaging
 
-The app-server exposes an opt-in BGR v1 status bridge for host-managed brain/grunt
-threads: correlated asynchronous `now` queries, safe-boundary replies, and live
+The app-server exposes an opt-in BGR v1 bridge for host-managed brain/grunt
+threads: identity-fenced tasks, clarification/progress/result callbacks,
+correlated status self-summaries, safe-boundary replies, and live
 attempt inspection/cancellation. Trusted host delivery supports external brains
 without a proxy native brain thread. Cancellation fences queued BGR queries as
 well as late replies, without dropping unrelated mailbox/input. Omnigent remains

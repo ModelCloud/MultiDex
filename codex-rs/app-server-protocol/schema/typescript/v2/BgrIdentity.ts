@@ -7,4 +7,4 @@ export type BgrIdentity = { teamId: string, agentId: string,
 /**
  * Host session identity, not the native thread UUID used by RPC threadId.
  */
-sessionId: string, taskId: string, attemptId: string, epoch: number, role: BgrRole, };
+sessionId: string, taskId?: string, attemptId?: string, epoch: number, role: BgrRole, };

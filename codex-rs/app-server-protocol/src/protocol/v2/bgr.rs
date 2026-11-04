@@ -18,6 +18,12 @@ pub struct BgrCapabilitiesReadResponse {
     pub status_scopes: Vec<String>,
     pub message_kinds: Vec<BgrMessageKind>,
     pub report_tool: codex_protocol::dynamic_tools::DynamicToolSpec,
+    pub send_tool: codex_protocol::dynamic_tools::DynamicToolSpec,
+    pub reply_tool: codex_protocol::dynamic_tools::DynamicToolSpec,
+    pub general_messaging: bool,
+    pub message_callbacks: bool,
+    pub consumption_receipts: bool,
+    pub status_evidence: String,
     pub live_reattach: bool,
     pub durable_mailbox: bool,
     pub restart_recovery: bool,
@@ -41,6 +47,15 @@ pub struct BgrThreadBindParams {
 #[ts(export_to = "v2/")]
 pub struct BgrThreadInspectParams {
     pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BgrThreadPeersParams {
+    pub thread_id: String,
+    pub identity: BgrIdentity,
+    pub peers: Vec<BgrIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

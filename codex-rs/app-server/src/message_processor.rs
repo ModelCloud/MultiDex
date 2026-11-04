@@ -1331,6 +1331,11 @@ impl MessageProcessor {
                 .bind(params)
                 .await
                 .map(|response| Some(response.into())),
+            ClientRequest::BgrThreadPeers { params, .. } => self
+                .bgr_processor
+                .peers(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::BgrThreadPeers(response))),
             ClientRequest::BgrMessageSend { params, .. } => self
                 .bgr_processor
                 .send(params)

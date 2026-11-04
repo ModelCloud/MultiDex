@@ -1133,7 +1133,12 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
             if let Some(params) = dynamic_tool_call_params {
                 if params.namespace.is_none()
-                    && params.tool == codex_protocol::bgr::BGR_REPORT_TOOL
+                    && matches!(
+                        params.tool.as_str(),
+                        codex_protocol::bgr::BGR_REPORT_TOOL
+                            | codex_protocol::bgr::BGR_SEND_TOOL
+                            | codex_protocol::bgr::BGR_REPLY_TOOL
+                    )
                     && conversation.inspect_bgr().await.is_ok()
                 {
                     crate::bgr::on_status_report(params, conversation, outgoing).await;

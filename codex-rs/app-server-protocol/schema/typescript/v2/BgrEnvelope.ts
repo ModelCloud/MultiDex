@@ -9,4 +9,8 @@ export type BgrEnvelope = { version: number, messageId: string, senderAgentId: s
 /**
  * The target assignment for queries; the reporting assignment for replies.
  */
-identity: BgrIdentity, kind: BgrMessageKind, correlationId: string, inReplyTo: string | null, payload: JsonValue, headSha: string | null, };
+identity: BgrIdentity,
+/**
+ * General messages authenticate `identity` as source and fence this exact target.
+ */
+recipientIdentity?: BgrIdentity, kind: BgrMessageKind, correlationId: string, inReplyTo: string | null, payload: JsonValue, headSha: string | null, };
