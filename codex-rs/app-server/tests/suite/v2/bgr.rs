@@ -54,6 +54,7 @@ async fn bgr_host_records_source_before_routing_between_separate_app_servers() -
     let capabilities: BgrCapabilitiesReadResponse =
         rpc(&mut brain, "bgr/capabilities/read", json!({})).await?;
     assert!(capabilities.host_record);
+    assert!(capabilities.reviewer_snapshot_no_lazy_fetch);
     let mut brain_id = identity("brain", BgrRole::Brain);
     brain_id.task_id = None;
     brain_id.attempt_id = None;
@@ -949,6 +950,7 @@ async fn bgr_two_grunts_reply_out_of_order_and_reject_unfenced_general_messages(
         rpc(&mut mcp, "bgr/capabilities/read", json!({})).await?;
     assert!(capabilities.reviewer_sandbox);
     assert!(capabilities.reviewer_start);
+    assert!(capabilities.reviewer_snapshot_no_lazy_fetch);
     assert!(capabilities.task_dispatch);
     let mut trace = json!({"capabilities": capabilities, "bindings": [], "rejections": [], "queries": [], "notifications": []});
     let brain: ThreadStartResponse = rpc(&mut mcp, "thread/start", json!({})).await?;

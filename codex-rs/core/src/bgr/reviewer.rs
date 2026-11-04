@@ -52,6 +52,8 @@ async fn git(repository: &str, args: &[&str], limit: usize) -> Result<Vec<u8>> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -430,6 +432,97 @@ impl CodexThread {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bgr_review_snapshot_rejects_missing_promised_blobs_without_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_str().unwrap();
+        let fixture_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-C", repository])
+                .args([
+                    "-c",
+                    "user.name=BGR",
+                    "-c",
+                    "user.email=bgr@example.invalid",
+                ])
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "fixture git failed: {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        fixture_git(&["init"]);
+        let source = directory.path().join("review.rs");
+        std::fs::write(&source, "base\n").unwrap();
+        fixture_git(&["add", "review.rs"]);
+        fixture_git(&["commit", "-m", "base"]);
+        let base_sha = fixture_git(&["rev-parse", "HEAD"]);
+        std::fs::write(&source, "head\n").unwrap();
+        fixture_git(&["commit", "-am", "head"]);
+        let head_sha = fixture_git(&["rev-parse", "HEAD"]);
+        let blob = fixture_git(&["rev-parse", "HEAD:review.rs"]);
+        let marker = directory.path().join("helper-marker");
+        let helper = directory.path().join("marker-helper");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf marker > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixture_git(&[
+            "config",
+            "remote.origin.url",
+            &format!("ext::{}", helper.display()),
+        ]);
+        fixture_git(&["config", "remote.origin.promisor", "true"]);
+        fixture_git(&["config", "extensions.partialClone", "origin"]);
+        fixture_git(&["config", "protocol.ext.allow", "always"]);
+        let review = BgrReviewInput {
+            repository: repository.to_owned(),
+            base_sha,
+            head_sha,
+        };
+        let snapshot = ReviewSnapshot::capture(&review).await.unwrap();
+        assert_eq!(snapshot.files["head/review.rs"], "head\n");
+        assert!(!marker.exists());
+
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(".git/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .unwrap();
+        assert!(ReviewSnapshot::capture(&review).await.is_err());
+        assert!(!marker.exists(), "snapshot capture invoked a remote helper");
+        assert!(
+            git(repository, &["cat-file", "blob", &blob], MAX_OBJECT_BYTES)
+                .await
+                .is_err()
+        );
+        assert!(!marker.exists(), "blob lookup invoked a remote helper");
+        assert!(
+            git(repository, &["fetch", "origin", &blob], MAX_OBJECT_BYTES)
+                .await
+                .is_err()
+        );
+        assert!(
+            !marker.exists(),
+            "repo protocol override invoked a remote helper"
+        );
+    }
 
     #[test]
     fn bgr_reviewer_settings_allow_routing_but_not_sandbox_override() {

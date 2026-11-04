@@ -19,7 +19,9 @@ without a proxy native brain thread. Cancellation fences queued BGR queries as
 well as late replies, without dropping unrelated mailbox/input. Omnigent remains
 the scheduler and durable ledger. Atomic reviewer creation freezes exact Git
 base/head source and exposes only snapshot/BGR tools, with no shell, MCP,
-delegation, ambient instructions, or arbitrary filesystem access. Restart
+delegation, ambient instructions, or arbitrary filesystem access. Hosts must require
+`reviewerSnapshotNoLazyFetch: true` before launching reviewers: snapshot capture
+disables Git lazy fetching and denies all transports; missing promised objects fail closed. Restart
 recovery remains unsupported. See the
 [implemented contract and capability limits](docs/brain-executor-reviewer-design.md#implemented-backend-contract-version-1).
 

@@ -29,6 +29,7 @@ pub struct BgrCapabilitiesReadResponse {
     pub restart_recovery: bool,
     pub reviewer_sandbox: bool,
     pub reviewer_start: bool,
+    pub reviewer_snapshot_no_lazy_fetch: bool,
     pub review_snapshot_tool: codex_protocol::dynamic_tools::DynamicToolSpec,
     pub host_delivery: bool,
     pub host_record: bool,

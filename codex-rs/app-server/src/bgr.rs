@@ -63,6 +63,7 @@ impl BgrRequestProcessor {
             restart_recovery: false,
             reviewer_sandbox: true,
             reviewer_start: true,
+            reviewer_snapshot_no_lazy_fetch: true,
             review_snapshot_tool: codex_protocol::bgr::review_snapshot_tool(),
             host_delivery: true,
             host_record: true,
