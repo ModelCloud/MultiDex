@@ -81,8 +81,11 @@ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
 use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminal;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadDeleteParams;
@@ -156,6 +159,9 @@ use codex_utils_path_uri::PathUri;
 use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
+use futures::FutureExt;
+use futures::future::Either;
+use futures::future::RemoteHandle;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -354,6 +360,7 @@ pub(crate) struct AppServerSession {
     pub(crate) thread_settings_update_supported: bool,
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
+    prefetched_model_list: Option<RemoteHandle<Result<ModelListResponse>>>,
     daybreak_api_key_compat: Arc<tokio::sync::Semaphore>,
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_id: Mutex<Option<String>>,
@@ -561,6 +568,7 @@ impl AppServerSession {
             thread_settings_update_supported: true,
             default_model: None,
             available_models: Vec::new(),
+            prefetched_model_list: None,
             daybreak_api_key_compat: Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             managed_new_thread_defaults: None,
             external_agent_config_import_id: Mutex::default(),
@@ -786,6 +794,32 @@ impl AppServerSession {
         client.codex_home()
     }
 
+    pub(crate) fn prefetch_model_list(&mut self) {
+        let (request, models) = self.request_model_list().remote_handle();
+        tokio::spawn(request);
+        self.prefetched_model_list = Some(models);
+    }
+
+    fn request_model_list(&mut self) -> impl Future<Output = Result<ModelListResponse>> + use<> {
+        let handle = self.request_handle();
+        let request_id = self.next_request_id();
+        async move {
+            handle
+                .request_typed(ClientRequest::ModelList {
+                    request_id,
+                    params: ModelListParams {
+                        cursor: None,
+                        limit: None,
+                        include_hidden: Some(true),
+                    },
+                })
+                .await
+                .map_err(|err| {
+                    bootstrap_request_error("model/list failed during TUI bootstrap", err)
+                })
+        }
+    }
+
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         let account = self.read_account().await?;
@@ -826,26 +860,13 @@ impl AppServerSession {
         fallback: EmptyCatalogFallback,
     ) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
-        // `hooks/list` holds the global config queue during startup. Submit models and config
-        // requirements together so an uncached model fetch can overlap both config requests.
-        let model_request_id = self.next_request_id();
+        let models = match self.prefetched_model_list.take() {
+            Some(models) => Either::Left(models),
+            None => Either::Right(self.request_model_list()),
+        };
         let requirements_request_id = self.next_request_id();
         let (models, requirements, collaboration_modes) = tokio::try_join!(
-            async {
-                self.request_handle
-                    .request_typed::<ModelListResponse>(ClientRequest::ModelList {
-                        request_id: model_request_id,
-                        params: ModelListParams {
-                            cursor: None,
-                            limit: None,
-                            include_hidden: Some(true),
-                        },
-                    })
-                    .await
-                    .map_err(|err| {
-                        bootstrap_request_error("model/list failed during TUI bootstrap", err)
-                    })
-            },
+            models,
             async {
                 match self
                     .request_handle
@@ -1190,6 +1211,32 @@ impl AppServerSession {
         .await
     }
 
+    pub(crate) async fn fork_thread_for_directory_change(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        selected_profile: Option<&PermissionProfileSelection>,
+    ) -> Result<AppServerStartedThread> {
+        let permission_mode = match self.thread_params_mode() {
+            ThreadParamsMode::Embedded => ForkPermissionMode::OverrideFromCurrentConfig,
+            ThreadParamsMode::Remote | ThreadParamsMode::Cloud => ForkPermissionMode::InheritSaved,
+        };
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::DeferUntilNextTurn,
+            ForkPresentation::Regular,
+            selected_profile,
+            permission_mode,
+            ForkConfigSource::Session,
+        )
+        .await
+    }
+
     pub(crate) async fn fork_side_thread(
         &mut self,
         local_settings: &LocalSettings,
@@ -1275,7 +1322,7 @@ impl AppServerSession {
             // Active-session config has already adopted the server's roots. Fork does
             // not restore saved roots when omitted, so preserve this explicit selection.
             params.runtime_workspace_roots = Some(config.workspace_roots.clone());
-            if selected_profile.is_none() {
+            if permission_mode == ForkPermissionMode::InheritSaved && selected_profile.is_none() {
                 params.approvals_reviewer = None;
                 if let Some(overrides) = params.config.as_mut() {
                     overrides.remove("approvals_reviewer");
@@ -1950,6 +1997,33 @@ impl AppServerSession {
             .await
             .wrap_err("thread/approveGuardianDeniedAction failed in TUI")?;
         Ok(())
+    }
+
+    pub(crate) async fn list_background_terminals(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<Vec<ThreadBackgroundTerminal>> {
+        let mut terminals = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request_id = self.next_request_id();
+            let page: ThreadBackgroundTerminalsListResponse = self
+                .request_handle
+                .request_typed(ClientRequest::ThreadBackgroundTerminalsList {
+                    request_id,
+                    params: ThreadBackgroundTerminalsListParams {
+                        thread_id: thread_id.to_string(),
+                        cursor,
+                        limit: None,
+                    },
+                })
+                .await?;
+            terminals.extend(page.data);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(terminals);
+            }
+        }
     }
 
     pub(crate) async fn thread_background_terminals_clean(

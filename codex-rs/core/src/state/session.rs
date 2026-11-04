@@ -14,6 +14,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use super::auto_compact_window::ContextWindowIdGenerator;
 use crate::TurnStartOptions;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
@@ -107,6 +108,8 @@ pub(crate) struct SessionState {
     pub(crate) last_started_turn_id: Option<String>,
     /// Latest regular turn, retained across completion, settings changes, and compaction.
     pub(crate) turn_attribution: Option<TurnAttribution>,
+    /// Explicit namespaces from the recovered turn's own rollout record.
+    pub(crate) restored_turn_routing: Option<(String, Vec<String>)>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
     /// Identity of the last context whose automatic compaction failed or made no progress.
@@ -116,6 +119,7 @@ pub(crate) struct SessionState {
     /// item, meaning it does not implement the remote-compaction item protocol. Sticky so
     /// later auto-compacts go straight to the local path instead of burning another request.
     remote_compaction_v2_unsupported: bool,
+    context_window_id_generator: ContextWindowIdGenerator,
     pub(crate) async_compaction: crate::session::async_compaction::AsyncCompactionState,
     /// Original request effort for the current model while configuration updates remain active.
     pub(crate) reasoning_effort_pin: ReasoningEffortPin,
@@ -136,16 +140,20 @@ impl SessionState {
     /// Create a new session state mirroring previous `State::default()` semantics.
     #[cfg(test)]
     pub(crate) fn new(session_configuration: SessionConfiguration) -> Self {
+        let context_window_id_generator: ContextWindowIdGenerator =
+            Arc::new(codex_protocol::ContextWindowId::new_uuid_v7);
         Self::new_with_auto_compact_window_ids(
             session_configuration,
-            AutoCompactWindowIds::new_initial(),
-            ContextManager::new(),
+            AutoCompactWindowIds::new_initial(context_window_id_generator()),
+            context_window_id_generator,
+            ContextManager::default(),
         )
     }
 
     pub(crate) fn new_with_auto_compact_window_ids(
         session_configuration: SessionConfiguration,
         auto_compact_window_ids: AutoCompactWindowIds,
+        context_window_id_generator: ContextWindowIdGenerator,
         history: ContextManager,
     ) -> Self {
         Self {
@@ -164,9 +172,11 @@ impl SessionState {
             previous_turn_provider: None,
             last_started_turn_id: None,
             turn_attribution: None,
+            restored_turn_routing: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             failed_auto_compact_context: None,
             remote_compaction_v2_unsupported: false,
+            context_window_id_generator,
             async_compaction: crate::session::async_compaction::AsyncCompactionState::default(),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
             shutting_down: false,
@@ -239,6 +249,7 @@ impl SessionState {
                 .replace_compacted(items, reviewer_compaction_hash.as_deref()),
             HistoryReplacement::Reset => {
                 self.turn_attribution = None;
+                self.restored_turn_routing = None;
                 self.history.replace_annotated(items);
                 true
             }
@@ -302,18 +313,25 @@ impl SessionState {
     }
 
     pub(crate) fn recovered_turn_start_options(&self, turn_id: &str) -> TurnStartOptions {
-        self.turn_attribution
+        let mut options = self
+            .turn_attribution
             .as_ref()
             .filter(|attribution| attribution.turn_id == turn_id)
             .map(TurnAttribution::start_options)
-            .unwrap_or_else(|| TurnStartOptions {
-                // Older rollouts only persisted the root on the model-context record.
-                root_turn_id: self
-                    .reference_context_item()
-                    .filter(|context| context.turn_id.as_deref() == Some(turn_id))
-                    .and_then(|context| context.root_turn_id),
-                ..Default::default()
-            })
+            .unwrap_or_default();
+        if let Some(context) = self
+            .reference_context_item()
+            .filter(|context| context.turn_id.as_deref() == Some(turn_id))
+        {
+            // Older rollouts only persisted the root on the model-context record.
+            options.root_turn_id = options.root_turn_id.or(context.root_turn_id);
+            options.direct_only_tool_namespaces = context.direct_only_tool_namespaces;
+        } else if let Some((id, namespaces)) = &self.restored_turn_routing
+            && id == turn_id
+        {
+            options.direct_only_tool_namespaces = Some(namespaces.clone());
+        }
+        options
     }
 
     // Token/rate limit helpers
@@ -387,7 +405,7 @@ impl SessionState {
         self.auto_compact_window.window_number()
     }
 
-    pub(crate) fn auto_compact_window_ids(&self) -> AutoCompactWindowIds {
+    pub(crate) fn auto_compact_window_ids(&self) -> &AutoCompactWindowIds {
         self.auto_compact_window.ids()
     }
 
@@ -400,7 +418,8 @@ impl SessionState {
     }
 
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.auto_compact_window.advance()
+        self.auto_compact_window
+            .advance((self.context_window_id_generator)())
     }
 
     pub(crate) fn request_new_context_window(&mut self) {
@@ -412,7 +431,7 @@ impl SessionState {
     }
 
     pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
+        let window = self.advance_auto_compact_window();
         self.auto_compact_window.clear_prefill();
         window
     }

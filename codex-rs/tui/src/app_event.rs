@@ -867,6 +867,13 @@ pub(crate) enum AppEvent {
         result: Result<ConsumeAccountRateLimitResetCreditResponse, String>,
     },
 
+    /// Restore the displayed thread's live terminals after replaying its history.
+    RestoreBackgroundTerminals(ThreadId),
+    BackgroundTerminalsLoaded {
+        request_id: Uuid,
+        terminals: Vec<codex_app_server_protocol::ThreadBackgroundTerminal>,
+    },
+
     /// Fetch backend-estimated usage for the currently visible enterprise thread.
     RefreshThreadUsage {
         thread_id: ThreadId,
@@ -1257,6 +1264,9 @@ pub(crate) enum AppEvent {
         control: VoiceControl,
     },
     RealtimeConversationStateChanged,
+    RealtimeSessionLockStopped {
+        thread_id: ThreadId,
+    },
     BackgroundVoiceError {
         thread_id: ThreadId,
         message: String,

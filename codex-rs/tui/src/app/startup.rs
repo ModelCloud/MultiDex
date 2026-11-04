@@ -51,13 +51,6 @@ fn spawn_startup_thread_start(
     });
 }
 
-#[derive(Default)]
-pub(super) struct FreshStartupDefaults {
-    pub(super) server_defaults_read: bool,
-    pub(super) prompt_windows_sandbox: bool,
-    pub(super) approval_policy: Option<codex_protocol::protocol::AskForApproval>,
-}
-
 pub(super) async fn prepare_fresh_startup_config(
     config: &mut Config,
     app_server: &AppServerSession,
@@ -65,45 +58,38 @@ pub(super) async fn prepare_fresh_startup_config(
     cli_kv_overrides: &[(String, TomlValue)],
     harness_overrides: &ConfigOverrides,
     environments: &EnvironmentManager,
-) -> Result<FreshStartupDefaults> {
+) -> Result<crate::projectless::AppliedDefaults> {
     let defaults_cwd = match app_server_target {
         AppServerTarget::Embedded | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
         AppServerTarget::Remote { .. } => {
             app_server.remote_cwd_override().unwrap_or(Path::new("."))
         }
     };
-    let defaults = crate::config_update::read_effective_config_if_supported(
+    let defaults = crate::config_update::read_effective_config_with_layers(
         app_server.request_handle(),
         defaults_cwd,
     )
     .await?;
-    let mut projectless = crate::projectless::AppliedDefaults::default();
-    if let Some(defaults) = defaults.as_ref() {
-        super::new_session::overlay_new_session_defaults(
-            config,
-            &defaults.config,
-            cli_kv_overrides,
-            harness_overrides,
-        );
-        projectless = crate::projectless::apply_defaults(
-            config,
-            harness_overrides,
-            app_server,
-            environments,
-            defaults,
-        );
-    }
+    super::new_session::overlay_new_session_defaults(
+        config,
+        &defaults.config,
+        cli_kv_overrides,
+        harness_overrides,
+    );
+    let projectless = crate::projectless::apply_defaults(
+        config,
+        harness_overrides,
+        app_server,
+        environments,
+        &defaults,
+    );
     apply_managed_new_thread_defaults(
         config,
         app_server.managed_new_thread_defaults(),
         cli_kv_overrides,
         harness_overrides,
     );
-    Ok(FreshStartupDefaults {
-        server_defaults_read: defaults.is_some(),
-        prompt_windows_sandbox: projectless.prompt_windows_sandbox,
-        approval_policy: projectless.approval_policy,
-    })
+    Ok(projectless)
 }
 
 pub(super) fn startup_model(
@@ -166,6 +152,21 @@ impl App {
 
     pub(super) fn awaiting_side_replay(&self, tui: &tui::Tui) -> bool {
         self.pending_thread_switch_resets != 0 && self.side_retention_enabled(tui)
+    }
+
+    /// Drain a side pair's queued prompts and transcript updates before a key can switch focus.
+    pub(super) fn can_read_terminal_after_thread_switch(
+        &self,
+        tui: &tui::Tui,
+        app_event_rx: &mpsc::UnboundedReceiver<AppEvent>,
+    ) -> bool {
+        self.pending_thread_switch_resets == 0
+            && (app_event_rx.is_empty()
+                || (!self.side_retention_enabled(tui)
+                    && self
+                        .current_displayed_thread_id()
+                        .and_then(|id| self.side_pair_key(id))
+                        .is_none()))
     }
 
     /// Keep the provisional loading frame until queued history reaches the owned transcript.
@@ -343,11 +344,8 @@ impl App {
             &session_selection,
             SessionSelection::StartFresh | SessionSelection::Exit
         );
-        let server_owned_fresh_bootstrap = uses_server_owned_fresh_bootstrap(
-            &app_server_target,
-            &session_selection,
-            &loader_overrides,
-        );
+        let server_owned_fresh_bootstrap =
+            uses_server_owned_fresh_bootstrap(&session_selection, &loader_overrides);
         let mut bootstrap = startup_bootstrap;
         if bootstrap.is_none() && !server_owned_fresh_bootstrap {
             bootstrap = Some(
@@ -401,7 +399,7 @@ impl App {
                 }
             }
         } else {
-            FreshStartupDefaults::default()
+            crate::projectless::AppliedDefaults::default()
         };
         let mut launch_choices = crate::app_server_session::StartupLaunchChoices::from_launch(
             &cli_kv_overrides,
@@ -417,7 +415,6 @@ impl App {
                         &mut app_server,
                         &mut config,
                         &mut launch_choices,
-                        startup_defaults.server_defaults_read,
                         &cli_kv_overrides,
                         &harness_overrides,
                     ),
@@ -450,7 +447,7 @@ impl App {
                 &harness_overrides,
             );
         }
-        let mut model = startup_model(&config, &bootstrap, startup_defaults.server_defaults_read);
+        let mut model = startup_model(&config, &bootstrap, fresh_start);
         let available_models = bootstrap.available_models;
         let mut remote_connection =
             crate::status::remote_connection::remote_connection_status_value(
@@ -1551,9 +1548,7 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                         AppRunControl::Continue
                     }
-                    // Dispatch the current composer's queued submission before a focus key can switch threads.
-                    event = tui_events.next(), if app.pending_thread_switch_resets == 0
-                        && (!app.side_retention_enabled(tui) || app_event_rx.is_empty())
+                    event = tui_events.next(), if app.can_read_terminal_after_thread_switch(tui, &app_event_rx)
                         && (app.reconnect.offline || !block_terminal_input_for_pending_startup_events) => {
                         if let Some(event) = event {
                             if (matches!(

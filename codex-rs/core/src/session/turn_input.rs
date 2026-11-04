@@ -151,7 +151,9 @@ impl PreparedTurnInputSettings {
         let TurnStartOptions {
             turn_trigger,
             final_output_json_schema,
+            direct_only_tool_namespaces,
             service_tier,
+            prompt_cache_ttl,
             parent_turn_id,
             initiating_agent_path,
             root_turn_id,
@@ -167,7 +169,9 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            direct_only_tool_namespaces,
             final_output_json_schema,
+            prompt_cache_ttl,
             cyber_access_program,
         };
         let turn_context = match kind {
@@ -356,6 +360,7 @@ fn user_input_metadata(request: &TurnInputRequest) -> UserInputMetadata {
     UserInputMetadata {
         origin: UserInputOrigin::from_turn_trigger(request.start.turn_trigger.as_deref()),
         response_item_uuid: request.user_item_uuid,
+        extension_data: request.user_input_extension_data.clone(),
         ..Default::default()
     }
 }
@@ -419,7 +424,7 @@ async fn start_or_steer(
             /*expected_turn_id*/ None,
             settings.required_active_final_output_json_schema(),
             responsesapi_client_metadata.clone(),
-            input_metadata,
+            input_metadata.clone(),
         )
         .await
     {
@@ -1034,7 +1039,7 @@ async fn capture_sender_user_messages(
     if !matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) {
         return None;
     }
-    Session::assign_missing_response_item_id(item);
+    session.assign_missing_response_item_id(item);
     session
         .services
         .local_agent_runtime

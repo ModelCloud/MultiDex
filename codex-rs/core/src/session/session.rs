@@ -33,6 +33,8 @@ use codex_http_client::RouteAwareClientPool;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::SharedModelProvider;
 use codex_prompts::render_model_instructions;
+use codex_protocol::ContextWindowId;
+use codex_protocol::ItemIdGenerator;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
@@ -63,6 +65,7 @@ type McpToolApprovalMetadataMap =
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
+    pub(crate) item_id_generator: ItemIdGenerator,
     pub(crate) agent_runtime: AgentRuntimeServices,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
@@ -824,6 +827,10 @@ impl Session {
         client
     }
 
+    pub(crate) fn new_item_id_generator() -> ItemIdGenerator {
+        Arc::new(|prefix| ResponseItemId::with_suffix(prefix, uuid::Uuid::now_v7()))
+    }
+
     pub(super) async fn effective_thread_config_snapshot(
         &self,
         configuration: &SessionConfiguration,
@@ -925,7 +932,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         compaction_metadata: CompactionTurnMetadata,
-        (window_id, window_number, context_window_id): (String, u64, uuid::Uuid),
+        (window_id, window_number, context_window_id): (String, u64, ContextWindowId),
     ) -> CodexResponsesMetadata {
         let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
             self.installation_id.clone(),
@@ -945,7 +952,7 @@ impl Session {
         turn_context: &TurnContext,
         responses_metadata: CodexResponsesMetadata,
         window_number: u64,
-        context_window_id: uuid::Uuid,
+        context_window_id: ContextWindowId,
     ) -> CodexResponsesMetadata {
         CodexResponsesMetadata {
             history_initialization: Some(self.history_initialization),
@@ -1080,8 +1087,13 @@ impl Session {
             session_configuration.thread_source.as_ref(),
             Some(ThreadSource::Subagent | ThreadSource::GuardianReview)
         );
+        let item_id_generator = Arc::clone(&agent_control.runtime().item_id_generator);
         if let InitialHistory::Forked(items) = &mut initial_history {
-            Self::assign_missing_rollout_response_item_ids(items);
+            for record in items {
+                if let RolloutItem::ResponseItem(item) = record {
+                    assign_missing_item_id(&mut item.item, &item_id_generator);
+                }
+            }
         }
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
@@ -1161,7 +1173,10 @@ impl Session {
                     SessionId::from(thread_id)
                 }
             });
-        let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
+        let context_window_id_generator =
+            Arc::clone(&agent_control.runtime().context_window_id_generator);
+        let initial_auto_compact_window_ids =
+            AutoCompactWindowIds::new_initial(context_window_id_generator());
         let restore_child_window = matches!(&initial_history, InitialHistory::Forked(_))
             && session_configuration.session_source.is_non_root_agent()
             && config.features.enabled(Feature::TokenBudget);
@@ -1613,6 +1628,7 @@ impl Session {
                     .permissions
                     .legacy_sandbox_policy(session_configuration.cwd().as_path()),
                 mcp_server_names.iter().map(String::as_str).collect(),
+                &crate::config::legacy_multi_agent_disabled_sources(&config.config_layer_stack),
             );
 
             let default_shell = session_configuration
@@ -1736,10 +1752,13 @@ impl Session {
             session_configuration.thread_name = thread_name.clone();
             let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
-                initial_auto_compact_window_ids,
+                initial_auto_compact_window_ids.clone(),
+                context_window_id_generator,
                 ContextManager::for_session(
                     session_configuration.root_capabilities_restricted,
                     &config.features,
+                    config.guardian_context_budgeting(),
+                    Arc::clone(&item_id_generator),
                 ),
             );
             if matches!(initial_history, InitialHistory::Resumed(_)) {
@@ -1948,6 +1967,7 @@ impl Session {
                     AgentIdentityAuthPolicy::JwtOnly
                 },
                 thread_id,
+                Arc::clone(&item_id_generator),
                 session_configuration.session_source.clone(),
                 session_configuration.originator.clone(),
                 config.model_verbosity,
@@ -2077,6 +2097,7 @@ impl Session {
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
                 thread_id,
+                item_id_generator,
                 agent_runtime,
                 installation_id,
                 tx_event: tx_event.clone(),

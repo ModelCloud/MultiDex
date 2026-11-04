@@ -642,23 +642,21 @@ pub(crate) async fn run_turn(
         match sampling_request_result {
             Ok((sampling_request_output, notify_messages)) => {
                 context_overflow_compacted = false;
-                let (model_needs_follow_up, sampling_request_last_agent_message) =
-                    match sampling_request_output {
-                        // A MultiDex steer interrupted only the live provider
-                        // stream. Keep the turn alive and consume the input that
-                        // steer already appended before issuing the replacement
-                        // request.
-                        SamplingRequestResult::Preempted => {
-                            // Continue from completed upstream history items; unfinished
-                            // streamed text is not synthesized into conversation history.
-                            client_session.resume_http_continuation();
-                            (true, None)
-                        }
-                        SamplingRequestResult::Completed {
-                            needs_follow_up,
-                            last_agent_message,
-                        } => (needs_follow_up, last_agent_message),
-                    };
+                let SamplingRequestResult {
+                    needs_follow_up: model_needs_follow_up,
+                    mailbox_preempted,
+                    multidex_preempted,
+                    last_agent_message: sampling_request_last_agent_message,
+                } = sampling_request_output;
+                // A MultiDex steer interrupted only the live provider stream. Keep
+                // the turn alive and consume the input that steer already appended
+                // before issuing the replacement request.
+                if multidex_preempted {
+                    // Continue from completed upstream history items; unfinished
+                    // streamed text is not synthesized into conversation history.
+                    client_session.resume_http_continuation();
+                }
+                let model_needs_follow_up = model_needs_follow_up || multidex_preempted;
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -770,9 +768,10 @@ pub(crate) async fn run_turn(
                             if run_pending_session_start_hooks(&sess, &turn_context).await {
                                 return Ok(None);
                             }
-                            // After a signaled step, drain the steer even if compaction
+                            // After interrupted sampling, drain pending input even if compaction
                             // leaves the estimated context above the token limit.
                             can_drain_pending_input = !model_needs_follow_up
+                                || mailbox_preempted
                                 || step_context
                                     .preempt
                                     .as_ref()
@@ -816,9 +815,10 @@ pub(crate) async fn run_turn(
                         ));
                     }
                     if stop_outcome.should_block {
-                        if let Some(hook_prompt_message) =
-                            build_hook_prompt_message(&stop_outcome.continuation_fragments)
-                        {
+                        if let Some(hook_prompt_message) = build_hook_prompt_message(
+                            &stop_outcome.continuation_fragments,
+                            &sess.item_id_generator,
+                        ) {
                             sess.record_response_item_and_emit_turn_item(
                                 &turn_context,
                                 &step_context.settings.model_info,
@@ -2111,6 +2111,7 @@ pub(crate) fn build_prompt(
         output_schema_strict: !crate::guardian::is_basic_session_source(
             &turn_context.session_source,
         ),
+        prompt_cache_ttl: turn_context.prompt_cache_ttl,
         cyber_access_program: turn_context.cyber_access_program,
     }
 }
@@ -2178,6 +2179,10 @@ async fn run_sampling_request(
             sess.clone_history().await
         };
         let input_item_count = history.raw_items().len();
+        let sampling_step_context = Arc::new(StepContext {
+            sampled_through_sequence: Some(history.input_sequence()),
+            ..step_context.as_ref().clone()
+        });
         let mut prompt_input = history
             .for_prompt(
                 &step_context.settings.model_info.input_modalities,
@@ -2241,7 +2246,7 @@ async fn run_sampling_request(
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
-            Arc::clone(&step_context),
+            sampling_step_context,
             Arc::clone(&turn_store),
             client_session,
             &responses_metadata,
@@ -2309,8 +2314,10 @@ async fn run_sampling_request(
         // to the turn loop. Terminal errors and exhausted retries must still propagate.
         if preempt.is_cancelled() || (draining_for_mailbox && matches!(retry, Ok(Ok(())))) {
             return Ok((
-                SamplingRequestResult::Completed {
+                SamplingRequestResult {
                     needs_follow_up: true,
+                    mailbox_preempted: draining_for_mailbox,
+                    multidex_preempted: false,
                     last_agent_message: None,
                 },
                 notify_messages,
@@ -2458,15 +2465,15 @@ pub(crate) async fn built_tools(
 }
 
 #[derive(Debug)]
-enum SamplingRequestResult {
-    Completed {
-        needs_follow_up: bool,
-        last_agent_message: Option<String>,
-    },
-    /// The local provider stream was intentionally replaced by a same-turn
-    /// steer. This is not a failed request and must not emit TurnAborted.
-    ///
-    Preempted,
+struct SamplingRequestResult {
+    needs_follow_up: bool,
+    /// Queued mail interrupted sampling and must be drained before the next request.
+    mailbox_preempted: bool,
+    /// A MultiDex steer replaced only the live provider stream. The turn stays
+    /// alive and consumes the input the steer already appended; this is not a
+    /// failed request and must not emit TurnAborted.
+    multidex_preempted: bool,
+    last_agent_message: Option<String>,
 }
 
 async fn arm_multidex_sampling_preemption(
@@ -3005,10 +3012,11 @@ async fn emit_agent_message_in_plan_mode(
             .insert(agent_message_id.clone());
     }
 
-    sess.emit_turn_item_completed_with_token_count(
+    sess.emit_turn_item_completed_with_metadata(
         turn_context,
         TurnItem::AgentMessage(agent_message),
         content_token_count,
+        /*user_input_extension_data*/ None,
     )
     .await;
     state.started_agent_message_items.remove(&agent_message_id);
@@ -3127,21 +3135,6 @@ async fn drain_in_flight(
         }
     }
     Ok(())
-}
-
-fn assign_missing_streamed_response_item_id(
-    item: &mut ResponseItem,
-    active_item: Option<&TurnItem>,
-) {
-    if item.id().is_some_and(|id| !id.is_empty()) {
-        return;
-    }
-
-    let active_item_id = active_item
-        .map(|item| ResponseItemId::from_server(item.id()))
-        .filter(|item_id| !item_id.is_empty());
-    item.set_id(active_item_id);
-    Session::assign_missing_response_item_id(item);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3280,12 +3273,19 @@ async fn try_run_sampling_request(
             }
         } => {
             client_session.drop_connection();
-            return Ok(SamplingRequestResult::Preempted);
+            return Ok(SamplingRequestResult {
+                needs_follow_up: true,
+                mailbox_preempted: false,
+                multidex_preempted: true,
+                last_agent_message: None,
+            });
         }
         _ = preempt.cancelled() => {
             client_session.drop_connection();
-            return Ok(SamplingRequestResult::Completed {
+            return Ok(SamplingRequestResult {
                 needs_follow_up: true,
+                mailbox_preempted: false,
+                multidex_preempted: false,
                 last_agent_message: None,
             });
         }
@@ -3373,7 +3373,12 @@ async fn try_run_sampling_request(
                 }
             } => {
                 drop_connection_after_stream = true;
-                break Ok(SamplingRequestResult::Preempted);
+                break Ok(SamplingRequestResult {
+                    needs_follow_up: true,
+                    mailbox_preempted: false,
+                    multidex_preempted: true,
+                    last_agent_message: None,
+                });
             }
             _ = preempt.cancelled() => {
                 if *draining_for_mailbox {
@@ -3391,8 +3396,10 @@ async fn try_run_sampling_request(
                 }
                 // TODO: Reconcile any response item already presented to the client.
                 drop_connection_after_stream = true;
-                break Ok(SamplingRequestResult::Completed {
+                break Ok(SamplingRequestResult {
                     needs_follow_up: true,
+                    mailbox_preempted: false,
+                    multidex_preempted: false,
                     last_agent_message,
                 });
             }
@@ -3417,7 +3424,12 @@ async fn try_run_sampling_request(
                 if matches!(err.details(), CodexErrorDetails::ResponseIncomplete(_)))
         {
             drop_connection_after_stream = true;
-            break Ok(SamplingRequestResult::Preempted);
+            break Ok(SamplingRequestResult {
+                needs_follow_up: true,
+                mailbox_preempted: false,
+                multidex_preempted: true,
+                last_agent_message: None,
+            });
         }
 
         let event = match event.unwrap_or_else(|| {
@@ -3440,8 +3452,10 @@ async fn try_run_sampling_request(
                 if *draining_for_mailbox && matches!(err.details(), CodexErrorDetails::Stream(_)) {
                     // Mail already requires a follow-up, even if the producer exited before
                     // receiving the interrupt. Do not retry without that pending input.
-                    break Ok(SamplingRequestResult::Completed {
+                    break Ok(SamplingRequestResult {
                         needs_follow_up: true,
+                        mailbox_preempted: true,
+                        multidex_preempted: false,
                         last_agent_message,
                     });
                 }
@@ -3482,7 +3496,12 @@ async fn try_run_sampling_request(
                             authorization: authorization.clone(),
                         })
                     });
-                assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                if item.id().is_none_or(|id| id.is_empty())
+                    && let Some(active_item) = &active_item
+                {
+                    item.set_id(Some(ResponseItemId::from_server(active_item.id())));
+                }
+                sess.assign_missing_response_item_id(&mut item);
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -3634,14 +3653,16 @@ async fn try_run_sampling_request(
                         needs_follow_up = true;
                         continue;
                     }
-                    break Ok(SamplingRequestResult::Completed {
+                    break Ok(SamplingRequestResult {
                         needs_follow_up: true,
+                        mailbox_preempted: true,
+                        multidex_preempted: false,
                         last_agent_message,
                     });
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
-                assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
+                sess.assign_missing_response_item_id(&mut item);
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;
                 if !*draining_for_mailbox
@@ -3843,8 +3864,10 @@ async fn try_run_sampling_request(
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
-                break Ok(SamplingRequestResult::Completed {
+                break Ok(SamplingRequestResult {
                     needs_follow_up,
+                    mailbox_preempted: *draining_for_mailbox,
+                    multidex_preempted: false,
                     last_agent_message,
                 });
             }

@@ -40,7 +40,7 @@ async fn agents_checks_trust_when_starting_after_dismissing_overview() -> Result
 
 #[tokio::test]
 #[cfg(unix)]
-async fn discovered_managed_daemon_can_restart() -> Result<()> {
+async fn discovered_managed_daemon_can_restart_with_auto_start_disabled() -> Result<()> {
     daemon_startup("discovered").await
 }
 
@@ -194,10 +194,8 @@ async fn daemon_startup(command: &str) -> Result<()> {
          {}\n\
          notice.model_migrations.\"gpt-5.6-terra\" = \"gpt-6-sol\"\n\
          [projects.{}]\ntrust_level = \"{}\"\n",
-            if command == "start" {
-                "features.daemon_auto_start=false"
-            } else if command == "discovered" {
-                "tui.status_line=[\"model\",\"thread-id\",\"thread-name\"]"
+            if command == "discovered" {
+                "tui.status_line=[\"model\",\"thread-id\",\"thread-name\"]\nfeatures.daemon_auto_start=false"
             } else if bedrock_onboarding {
                 "features.gcp_setup_wizard=false"
             } else {
@@ -332,6 +330,7 @@ async fn daemon_startup(command: &str) -> Result<()> {
             }
             "entercontinue·escback"
         } else if command == "discovered" {
+            args.extend(["--disable".into(), "daemon_auto_start".into()]);
             // Empty drafts need not survive a daemon restart. Renaming materializes the
             // thread; wait for the confirmed footer name, not the echoed command.
             steps.push_back(("GPT-5.6-Terra", b"/rename daemon-restart-test\r"));
@@ -620,7 +619,15 @@ async fn daemon_startup(command: &str) -> Result<()> {
         ))
     }
     .await;
-    // Always stop the detached daemon, including on timeout or failed assertions.
+    // Elevated fresh Bedrock onboarding already verified that no daemon started.
+    if elevated
+        && command == "bedrock"
+        && let Ok((session, Ok(Ok(())))) = &result
+    {
+        session.terminate();
+        return Ok(());
+    }
+    // Stop the detached daemon, including on timeout or failed assertions.
     let stopped = Command::new(&codex)
         .env_clear()
         .envs(&env)
