@@ -102,6 +102,13 @@ pub(crate) struct RuntimeKeymap {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppKeymap {
+    /// Change where a new conversation runs.
+    pub(crate) change_host: Vec<KeyBinding>,
+    pub(crate) focus_main_composer: Vec<KeyBinding>,
+    pub(crate) focus_sidebar_content: Vec<KeyBinding>,
+    pub(crate) hide_pane: Vec<KeyBinding>,
+    pub(crate) focus_pane_left: Vec<KeyBinding>,
+    pub(crate) focus_pane_right: Vec<KeyBinding>,
     /// Open the agent command center.
     pub(crate) open_agents: Vec<KeyBinding>,
     /// Open transcript overlay.
@@ -652,7 +659,7 @@ impl RuntimeKeymap {
 
         DEFAULTS
             .get_or_init(|| {
-                Self::resolve(&TuiKeymap::default()).unwrap_or_else(|error| {
+                Self::resolve(&TuiKeymap::default(), /*workspace*/ false).unwrap_or_else(|error| {
                     panic!("built-in keymap defaults must be valid: {error}")
                 })
             })
@@ -673,10 +680,31 @@ impl RuntimeKeymap {
         if keymap == &TuiKeymap::default() {
             return Ok(Self::defaults());
         }
-        Self::resolve(keymap)
+        Self::resolve(keymap, /*workspace*/ false)
     }
 
-    fn resolve(keymap: &TuiKeymap) -> Result<Self, String> {
+    pub(crate) fn for_session(keymap: &TuiKeymap, workspace: bool) -> Result<Self, String> {
+        if workspace {
+            Self::resolve(keymap, workspace)
+        } else {
+            Self::from_config(keymap)
+        }
+    }
+
+    fn resolve(keymap: &TuiKeymap, workspace: bool) -> Result<Self, String> {
+        // Inactive pane shortcuts must not claim keys or chord prefixes in classic mode.
+        let mut classic_keymap;
+        let keymap = if workspace {
+            keymap
+        } else {
+            classic_keymap = keymap.clone();
+            classic_keymap.global.focus_main_composer = None;
+            classic_keymap.global.focus_sidebar_content = None;
+            classic_keymap.global.hide_pane = None;
+            classic_keymap.global.focus_pane_left = None;
+            classic_keymap.global.focus_pane_right = None;
+            &classic_keymap
+        };
         let defaults = Self::built_in_defaults();
         let chords = Arc::new(RuntimeChordKeymap::from_config(keymap)?);
         let side_toggle_default_is_shadowed = keymap.global.toggle_side_conversation.is_none()
@@ -723,6 +751,36 @@ impl RuntimeKeymap {
             .collect();
 
         let app = AppKeymap {
+            change_host: resolve_bindings(
+                keymap.global.change_host.as_ref(),
+                &defaults.app.change_host,
+                "tui.keymap.global.change_host",
+            )?,
+            focus_main_composer: resolve_bindings(
+                keymap.global.focus_main_composer.as_ref(),
+                &[],
+                "tui.keymap.global.focus_main_composer",
+            )?,
+            focus_sidebar_content: resolve_bindings(
+                keymap.global.focus_sidebar_content.as_ref(),
+                &[],
+                "tui.keymap.global.focus_sidebar_content",
+            )?,
+            hide_pane: resolve_bindings(
+                keymap.global.hide_pane.as_ref(),
+                &[],
+                "tui.keymap.global.hide_pane",
+            )?,
+            focus_pane_left: resolve_bindings(
+                keymap.global.focus_pane_left.as_ref(),
+                &[],
+                "tui.keymap.global.focus_pane_left",
+            )?,
+            focus_pane_right: resolve_bindings(
+                keymap.global.focus_pane_right.as_ref(),
+                &[],
+                "tui.keymap.global.focus_pane_right",
+            )?,
             open_agents: resolve_bindings(
                 keymap.global.open_agents.as_ref(),
                 &defaults.app.open_agents,
@@ -1671,7 +1729,7 @@ impl RuntimeKeymap {
             }
         }
         resolved.configure_search(keymap)?;
-        chords::leader_defaults::register(keymap, &mut resolved);
+        chords::leader_defaults::register(keymap, &mut resolved, workspace);
         resolved.validate_conflicts()?;
         chords::validate_chord_conflicts(&resolved)?;
         chords::install_dispatch_bindings(&mut resolved)?;
@@ -1697,6 +1755,12 @@ impl RuntimeKeymap {
     fn built_in_defaults() -> Self {
         Self {
             app: AppKeymap {
+                change_host: Vec::new(),
+                focus_main_composer: Vec::new(),
+                focus_sidebar_content: Vec::new(),
+                hide_pane: Vec::new(),
+                focus_pane_left: Vec::new(),
+                focus_pane_right: Vec::new(),
                 open_agents: default_bindings![],
                 open_transcript: default_bindings![ctrl(KeyCode::Char('t'))],
                 find_transcript: default_bindings![plain(KeyCode::F(3))],
@@ -2023,15 +2087,16 @@ impl RuntimeKeymap {
     ///    backtracking, intentionally stay outside this configurable keymap.
     fn validate_conflicts(&self) -> Result<(), String> {
         for (action, bindings) in [
-            ("open_presets", &self.chat.open_presets),
-            ("toggle_voice", &self.chat.toggle_voice),
+            ("global.change_host", &self.app.change_host),
+            ("chat.open_presets", &self.chat.open_presets),
+            ("chat.toggle_voice", &self.chat.toggle_voice),
             (
-                "previous_permission_mode",
+                "chat.previous_permission_mode",
                 &self.chat.previous_permission_mode,
             ),
-            ("next_permission_mode", &self.chat.next_permission_mode),
-            ("prompt_stack_back", &self.chat.prompt_stack_back),
-            ("skip_question", &self.chat.skip_question),
+            ("chat.next_permission_mode", &self.chat.next_permission_mode),
+            ("chat.prompt_stack_back", &self.chat.prompt_stack_back),
+            ("chat.skip_question", &self.chat.skip_question),
         ] {
             if bindings.iter().any(|binding| {
                 let (code, modifiers) = binding.parts();
@@ -2039,13 +2104,22 @@ impl RuntimeKeymap {
                     || matches!(code, KeyCode::Char(_)) && crate::key_hint::is_altgr(modifiers)
             }) {
                 return Err(format!(
-                    "tui.keymap.chat.{action}: printable keys are reserved for text input"
+                    "tui.keymap.{action}: printable keys are reserved for text input"
                 ));
             }
         }
         #[cfg(unix)]
         for (action, bindings) in [
+            ("global.change_host", &self.app.change_host),
             ("global.open_agents", &self.app.open_agents),
+            ("global.focus_main_composer", &self.app.focus_main_composer),
+            (
+                "global.focus_sidebar_content",
+                &self.app.focus_sidebar_content,
+            ),
+            ("global.focus_pane_left", &self.app.focus_pane_left),
+            ("global.focus_pane_right", &self.app.focus_pane_right),
+            ("global.hide_pane", &self.app.hide_pane),
             ("chat.open_presets", &self.chat.open_presets),
             ("chat.toggle_voice", &self.chat.toggle_voice),
         ] {
@@ -2074,6 +2148,18 @@ impl RuntimeKeymap {
         }
 
         let main_bindings = [
+            ("change_host", self.app.change_host.as_slice()),
+            (
+                "focus_main_composer",
+                self.app.focus_main_composer.as_slice(),
+            ),
+            (
+                "focus_sidebar_content",
+                self.app.focus_sidebar_content.as_slice(),
+            ),
+            ("focus_pane_left", self.app.focus_pane_left.as_slice()),
+            ("focus_pane_right", self.app.focus_pane_right.as_slice()),
+            ("hide_pane", self.app.hide_pane.as_slice()),
             ("open_agents", self.app.open_agents.as_slice()),
             ("open_transcript", self.app.open_transcript.as_slice()),
             ("find_transcript", self.app.find_transcript.as_slice()),
@@ -2242,6 +2328,17 @@ impl RuntimeKeymap {
         validate_no_shadow_with_allowed_overlaps(
             "main",
             [
+                (
+                    "focus_main_composer",
+                    self.app.focus_main_composer.as_slice(),
+                ),
+                (
+                    "focus_sidebar_content",
+                    self.app.focus_sidebar_content.as_slice(),
+                ),
+                ("focus_pane_left", self.app.focus_pane_left.as_slice()),
+                ("focus_pane_right", self.app.focus_pane_right.as_slice()),
+                ("hide_pane", self.app.hide_pane.as_slice()),
                 ("open_agents", self.app.open_agents.as_slice()),
                 ("open_transcript", self.app.open_transcript.as_slice()),
                 ("find_transcript", self.app.find_transcript.as_slice()),
@@ -2368,6 +2465,23 @@ impl RuntimeKeymap {
             "transcript",
             [
                 (
+                    "global.focus_main_composer",
+                    self.app.focus_main_composer.as_slice(),
+                ),
+                (
+                    "global.focus_sidebar_content",
+                    self.app.focus_sidebar_content.as_slice(),
+                ),
+                (
+                    "global.focus_pane_left",
+                    self.app.focus_pane_left.as_slice(),
+                ),
+                (
+                    "global.focus_pane_right",
+                    self.app.focus_pane_right.as_slice(),
+                ),
+                ("global.hide_pane", self.app.hide_pane.as_slice()),
+                (
                     "global.select_transcript",
                     self.app.select_transcript.as_slice(),
                 ),
@@ -2399,6 +2513,23 @@ impl RuntimeKeymap {
         validate_unique(
             "activity",
             context_bindings(KeymapContext::List).chain([
+                (
+                    "global.focus_main_composer",
+                    self.app.focus_main_composer.as_slice(),
+                ),
+                (
+                    "global.focus_sidebar_content",
+                    self.app.focus_sidebar_content.as_slice(),
+                ),
+                (
+                    "global.focus_pane_left",
+                    self.app.focus_pane_left.as_slice(),
+                ),
+                (
+                    "global.focus_pane_right",
+                    self.app.focus_pane_right.as_slice(),
+                ),
+                ("global.hide_pane", self.app.hide_pane.as_slice()),
                 ("global.focus_activity", self.app.focus_activity.as_slice()),
                 (
                     "global.find_transcript",
@@ -3860,6 +3991,40 @@ mod tests {
 
     #[test]
     fn toggle_side_conversation_can_be_remapped_and_rejects_conflicts() {
+        for (pane, section, action) in [
+            ("hide_pane", "pager", "page_up"),
+            ("hide_pane", "list", "move_down"),
+            ("focus_main_composer", "pager", "page_up"),
+            ("focus_sidebar_content", "list", "move_down"),
+            ("focus_pane_left", "list", "move_down"),
+            ("focus_pane_right", "pager", "page_up"),
+        ] {
+            let config: TuiKeymap = toml::from_str(&format!(
+                "[global]\n{pane} = 'f8'\n[{section}]\n{action} = 'f8'"
+            ))
+            .unwrap();
+            let error = RuntimeKeymap::for_session(&config, /*workspace*/ true).unwrap_err();
+            assert!(
+                error.contains(&format!("global.{pane}")) && error.contains(action),
+                "{error}"
+            );
+        }
+        #[cfg(unix)]
+        for action in [
+            "hide_pane",
+            "focus_main_composer",
+            "focus_sidebar_content",
+            "focus_pane_left",
+            "focus_pane_right",
+        ] {
+            let config: TuiKeymap =
+                toml::from_str(&format!("[global]\n{action} = 'ctrl-z'")).unwrap();
+            assert!(
+                RuntimeKeymap::for_session(&config, /*workspace*/ true)
+                    .unwrap_err()
+                    .contains("suspend")
+            );
+        }
         let mut keymap = TuiKeymap::default();
         keymap.global.toggle_side_conversation = Some(one("f12"));
 
@@ -3890,12 +4055,46 @@ mod tests {
         }
 
         let mut keymap = TuiKeymap::default();
+        keymap.global.open_transcript = Some(one("leader left"));
+        keymap.global.focus_pane_right = Some(one("f12 b"));
+        let runtime = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
+        for (action, expected) in [
+            ("focus_pane_left", "leader h"),
+            ("focus_pane_right", "f12 b"),
+        ] {
+            let installed: Vec<_> = runtime
+                .chords
+                .bindings
+                .iter()
+                .filter(|binding| binding.action.action == action)
+                .map(|binding| binding.spec.as_str())
+                .collect();
+            assert_eq!(installed, [expected], "{action}");
+        }
+
+        let mut keymap = TuiKeymap::default();
         keymap.global.open_transcript = Some(one("ctrl-/"));
         keymap.global.copy = Some(one("ctrl-7"));
 
         let runtime =
             RuntimeKeymap::from_config(&keymap).expect("distinct legacy bindings remain valid");
         assert!(runtime.app.toggle_side_conversation.is_empty());
+    }
+
+    #[test]
+    fn pane_binding_only_shadows_side_toggle_in_workspace_sessions() {
+        let keymap = toml::from_str("[global]\nfocus_pane_right = 'ctrl-/'").unwrap();
+        let classic = RuntimeKeymap::for_session(&keymap, /*workspace*/ false).unwrap();
+        assert_eq!(
+            classic.app.toggle_side_conversation,
+            RuntimeKeymap::defaults().app.toggle_side_conversation
+        );
+        let workspace = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
+        assert!(workspace.app.toggle_side_conversation.is_empty());
+        assert_eq!(
+            workspace.app.focus_pane_right,
+            vec![key_hint::ctrl(KeyCode::Char('/'))]
+        );
     }
 
     #[test]
@@ -4052,6 +4251,17 @@ mod tests {
         keymap.composer.toggle_shortcuts = Some(KeybindingsSpec::Many(vec![]));
         let runtime = RuntimeKeymap::from_config(&keymap).expect("config should parse");
         assert!(runtime.composer.toggle_shortcuts.is_empty());
+        keymap.global.hide_pane = Some(KeybindingsSpec::Many(vec![]));
+        keymap.global.focus_sidebar_content = Some(KeybindingsSpec::Many(vec![]));
+        keymap.global.focus_pane_right = Some(KeybindingsSpec::Many(vec![]));
+        let runtime = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
+        for action in ["hide_pane", "focus_sidebar_content", "focus_pane_right"] {
+            assert!(
+                runtime
+                    .primary_hint(KeymapContext::Global, action)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

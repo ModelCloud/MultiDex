@@ -160,6 +160,7 @@ pub(crate) fn build_tool_router(
         session.services.mcp_manager.shared_definitions(),
         &mut registry,
     );
+    let search = step_store.get::<crate::model_search::ModelSearch>();
     apply_mcp_tool_exposure_policy(
         turn_context,
         model_info,
@@ -173,6 +174,29 @@ pub(crate) fn build_tool_router(
         extension_tool_executors(session, step_store),
         &mut registry,
     );
+    let native_mode = match search.as_deref() {
+        None => Some(turn_context.config.web_search_mode.value()),
+        Some(crate::model_search::ModelSearch::Native { mode, .. }) => Some(*mode),
+        _ => None,
+    };
+    if matches!(
+        search.as_deref(),
+        Some(
+            crate::model_search::ModelSearch::Native { .. }
+                | crate::model_search::ModelSearch::Disabled
+        )
+    ) {
+        for tool in mcp
+            .tools()
+            .iter()
+            .filter(|tool| codex_mcp::is_model_search_tool(tool))
+        {
+            registry.remove(&tool.canonical_tool_name());
+        }
+    }
+    if native_mode.is_none() {
+        registry.remove(&ToolName::namespaced("web", "run"));
+    }
     append_dynamic_tool_runtimes(dynamic_tools, &mut registry);
     if session
         .services
@@ -189,11 +213,16 @@ pub(crate) fn build_tool_router(
             let _ = registry.remove(&name);
         }
     }
-    let hosted_specs = hosted_model_tool_specs(
-        turn_context,
-        model_info,
-        standalone_web_search_tool.as_slice(),
-    );
+    let hosted_specs = if let Some(mode) = native_mode {
+        hosted_model_tool_specs(
+            turn_context,
+            model_info,
+            mode,
+            standalone_web_search_tool.as_slice(),
+        )
+    } else {
+        Vec::new()
+    };
 
     finalize_tool_router(
         turn_context,
@@ -360,6 +389,7 @@ pub(crate) fn append_source_tools(
     hosted_model_tool_specs(
         turn_context,
         model_info,
+        turn_context.config.web_search_mode.value(),
         standalone_web_search_tool.as_slice(),
     )
 }
@@ -709,6 +739,7 @@ fn spec_for_model_request(
 fn hosted_model_tool_specs(
     turn_context: &TurnContext,
     model_info: &ModelInfo,
+    mode: WebSearchMode,
     registered_extension_tool_names: &[ToolName],
 ) -> Vec<ToolSpec> {
     // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
@@ -723,7 +754,7 @@ fn hosted_model_tool_specs(
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
         && turn_context.provider.capabilities().web_search)
-        .then_some(turn_context.config.web_search_mode.value());
+        .then_some(mode);
     let web_search_config = web_search_mode
         .as_ref()
         .and(turn_context.config.web_search_config.as_ref());
@@ -1340,7 +1371,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
     }
 
     if turn_context.config.experimental_request_user_input_enabled
-        && !turn_context.session_source.is_non_root_agent()
+        && !turn_context.root_capabilities_restricted
         && context
             .model_info
             .experimental_supported_tools
@@ -1367,7 +1398,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         );
     }
 
-    if !turn_context.session_source.is_non_root_agent()
+    if !turn_context.root_capabilities_restricted
         && (features.enabled(Feature::SendMessageToUserAsync)
             || context
                 .model_info
@@ -1477,6 +1508,14 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
             let spawn_agent_description =
                 model_messages.multi_agent_tool_description_override("spawn_agent");
+            // The OpenAI backend reserves the collaboration namespace and validates
+            // its tool schemas. Provider/model overrides are MultiDex extensions:
+            // keep them for other providers, but use the accepted schema for OpenAI.
+            let expose_model_overrides = turn_context
+                .config
+                .multi_agent_v2
+                .expose_spawn_agent_model_overrides
+                && !turn_context.provider.info().is_openai();
             let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
                 ToolExposure::DirectModelOnly
             } else {
@@ -1509,10 +1548,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                             agent_type_description,
                             expose_agent_type: !turn_context.config.agent_roles.is_empty(),
                             hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
-                            expose_spawn_agent_model_overrides: turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
+                            expose_spawn_agent_model_overrides: expose_model_overrides,
                             usage_hint_text: turn_context
                                 .config
                                 .multi_agent_v2
@@ -1533,12 +1569,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             if !turn_context.config.multi_agent_v2.disable_direct_message {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        SendMessageHandlerV2::new(
-                            turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
-                        ),
+                        SendMessageHandlerV2::new(expose_model_overrides),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("send_message"),
                         model_messages.multi_agent_tool_parameters_override("send_message"),
@@ -1548,12 +1579,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 );
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        FollowupTaskHandlerV2::new(
-                            turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
-                        ),
+                        FollowupTaskHandlerV2::new(expose_model_overrides),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("followup_task"),
                         model_messages.multi_agent_tool_parameters_override("followup_task"),
@@ -1562,11 +1588,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     native_review,
                 );
             }
-            if turn_context
-                .config
-                .multi_agent_v2
-                .expose_spawn_agent_model_overrides
-            {
+            if expose_model_overrides {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
                         SetAgentSettingsHandlerV2,

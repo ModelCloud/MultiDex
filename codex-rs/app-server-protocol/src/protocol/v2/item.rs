@@ -1507,6 +1507,12 @@ pub struct ItemCompletedNotification {
     pub item: ThreadItem,
     pub thread_id: String,
     pub turn_id: String,
+    /// Native content tokens for the completed assistant message, including a sampled footer.
+    /// Null when unavailable. Completion telemetry is not part of the stored thread item.
+    #[serde(default)]
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub content_token_count: Option<u64>,
     /// Unix timestamp (in milliseconds) when this item lifecycle completed.
     #[ts(type = "number")]
     pub completed_at_ms: i64,
@@ -1522,6 +1528,7 @@ impl ItemCompletedNotification {
         Self {
             thread_id,
             turn_id,
+            content_token_count: None,
             completed_at_ms,
             item: ThreadItem::completed(payload, started_at_ms, completed_at_ms),
         }

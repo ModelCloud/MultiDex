@@ -446,6 +446,10 @@
           "description": "Experimental replacement for the history-retrieval instructions when history tools and Apps are enabled. Omitted or blank values use the built-in prompt.",
           "type": "string"
         },
+        "experimental_denial_reconsideration_prompt": {
+          "description": "Developer message used when `features.guardian_denial_reconsideration` is enabled. Omitted or blank values use the built-in prompt. Maximum 1,000 UTF-8 bytes.",
+          "type": "string"
+        },
         "experimental_policy_template": {
           "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
           "type": "string"
@@ -843,6 +847,9 @@
             "agent_message_board": {
               "type": "boolean"
             },
+            "agent_message_board_mcp": {
+              "type": "boolean"
+            },
             "analytics_plan_history": {
               "type": "boolean"
             },
@@ -917,6 +924,9 @@
               "type": "boolean"
             },
             "cli_daybreak": {
+              "type": "boolean"
+            },
+            "cli_resume_account_check": {
               "type": "boolean"
             },
             "code_mode": {
@@ -1066,10 +1076,16 @@
             "guardian_conversation_history_tools": {
               "type": "boolean"
             },
+            "guardian_denial_reconsideration": {
+              "type": "boolean"
+            },
             "guardian_enhanced_node_repl_transcripts": {
               "type": "boolean"
             },
             "guardian_ext": {
+              "type": "boolean"
+            },
+            "guardian_include_additional_context": {
               "type": "boolean"
             },
             "guardian_native_multi_agent_history": {
@@ -1102,10 +1118,16 @@
             "hooks": {
               "type": "boolean"
             },
+            "hosted_search_policy": {
+              "type": "boolean"
+            },
             "image_detail_original": {
               "type": "boolean"
             },
             "image_generation": {
+              "type": "boolean"
+            },
+            "image_generation_animation": {
               "type": "boolean"
             },
             "image_resize_notice": {
@@ -1415,6 +1437,9 @@
               "type": "boolean"
             },
             "tui_multi_backend": {
+              "type": "boolean"
+            },
+            "tui_workspace": {
               "type": "boolean"
             },
             "ultrafast_mode": {
@@ -2142,7 +2167,7 @@
           "type": "boolean"
         },
         "sandbox_approval": {
-          "description": "Whether to allow shell command approval requests, including inline `with_additional_permissions` and `require_escalated` requests.",
+          "description": "Whether to allow sandbox escalation approval requests, including inline `with_additional_permissions` and `require_escalated` requests. Dangerous commands can still request approval within existing permissions.",
           "type": "boolean"
         },
         "skill_approval": {
@@ -2155,6 +2180,32 @@
         "mcp_elicitations",
         "rules",
         "sandbox_approval"
+      ],
+      "type": "object"
+    },
+    "GuardianElasticSectionConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "max_section_entry_tokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_total_section_tokens": {
+          "description": "Upper bound for the section's allocation. Omit to use the global request budget as the upper bound.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "min_total_section_tokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_section_entry_tokens",
+        "min_total_section_tokens"
       ],
       "type": "object"
     },
@@ -2227,6 +2278,17 @@
           "maximum": 1.0,
           "minimum": 0.0,
           "type": "number"
+        },
+        "sync_elastic_budgeting": {
+          "description": "Enable elastic allocation for synchronous Guardian requests. Defaults to false.",
+          "type": "boolean"
+        },
+        "sync_elastic_sections": {
+          "additionalProperties": {
+            "$ref": "#/definitions/GuardianElasticSectionConfigToml"
+          },
+          "description": "Named section limits, decoded and validated by Guardian when the switch is enabled.",
+          "type": "object"
         },
         "thread_context": {
           "description": "Deprecated and ignored; thread-owned Guardian context is always enabled.",
@@ -3742,6 +3804,7 @@
       "enum": [
         "auto",
         "osc9",
+        "osc777",
         "bel"
       ],
       "type": "string"
@@ -5133,6 +5196,14 @@
     "ToolsToml": {
       "additionalProperties": false,
       "properties": {
+        "client_search_provider": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebSearchProvider"
+            }
+          ],
+          "description": "Client provider preference when the model does not select a provider."
+        },
         "experimental_request_user_input": {
           "$ref": "#/definitions/ExperimentalRequestUserInput"
         },
@@ -5222,6 +5293,17 @@
           "default": false,
           "description": "Deselect read-only transcript or footer text after Copy on select confirms delivery. Editable composer selections remain visible. Defaults to `false` and has no effect when Copy on select is off.",
           "type": "boolean"
+        },
+        "default_hosts": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "default": {},
+          "description": "Preferred hosts for new conversations, indexed by project and local user identity. Read from the user configuration only; values are never endpoints or credentials.",
+          "type": "object"
         },
         "disable_paste_burst": {
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
@@ -5319,10 +5401,16 @@
               "yank": null
             },
             "global": {
+              "change_host": null,
               "clear_terminal": null,
               "copy": null,
               "find_transcript": null,
               "focus_activity": null,
+              "focus_main_composer": null,
+              "focus_pane_left": null,
+              "focus_pane_right": null,
+              "focus_sidebar_content": null,
+              "hide_pane": null,
               "leader": null,
               "open_agents": null,
               "open_external_editor": null,
@@ -6117,6 +6205,14 @@
       "additionalProperties": false,
       "description": "Global keybindings. These are used when a context does not define an override.",
       "properties": {
+        "change_host": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Change where a new conversation runs."
+        },
         "clear_terminal": {
           "allOf": [
             {
@@ -6148,6 +6244,46 @@
             }
           ],
           "description": "Focus activity groups in the owned transcript to inspect their details."
+        },
+        "focus_main_composer": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Focus the main conversation composer."
+        },
+        "focus_pane_left": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Focus the parent conversation."
+        },
+        "focus_pane_right": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Focus the open side conversation."
+        },
+        "focus_sidebar_content": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Focus the side conversation, or hide it when already focused."
+        },
+        "hide_pane": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Hide the focused sidebar pane."
         },
         "leader": {
           "allOf": [
@@ -6357,10 +6493,16 @@
             }
           ],
           "default": {
+            "change_host": null,
             "clear_terminal": null,
             "copy": null,
             "find_transcript": null,
             "focus_activity": null,
+            "focus_main_composer": null,
+            "focus_pane_left": null,
+            "focus_pane_right": null,
+            "focus_sidebar_content": null,
+            "hide_pane": null,
             "leader": null,
             "open_agents": null,
             "open_external_editor": null,
@@ -7403,6 +7545,14 @@
       ],
       "type": "string"
     },
+    "WebSearchProvider": {
+      "description": "Provider preference selected by the resolved model catalog entry.",
+      "enum": [
+        "standalone",
+        "search_mcp"
+      ],
+      "type": "string"
+    },
     "WebSearchToolConfig": {
       "additionalProperties": false,
       "properties": {
@@ -7641,6 +7791,9 @@
         "agent_message_board": {
           "type": "boolean"
         },
+        "agent_message_board_mcp": {
+          "type": "boolean"
+        },
         "analytics_plan_history": {
           "type": "boolean"
         },
@@ -7715,6 +7868,9 @@
           "type": "boolean"
         },
         "cli_daybreak": {
+          "type": "boolean"
+        },
+        "cli_resume_account_check": {
           "type": "boolean"
         },
         "code_mode": {
@@ -7864,10 +8020,16 @@
         "guardian_conversation_history_tools": {
           "type": "boolean"
         },
+        "guardian_denial_reconsideration": {
+          "type": "boolean"
+        },
         "guardian_enhanced_node_repl_transcripts": {
           "type": "boolean"
         },
         "guardian_ext": {
+          "type": "boolean"
+        },
+        "guardian_include_additional_context": {
           "type": "boolean"
         },
         "guardian_native_multi_agent_history": {
@@ -7900,10 +8062,16 @@
         "hooks": {
           "type": "boolean"
         },
+        "hosted_search_policy": {
+          "type": "boolean"
+        },
         "image_detail_original": {
           "type": "boolean"
         },
         "image_generation": {
+          "type": "boolean"
+        },
+        "image_generation_animation": {
           "type": "boolean"
         },
         "image_resize_notice": {
@@ -8213,6 +8381,9 @@
           "type": "boolean"
         },
         "tui_multi_backend": {
+          "type": "boolean"
+        },
+        "tui_workspace": {
           "type": "boolean"
         },
         "ultrafast_mode": {

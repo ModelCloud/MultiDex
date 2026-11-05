@@ -41,6 +41,7 @@ use serde_json::json;
 
 use crate::WaitForEnvironmentToolConfig;
 use crate::config::CurrentTimeReminderConfig;
+use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::responses_metadata::TurnToolFunctionInfo;
 use crate::responses_metadata::TurnToolNamespacesInfo;
@@ -1017,6 +1018,15 @@ async fn exec_command_guidance_follows_executor_platform_and_fallbacks() {
 
 #[tokio::test]
 async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
+    let (attachment, _guard, _) = EnvironmentAttachment::new(
+        "remote",
+        Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some(
+                "ws://127.0.0.1:1/remote-exec-server".to_string(),
+            ))
+            .expect("remote test environment"),
+        ),
+    );
     let remote_environment = probe(|turn| {
         set_feature(turn, Feature::ShellTool, /*enabled*/ false);
         update_turn_settings_for_test(turn, |settings| {
@@ -1032,12 +1042,7 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
             panic!("primary environment should be ready");
         };
         environment.selection.environment_id = "remote".to_string();
-        environment.environment = Arc::new(
-            codex_exec_server::Environment::create_for_tests(Some(
-                "ws://127.0.0.1:1/remote-exec-server".to_string(),
-            ))
-            .expect("remote test environment"),
-        );
+        environment.attachment = attachment;
     })
     .await;
     remote_environment.assert_visible_lacks(&["exec_command", "write_stdin"]);
@@ -1142,7 +1147,12 @@ async fn environment_tools_follow_the_step_context() {
             /*tool_suggest_candidates*/ None,
             /*wait_for_environment_tool_config*/ None,
         ),
-        super::hosted_model_tool_specs(turn.as_ref(), turn.model_info(), &[]),
+        super::hosted_model_tool_specs(
+            turn.as_ref(),
+            turn.model_info(),
+            turn.config.web_search_mode.value(),
+            &[],
+        ),
         &Default::default(),
     ));
 
@@ -2273,6 +2283,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         super::hosted_model_tool_specs(
             first_step_context.turn.as_ref(),
             first_step_context.turn.model_info(),
+            first_step_context.turn.config.web_search_mode.value(),
             &[],
         ),
         &cache,
@@ -2307,6 +2318,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         super::hosted_model_tool_specs(
             second_step_context.turn.as_ref(),
             second_step_context.turn.model_info(),
+            second_step_context.turn.config.web_search_mode.value(),
             &[],
         ),
         &cache,
@@ -2372,6 +2384,7 @@ async fn tool_search_cache_rebuilds_when_deferred_world_state_changes() {
             super::hosted_model_tool_specs(
                 step_context.turn.as_ref(),
                 step_context.turn.model_info(),
+                step_context.turn.config.web_search_mode.value(),
                 &[],
             ),
             &cache,
@@ -2789,6 +2802,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 
     let v2 = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
         update_config(turn, |config| {
             config.multi_agent_v2.max_concurrent_threads_per_session = 17;
         });
@@ -2909,9 +2923,76 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
 }
 
 #[tokio::test]
+async fn openai_multi_agent_v2_uses_reserved_collaboration_schemas() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.expose_spawn_agent_model_overrides = true;
+        });
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
+        panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
+    };
+    assert!(
+        !plan
+            .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"set_agent_settings".to_string())
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name)
+        }) else {
+            panic!("expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE}");
+        };
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("tool should use object params");
+        for extension in ["provider", "model", "reasoning_effort"] {
+            assert!(
+                !properties.contains_key(extension),
+                "{tool_name} must not expose {extension} to OpenAI"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_openai_multi_agent_v2_keeps_provider_overrides() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
+        panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
+    };
+    assert!(
+        plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"set_agent_settings".to_string())
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name)
+        }) else {
+            panic!("expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE}");
+        };
+        assert!(
+            tool.parameters
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("provider"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn multi_agent_v2_can_disable_wait_agent() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
         update_config(turn, |config| {
             config.multi_agent_v2.wait_agent_enabled = false;
         });

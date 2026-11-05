@@ -159,6 +159,12 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, String> {
     // Preserve activation for history forks without freezing the parent's model-owned prompts.
     // Fresh child startup restores configured preferences from the retained snapshot.
     config.token_budget = turn.configured_token_budget.clone();
+    if let Some(thread_namespaces) = &turn.overridden_direct_only_tool_namespaces {
+        config
+            .code_mode
+            .direct_only_tool_namespaces
+            .clone_from(thread_namespaces);
+    }
     config.model = Some(turn.model_info().slug.clone());
     config.model_provider = turn.provider.info().clone();
     config.model_reasoning_effort = turn
@@ -282,6 +288,7 @@ async fn apply_requested_spawn_agent_model_overrides(
         Some(crate::thread_manager::build_models_manager(
             config,
             std::sync::Arc::clone(&session.services.auth_manager),
+            /*runtime*/ None,
         ))
     } else {
         None

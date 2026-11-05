@@ -294,6 +294,22 @@ pub(crate) struct AgentPickerThreadRefresh {
     pub(crate) archived_thread_ids: std::collections::HashSet<ThreadId>,
 }
 
+/// Source-backed replacement for the outgoing widget's width-bound streaming rows.
+#[derive(Debug)]
+pub(crate) enum CapturedSideStream {
+    Answer(Arc<crate::history_cell::AgentMarkdownCell>),
+    Plan(Arc<crate::history_cell::ProposedPlanCell>),
+}
+
+/// Presentation retained alongside the transcript while its composer is inactive.
+#[derive(Debug)]
+pub(crate) struct CapturedSideDisplay {
+    pub(crate) active: Option<Box<dyn HistoryCell>>,
+    pub(crate) auxiliary: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
+    pub(crate) draft: String,
+    pub(crate) status: Option<String>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -566,6 +582,19 @@ pub(crate) enum AppEvent {
         name: Option<String>,
     },
 
+    /// Resolve the /new host before offering choices about the displayed checkout.
+    ChooseNewSessionCheckout {
+        name: Option<String>,
+    },
+
+    /// Start on the current worktree's host, ignoring the saved new-thread host.
+    NewSessionInCurrentWorktree {
+        name: Option<String>,
+    },
+
+    /// Move an empty conversation to the next connected backend.
+    CycleNewConversationBackend,
+
     /// Continue a provider-locked conversation in a fresh chat using its saved history.
     ContinueProviderChat {
         thread_id: ThreadId,
@@ -640,6 +669,17 @@ pub(crate) enum AppEvent {
     ClearUi {
         name: Option<String>,
     },
+
+    /// Move the outgoing transcript once its previously queued history edits have run.
+    ParkSideCompanion {
+        pair: ThreadId,
+        thread_id: ThreadId,
+        stream: Option<CapturedSideStream>,
+        display: CapturedSideDisplay,
+    },
+
+    /// Release input and drawing after the destination snapshot's queued history edits.
+    SideReplayFinished(ThreadId),
 
     /// Clear history queued by the previous thread before the new thread's replay events.
     ResetTranscriptForThreadSwitch,
@@ -825,6 +865,13 @@ pub(crate) enum AppEvent {
         idempotency_key: String,
         credit_id: Option<String>,
         result: Result<ConsumeAccountRateLimitResetCreditResponse, String>,
+    },
+
+    /// Restore the displayed thread's live terminals after replaying its history.
+    RestoreBackgroundTerminals(ThreadId),
+    BackgroundTerminalsLoaded {
+        request_id: Uuid,
+        terminals: Vec<codex_app_server_protocol::ThreadBackgroundTerminal>,
     },
 
     /// Fetch backend-estimated usage for the currently visible enterprise thread.
@@ -1183,6 +1230,14 @@ pub(crate) enum AppEvent {
         result: Result<SkillsListResponse, String>,
     },
 
+    /// Result of the skills refresh issued while replaying a docked conversation.
+    SideReplaySkillsLoaded {
+        request_id: Uuid,
+        thread_id: ThreadId,
+        cwd: PathBuf,
+        result: Result<SkillsListResponse, String>,
+    },
+
     /// Begin buffering initial resume replay rows before they are written to scrollback.
     BeginInitialHistoryReplayBuffer,
 
@@ -1209,6 +1264,9 @@ pub(crate) enum AppEvent {
         control: VoiceControl,
     },
     RealtimeConversationStateChanged,
+    RealtimeSessionLockStopped {
+        thread_id: ThreadId,
+    },
     BackgroundVoiceError {
         thread_id: ThreadId,
         message: String,

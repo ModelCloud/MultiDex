@@ -398,6 +398,37 @@ impl ThreadHistoryBuilder {
             .map(|turn| turn.rollout_start_index)
     }
 
+    /// Keeps the latest assistant item in memory for live summaries. Full reconnects
+    /// load older text from history. Rollout replay uses the regular reducer.
+    pub fn handle_live_paginated_event(&mut self, event: &EventMsg) {
+        let previous_len = self
+            .current_turn
+            .as_ref()
+            .map_or(0, |turn| turn.items.len());
+        self.handle_event_for_history_mode(event, ThreadHistoryMode::Paginated);
+        if let EventMsg::ItemCompleted(completed) = event
+            && let codex_protocol::items::TurnItem::AgentMessage(item) = &completed.item
+            && let Some(turn) = self
+                .current_turn
+                .as_mut()
+                .filter(|turn| turn.id == completed.turn_id)
+        {
+            if turn.items.len() > previous_len {
+                if let Some(index) = turn.evictable_agent_item.replace(previous_len)
+                    && let ThreadItemPayload::AgentMessage { text, .. } = &mut turn.items[index]
+                {
+                    *text = String::new();
+                }
+            } else if turn
+                .evictable_agent_item
+                .is_some_and(|index| turn.items[index].id() == item.id)
+            {
+                // A read by ID could still find the prior version of a corrected item.
+                turn.evictable_agent_item = None;
+            }
+        }
+    }
+
     /// Shared reducer for persisted rollout replay and in-memory current-turn
     /// tracking used by running thread resume/rejoin.
     ///
@@ -1561,6 +1592,7 @@ impl ThreadHistoryBuilder {
             root_turn_id: None,
             items: Vec::new(),
             item_index: TurnItemIndex::default(),
+            evictable_agent_item: None,
             item_times: HashMap::new(),
             error: None,
             status: TurnStatus::Completed,
@@ -1889,6 +1921,7 @@ struct PendingTurn {
     root_turn_id: Option<String>,
     items: Vec<ThreadItemPayload>,
     item_index: TurnItemIndex,
+    evictable_agent_item: Option<usize>,
     item_times: HashMap<String, ItemTimes>,
     error: Option<TurnError>,
     status: TurnStatus,
@@ -2102,6 +2135,7 @@ mod tests {
             };
             builder.handle_event_for_history_mode(&EventMsg::ItemStarted(started), mode);
             let completed = ItemCompletedEvent {
+                content_token_count: None,
                 thread_id: ThreadId::default(),
                 turn_id: turn_id.clone(),
                 item,
@@ -2303,6 +2337,7 @@ mod tests {
         });
         let events = vec![
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".into(),
                 item: entered,
@@ -2310,6 +2345,7 @@ mod tests {
                 completed_at_ms: 0,
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".into(),
                 item: exited,
@@ -2561,6 +2597,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: sleep_item,
@@ -2646,6 +2683,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: CoreTurnItem::Extension(CoreExtensionItem::ImageGeneration(
@@ -2764,6 +2802,7 @@ mod tests {
                 interaction_input: None,
             }),
             EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: command_item,
@@ -4040,6 +4079,7 @@ mod tests {
         use codex_protocol::protocol::HasLegacyEvent;
 
         let completion = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-a".into(),
             started_at_ms: None,
@@ -4342,6 +4382,44 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn live_paginated_turn_releases_superseded_agent_text() {
+        let mut builder = ThreadHistoryBuilder::new();
+        let turn_id = builder.ensure_turn().id.clone();
+        for (id, text) in [
+            ("a", "old"),
+            ("b", "draft"),
+            ("b", "corrected"),
+            ("c", "latest"),
+        ] {
+            builder.handle_live_paginated_event(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
+                thread_id: ThreadId::default(),
+                turn_id: turn_id.clone(),
+                item: CoreTurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
+                    id: id.into(),
+                    content: vec![codex_protocol::items::AgentMessageContent::Text {
+                        text: text.into(),
+                    }],
+                    phase: None,
+                    memory_citation: None,
+                    delivery: None,
+                    questions: None,
+                }),
+                started_at_ms: None,
+                completed_at_ms: 1,
+            }));
+        }
+        let mut texts = builder.current_turn.unwrap().items.into_iter().map(|item| {
+            let ThreadItemPayload::AgentMessage { text, .. } = item else {
+                panic!("expected assistant item")
+            };
+            text
+        });
+        assert_eq!(texts.next().unwrap().capacity(), 0);
+        assert_eq!(texts.collect::<Vec<_>>(), ["corrected", "latest"]);
     }
 
     #[test]
@@ -4755,6 +4833,7 @@ mod tests {
                     misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::PolicyCapacityUnavailable),
+                    rejected_audio_file_ids: Vec::new(),
                 }),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
@@ -5164,6 +5243,7 @@ mod tests {
                 misalignment: None,
                 message: "rollback failed".into(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                rejected_audio_file_ids: Vec::new(),
             }),
         ];
 
@@ -5211,6 +5291,7 @@ mod tests {
                 misalignment: None,
                 message: "request-level failure".into(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                rejected_audio_file_ids: Vec::new(),
             }),
         ];
 
@@ -5269,6 +5350,7 @@ mod tests {
                 codex_error_info: Some(CodexErrorInfo::ResponseStreamDisconnected {
                     http_status_code: Some(502),
                 }),
+                rejected_audio_file_ids: Vec::new(),
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 root_turn_id: None,
@@ -5334,6 +5416,7 @@ mod tests {
                     misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                    rejected_audio_file_ids: Vec::new(),
                 }),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
@@ -5376,10 +5459,13 @@ mod tests {
 
     #[test]
     fn rebuilds_hook_prompt_items_from_rollout_response_items() {
-        let hook_prompt = build_hook_prompt_message(&[
-            CoreHookPromptFragment::from_single_hook("Retry with tests.", "hook-run-1"),
-            CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
-        ])
+        let hook_prompt = build_hook_prompt_message(
+            &[
+                CoreHookPromptFragment::from_single_hook("Retry with tests.", "hook-run-1"),
+                CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
+            ],
+            &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+        )
         .expect("hook prompt message");
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
@@ -5460,6 +5546,7 @@ mod tests {
         }));
         let changes =
             builder.handle_event_with_changes(&EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id: ThreadId::new(),
                 turn_id: "turn-a".into(),
                 item: hook_prompt,
@@ -5481,6 +5568,7 @@ mod tests {
             .join("worker")
             .expect("worker path");
         let spawn = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-a".into(),
             item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {
@@ -5531,6 +5619,7 @@ mod tests {
                     time_to_first_token_ms: None,
                 })),
                 RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                    content_token_count: None,
                     thread_id: ThreadId::new(),
                     turn_id: "turn-a".into(),
                     item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {

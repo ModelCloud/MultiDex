@@ -57,6 +57,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::security_risk::SecurityRiskScore;
+use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use core_test_support::ThreadIdle;
 use core_test_support::apps_test_server::HostedMessagingServer;
 use core_test_support::responses;
@@ -265,8 +266,13 @@ async fn installed_extension_warms_connections_without_blocking_thread_start() -
 async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("original"));
+    auth_manager
+        .set_external_auth(Arc::new(RefreshableAuth(std::sync::Mutex::new("original"))))
+        .await?;
     let thread_server = responses::start_mock_server().await;
     let test = test_codex()
+        .with_auth_manager(Arc::clone(&auth_manager))
         .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
         .build_with_auto_env(&thread_server)
         .await?;
@@ -281,10 +287,6 @@ async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Resul
     let server = responses::start_websocket_server(connections).await;
     let http = responses::start_mock_server().await;
     let http_mock = responses::mount_sse_once(&http, responses::sse(events)).await;
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("original"));
-    auth_manager
-        .set_external_auth(Arc::new(RefreshableAuth(std::sync::Mutex::new("original"))))
-        .await?;
     let mut config = test.config.clone();
     config.model_provider = ModelProviderInfo::create_openai_provider(Some(
         proxy_websocket_servers_with_http(
@@ -478,7 +480,7 @@ fn user_instruction(text: &str) -> ResponseItem {
     ResponseItem::Message {
         status: None,
         encrypted_content: None,
-        id: Some(ResponseItemId::new("msg")),
+        id: Some(uuid_v7_item_id_generator_for_test()("msg")),
         role: "user".to_owned(),
         content: vec![ContentItem::InputText {
             text: text.to_owned(),
@@ -2065,7 +2067,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         ResponseItem::Message {
             status: None,
             encrypted_content: None,
-            id: Some(ResponseItemId::new("assistant")),
+            id: Some(uuid_v7_item_id_generator_for_test()("assistant")),
             role: "assistant".to_owned(),
             content: vec![ContentItem::OutputText {
                 annotations: None,

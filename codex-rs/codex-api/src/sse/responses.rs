@@ -689,6 +689,7 @@ async fn process_sse_with_treatment(
                 if matches!(
                     error,
                     ApiError::FlexUnavailable
+                        | ApiError::SessionBudgetExceeded
                         | ApiError::ResponseIncomplete(_)
                         | ApiError::ContextWindowExceeded
                 ) {

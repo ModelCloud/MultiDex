@@ -117,7 +117,7 @@ fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_poli
             permissions: &permissions,
             sandbox: SandboxType::None,
             enforce_managed_network: false,
-            environment_id: None,
+            environment_id: Some("remote"),
             network: None,
             sandbox_policy_cwd: &cwd_uri,
             sandbox_exe: None,
@@ -128,6 +128,10 @@ fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_poli
 
     assert_eq!(exec_request.cwd, cwd_uri);
     assert_eq!(exec_request.sandbox_policy_cwd, cwd_uri);
+    assert_eq!(
+        exec_request.network_environment_id.as_deref(),
+        Some("remote")
+    );
     assert_eq!(
         exec_request.permission_profile.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::unrestricted()
@@ -837,4 +841,33 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
         Some(std::ffi::OsStr::new(".sandbox-bin"))
     );
     assert!(materialized_helper.exists());
+}
+
+#[test]
+fn restricted_token_preserves_read_only_carveouts_at_a_volume_root() -> anyhow::Result<()> {
+    let cwd = AbsolutePathBuf::current_dir()?;
+    let root = AbsolutePathBuf::from_absolute_path(cwd.ancestors().last().expect("volume root"))?;
+    // Exercise policy preparation without installing ACLs on the test host.
+    let read_only = root.join("codex-test-read-only");
+    let mut file_system = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    file_system.entries.push(FileSystemSandboxEntry::new(
+        read_only.clone().into(),
+        FileSystemAccessMode::Read,
+    ));
+    let profile =
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted);
+    let overrides = crate::resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &profile,
+        &root,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect("prepare volume-root workspace")
+    .expect("read-only child");
+    assert_eq!(overrides.additional_deny_write_paths, [read_only]);
+    Ok(())
 }

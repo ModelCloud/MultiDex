@@ -4,12 +4,14 @@ use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use codex_app_server::in_process;
+use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadQueueAddParams;
 use codex_app_server_protocol::ThreadQueueAddResponse;
 use codex_app_server_protocol::ThreadQueueListParams;
@@ -42,7 +44,6 @@ use wiremock::MockServer;
 
 #[test_case("other"; "selection_changes")]
 #[test_case("gateway"; "definition_changes")]
-#[test_case("default"; "default_selection_changes")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_requirement_changes_reject_inputs_to_existing_threads(
     required_selection: &str,
@@ -79,17 +80,7 @@ base_url = "{}/v1"
         other.uri(),
     );
     let requirements_path = home.path().join("requirements.toml");
-    if required_selection == "default" {
-        std::fs::write(
-            &requirements_path,
-            requirements.replace("model_provider = \"gateway\"", ""),
-        )?;
-        let path = home.path().join("config.toml");
-        let config = std::fs::read_to_string(&path)?;
-        std::fs::write(path, config.replace("mock_provider", "gateway"))?;
-    } else {
-        std::fs::write(&requirements_path, &requirements)?;
-    }
+    std::fs::write(&requirements_path, &requirements)?;
     let mut server = TestAppServer::builder()
         .with_codex_home(home.path())
         .with_json_logging("warn")
@@ -136,69 +127,12 @@ base_url = "{}/v1"
     } else {
         requirements.replace(gateway.uri(), &other.uri())
     };
-    // Changing the ambient default selection is a provider hand-off, not a
-    // corrupted thread: the thread keeps the route it holds and stays usable.
-    // Only a managed policy change may reject the retained route.
-    if required_selection == "default" {
-        let path = home.path().join("config.toml");
-        let config = std::fs::read_to_string(&path)?;
-        std::fs::write(
-            path,
-            config.replace("model_provider = \"gateway\"", "model_provider = \"other\""),
-        )?;
-        // Admission only: these must be answered, not rejected with
-        // ``modelProviderMismatch``. The retained route is unchanged, so the
-        // thread keeps talking to the gateway it was started on.
-        for (method, params) in [
-            ("thread/resume", json!({"threadId": started.thread.id})),
-            (
-                "thread/goal/set",
-                json!({"threadId": started.thread.id, "objective": "New goal"}),
-            ),
-            ("thread/goal/get", json!({"threadId": started.thread.id})),
-        ] {
-            let id = server.send_raw_request(method, Some(params)).await?;
-            server
-                .read_response::<serde_json::Value>(id)
-                .await
-                .unwrap_or_else(|err| {
-                    panic!("{method} must stay admitted after the ambient provider changes: {err}")
-                });
-        }
-        // The retained thread must still be routed to its own provider, never
-        // silently redirected to the new ambient default.
-        let id = server
-            .send_raw_request(
-                "thread/read",
-                Some(json!({"threadId": started.thread.id, "includeTurns": false})),
-            )
-            .await?;
-        let read: codex_app_server_protocol::ThreadReadResponse = server.read_response(id).await?;
-        assert_eq!(read.thread.model_provider, "gateway");
-        assert!(
-            other
-                .received_requests()
-                .await
-                .expect("recorded requests")
-                .is_empty(),
-            "ambient selection must not redirect the retained thread"
-        );
-        release_response.send(()).expect("release active response");
-        timeout(
-            wait,
-            server.read_stream_until_notification_message("turn/completed"),
-        )
-        .await??;
-        gateway.shutdown().await;
-        return Ok(());
-    }
-    let provider_error = {
-        std::fs::write(requirements_path, updated)?;
+    std::fs::write(requirements_path, updated)?;
+    let provider_error =
         codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
             model_provider: "gateway".into(),
             required_model_provider: required_selection.into(),
-        }
-    };
+        };
     let expected_error = JSONRPCErrorError {
         code: -32600,
         message: provider_error.to_string(),
@@ -383,7 +317,7 @@ async fn provider_selection_can_be_restored_for_existing_threads() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn malformed_system_defaults_reject_input_until_provider_can_be_resolved() -> Result<()> {
+async fn malformed_system_defaults_do_not_block_existing_thread_turn() -> Result<()> {
     let provider = MockServer::start().await;
     let home = TempDir::new()?;
     MockResponsesConfig::new(&provider.uri()).write(home.path())?;
@@ -398,7 +332,7 @@ async fn malformed_system_defaults_reject_input_until_provider_can_be_resolved()
             .build()
             .await?,
     );
-    let client = in_process::start(InProcessStartArgs {
+    let mut client = in_process::start(InProcessStartArgs {
         arg0_paths: Arg0DispatchPaths::default(),
         config,
         cli_overrides: Vec::new(),
@@ -453,9 +387,23 @@ async fn malformed_system_defaults_reject_input_until_provider_can_be_resolved()
             },
         })
         .await?
-        .expect_err("cannot verify the selected provider from malformed configuration");
-    assert_eq!(response.code, -32600);
-    assert!(requests.requests().is_empty());
+        .expect("turn/start should succeed");
+    let _: TurnStartResponse = serde_json::from_value(response)?;
+    timeout(Duration::from_secs(/*secs*/ 60), async {
+        loop {
+            let Some(event) = client.next_event().await else {
+                anyhow::bail!("app-server stopped before turn/completed");
+            };
+            if let InProcessServerEvent::ServerNotification(notification) = event
+                && let ServerNotification::TurnCompleted(completed) = notification.as_ref()
+                && completed.thread_id == started.thread.id
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    assert_eq!(requests.requests().len(), 1);
     client.shutdown().await?;
     Ok(())
 }

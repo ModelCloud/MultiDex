@@ -67,6 +67,7 @@ use crate::config::ManagedFeatures;
 use crate::config::Permissions;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianContextMode;
+use crate::context::GuardianDenialReconsideration;
 use crate::context::GuardianFollowupReviewReminder;
 use crate::context::GuardianNodeReplPolicy;
 use crate::context_manager::ContextManager;
@@ -77,6 +78,7 @@ use crate::session::turn_context::TurnContext;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::turn_input::TurnInput;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -156,6 +158,7 @@ pub struct GuardianReviewSessionReuseKey {
     omit_personality: bool,
     permissions: Permissions,
     developer_instructions: Option<String>,
+    denial_reconsideration_prompt: Option<String>,
     base_instructions: Option<String>,
     user_instructions: Option<Instructions>,
     thread_instructions: Option<Instructions>,
@@ -199,6 +202,9 @@ impl GuardianReviewSessionReuseKey {
             omit_personality: spawn_config.personality == Some(Personality::None),
             permissions: spawn_config.permissions.clone(),
             developer_instructions: spawn_config.developer_instructions.clone(),
+            denial_reconsideration_prompt: spawn_config
+                .guardian_denial_reconsideration_prompt
+                .clone(),
             base_instructions: spawn_config.base_instructions.clone(),
             user_instructions: instructions.user,
             thread_instructions: instructions.thread,
@@ -328,6 +334,11 @@ async fn run_review_on_session(
         false
     };
     if should_compact {
+        let mut execution_attempt =
+            crate::turn_timing::review_execution::ReviewExecutionObservation::install(
+                Arc::clone(&review_session.session),
+                params.parent_context.review_execution.clone(),
+            );
         let compact_submission = run_before_review_deadline(
             deadline,
             params.external_cancel.as_ref(),
@@ -363,6 +374,7 @@ async fn run_review_on_session(
             &mut analytics_result,
         )
         .await;
+        execution_attempt.finish(result.turn_completed);
         if !matches!(
             result.outcome,
             GuardianReviewSessionOutcome::Completed(Ok(_))
@@ -557,6 +569,7 @@ async fn run_review_on_session(
         .thread_extension_data
         .insert(super::input_budget::PendingReviewContext {
             context: prompt_items.context,
+            elastic: params.spawn_config.guardian_sync_elastic_budget.clone(),
         });
     review_session
         .session
@@ -565,6 +578,11 @@ async fn run_review_on_session(
         .insert(super::PendingReviewRouting(
             params.parent_context.parent_response.clone(),
         ));
+    let mut execution_attempt =
+        crate::turn_timing::review_execution::ReviewExecutionObservation::install(
+            Arc::clone(&review_session.session),
+            params.parent_context.review_execution.clone(),
+        );
     let request = codex_guardian_reviewer::ReviewerTurn {
         items,
         environments: codex_protocol::protocol::TurnEnvironmentSelections::new(
@@ -587,6 +605,22 @@ async fn run_review_on_session(
         root_turn_id: parent_turn.turn_metadata_state.root_turn_id(),
     }
     .into_request();
+    let reconsideration = params
+        .spawn_config
+        .features
+        .enabled(Feature::GuardianDenialReconsideration)
+        .then(|| {
+            let mut followup = request.clone();
+            followup.input = TurnInput::ResponseItem(ContextualUserFragment::into(
+                GuardianDenialReconsideration {
+                    prompt: params
+                        .spawn_config
+                        .guardian_denial_reconsideration_prompt
+                        .as_deref(),
+                },
+            ));
+            followup
+        });
     let child_turn_id = match codex_guardian_reviewer::start_review_turn(
         review_session,
         request,
@@ -602,6 +636,7 @@ async fn run_review_on_session(
                 .services
                 .thread_extension_data
                 .remove::<super::PendingReviewRouting>();
+
             review_session
                 .session
                 .services
@@ -630,11 +665,49 @@ async fn run_review_on_session(
         &mut analytics_result,
     )
     .await;
+    execution_attempt.finish(turn_result.turn_completed);
+    let turn_result = match reconsideration {
+        Some(request) => {
+            if let GuardianReviewSessionOutcome::Completed(Ok(Some(response))) =
+                &turn_result.outcome
+                && response.assessment().is_ok_and(|assessment| {
+                    assessment.outcome == codex_protocol::protocol::GuardianAssessmentOutcome::Deny
+                })
+                && let Some(execution) = &params.parent_context.review_execution
+            {
+                // Reconsideration's second turn does not yet have an execution observer.
+                execution.mark_unknown();
+            }
+            // The new turn does not own the first turn's retained evidence backup.
+            // Keep that evidence intact; an over-budget follow-up keeps the denial.
+            let store = &review_session.session.services.thread_extension_data;
+            let compaction_was_disabled = store
+                .get::<crate::compact::AutoCompactionDisabled>()
+                .is_some();
+            store.insert(crate::compact::AutoCompactionDisabled);
+            let result = codex_guardian_reviewer::reconsider_denial(
+                review_session,
+                turn_result,
+                request,
+                deadline,
+                params.external_cancel.as_ref(),
+                &mut analytics_result,
+                &params.parent_context.turn().session_telemetry,
+            )
+            .await;
+            if !compaction_was_disabled {
+                store.remove::<crate::compact::AutoCompactionDisabled>();
+            }
+            result
+        }
+        None => turn_result,
+    };
     review_session
         .session
         .services
         .thread_extension_data
         .remove::<super::PendingReviewRouting>();
+
     // Finalizing input consumes this context; failures before admission leave it pending.
     let transcript_admitted = review_session
         .session
