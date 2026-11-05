@@ -1564,6 +1564,7 @@ fn config_toml_deserializes_model_availability_nux() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            sidebar_width_percent: None,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
             copy_on_select_clear_selection: false,
@@ -2362,7 +2363,9 @@ respect_system_proxy = true
         codex_http_client::OutboundProxyPolicy::RespectSystemProxy
     );
     assert_eq!(
-        config.plugins_config_input().remote_plugin_service_config(),
+        config
+            .plugins_config_input()
+            .remote_plugin_service_config(/*runtime_auth*/ None),
         codex_core_plugins::remote::RemotePluginServiceConfig::new(
             config.chatgpt_base_url,
             codex_http_client::HttpClientFactory::new(
@@ -4927,6 +4930,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            sidebar_width_percent: None,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
             copy_on_select_clear_selection: false,
@@ -9086,9 +9090,6 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
                 "  Configured template: {{ tenant_policy_config }}  ".to_string(),
             ),
             experimental_conversation_history_prompt: None,
-            experimental_denial_reconsideration_prompt: Some(
-                "  Reconsider this review carefully.  ".to_owned(),
-            ),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -9110,14 +9111,12 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
             config.guardian_policy_config.as_deref(),
             config.guardian_extra_policy.as_deref(),
             config.guardian_policy_template.as_deref(),
-            config.guardian_denial_reconsideration_prompt.as_deref(),
         ),
         (
             expected_mode,
             Some("Use the user-configured guardian policy."),
             Some("Use the user-configured additional policy."),
             Some("Configured template: {{ tenant_policy_config }}"),
-            Some("Reconsider this review carefully."),
         )
     );
 
@@ -9127,34 +9126,6 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
         features.contains("async_classifier_mode"),
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_config_rejects_oversized_guardian_reconsideration_prompt() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        auto_review: Some(AutoReviewToml {
-            experimental_denial_reconsideration_prompt: Some("é".repeat(501)),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let error = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides {
-            cwd: Some(codex_home.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        error.to_string(),
-        "auto_review.experimental_denial_reconsideration_prompt exceeds 1,000 UTF-8 bytes"
-    );
     Ok(())
 }
 
@@ -9235,7 +9206,6 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
                 extra_policy: Some("Use the user-configured additional policy.".to_string()),
                 experimental_policy_template: None,
                 experimental_conversation_history_prompt: None,
-                experimental_denial_reconsideration_prompt: None,
                 conversation_history_max_output_tokens: None,
             }),
             ..Default::default()
@@ -9278,7 +9248,6 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             extra_policy: Some("   ".to_string()),
             experimental_policy_template: None,
             experimental_conversation_history_prompt: Some(String::new()),
-            experimental_denial_reconsideration_prompt: Some("  ".to_owned()),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -9299,9 +9268,8 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             config.guardian_policy_config,
             config.guardian_extra_policy,
             config.guardian_conversation_history_prompt,
-            config.guardian_denial_reconsideration_prompt,
         ),
-        (None, None, None, None)
+        (None, None, None)
     );
 
     Ok(())
@@ -13092,8 +13060,11 @@ max_concurrent_threads_per_session = 17
     assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
 
-#[test]
-fn multi_agent_v2_model_override_exposure_preserves_configured_usage_hints() {
+#[test_case::test_case(false; "native_tools")]
+#[test_case::test_case(true; "native_tools_disabled")]
+fn multi_agent_v2_model_override_exposure_preserves_configured_usage_hints(
+    disable_native_tools: bool,
+) {
     let config_toml = toml::from_str(
         r###"[features.multi_agent_v2]
 enabled = true
@@ -13104,7 +13075,8 @@ expose_spawn_agent_model_overrides = true
     )
     .expect("multi-agent v2 config should parse");
 
-    let config = resolve_multi_agent_v2_config(&config_toml);
+    let mut config = resolve_multi_agent_v2_config(&config_toml);
+    config.disable_native_tools = disable_native_tools;
     assert!(config.expose_spawn_agent_model_overrides);
     assert_eq!(
         config.root_agent_usage_hint_text.as_deref(),
@@ -13130,6 +13102,23 @@ expose_spawn_agent_model_overrides = true
             Some("## `update_plan`\nSubagent guidance.".to_string()),
         )
     );
+}
+
+#[test]
+fn multi_agent_v2_disabled_native_tools_omit_default_roles() {
+    let mut config = resolve_multi_agent_v2_config(&ConfigToml::default());
+    config.disable_native_tools = true;
+    let mut messages = ResolvedModelMessages::bundled().multi_agent();
+    for catalog_override in [false, true] {
+        if catalog_override {
+            messages.root = ResolvedMessage::Catalog("Catalog root base.");
+            messages.subagent = ResolvedMessage::Catalog("Catalog subagent base.");
+        }
+        let usage_hints = resolve_usage_hints(
+            &config, messages, /*omit_update_plan_instructions*/ false,
+        );
+        assert_eq!((usage_hints.root, usage_hints.subagent), (None, None));
+    }
 }
 
 #[test]

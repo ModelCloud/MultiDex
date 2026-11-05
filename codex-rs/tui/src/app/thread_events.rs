@@ -193,6 +193,17 @@ impl ThreadEventStore {
         self.push_notification_inner(Cow::Borrowed(notification));
     }
 
+    pub(super) fn is_realtime_delegated_turn(&self, turn_id: &str) -> bool {
+        self.delegated_turns.iter().any(|id| id == turn_id)
+            || self.turns.iter().any(|turn| {
+                turn.id == turn_id
+                    && turn
+                        .items
+                        .iter()
+                        .any(|entry| is_voice_handoff_item(&entry.payload))
+            })
+    }
+
     fn push_notification_inner(&mut self, notification: Cow<'_, ServerNotification>) {
         let user_item = match notification.as_ref() {
             ServerNotification::ItemStarted(n) => Some((&n.turn_id, &n.item.payload)),
@@ -257,31 +268,18 @@ impl ThreadEventStore {
                 started @ codex_app_server_protocol::ItemStartedNotification {
                     item:
                         codex_app_server_protocol::ThreadItem {
-                            payload: ThreadItemPayload::Reasoning { id, .. },
+                            payload: ThreadItemPayload::Reasoning { .. },
                             ..
                         },
                     ..
                 },
-            ) if !self.delegated_turns.contains(&started.turn_id)
-                && !self.turns.iter().any(|turn| {
-                    turn.id == started.turn_id
-                        && turn
-                            .items
-                            .iter()
-                            .any(|entry| is_voice_handoff_item(&entry.payload))
-                }) =>
-            {
-                self.active_reasoning_item =
-                    Some(codex_app_server_protocol::ItemStartedNotification::new(
-                        started.thread_id.clone(),
-                        started.turn_id.clone(),
-                        ThreadItemPayload::Reasoning {
-                            id: id.clone(),
-                            summary: Vec::new(),
-                            content: Vec::new(),
-                        },
-                        started.started_at_ms,
-                    ));
+            ) => {
+                // Only typed reasoning starts belong in the replay buffer. Decide while
+                // the handoff order is known, before bounded eviction can obscure it.
+                if self.is_realtime_delegated_turn(&started.turn_id) {
+                    return;
+                }
+                self.active_reasoning_item = Some(started.clone());
             }
             ServerNotification::ItemCompleted(completed)
                 if matches!(&completed.item.payload, ThreadItemPayload::Reasoning { .. })
@@ -468,6 +466,7 @@ impl ThreadEventStore {
                         let key = (n.turn_id.clone(), id.clone());
                         if voice_started.contains(&n.turn_id) {
                             typed_items.remove(&key);
+                            return false;
                         } else {
                             typed_items.insert(key);
                         }

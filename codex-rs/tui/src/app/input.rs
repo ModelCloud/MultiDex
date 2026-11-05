@@ -186,6 +186,11 @@ impl App {
                 if self.backtrack.primed && !self.backtrack.overlay_preview_active {
                     self.reset_backtrack_state();
                 }
+                if self.key_chord_matcher.workspace_leader().is_some() {
+                    tui.frame_requester()
+                        .schedule_frame_in(super::workspace_hud::REVEAL_DELAY);
+                    return None;
+                }
                 self.set_key_chord_hint_override(self.key_chord_matcher.pending_hint_items(
                     &self.keymap.chords,
                     tui.terminal.last_known_screen_size.width,
@@ -242,12 +247,25 @@ impl App {
         if !self.conversation_focus_available(tui) {
             return contexts;
         }
+        if self.chooser_focus() == Some(super::sidebar::PaneFocus::Sidebar)
+            && self.sidebar_chooser_available()
+        {
+            return crate::keymap::KeymapContextSet::focused_sidebar_chooser();
+        }
         let mut contexts = contexts.with_pane_directions();
+        if self.open_pane_focus().is_some() {
+            contexts = contexts.with_open_pane();
+        }
+        if self.can_nudge_side_width(tui) {
+            contexts = contexts.with_focused_side_pane();
+        }
         if self.main_composer_shortcut_available() {
             contexts = contexts.with_main_composer_focus();
         }
         if self.switchable_side_child().is_some() {
             contexts.with_side_pane()
+        } else if self.sidebar_chooser_available() {
+            contexts.with_sidebar_chooser()
         } else {
             contexts
         }

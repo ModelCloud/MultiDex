@@ -2063,7 +2063,9 @@ impl Session {
             state.last_started_turn_id = last_started_turn_id;
             state.turn_attribution = turn_attribution;
             state.restored_turn_routing = restored_turn_routing;
-            if let Some(world_state) = world_state_baseline {
+            if let Some(mut world_state) = world_state_baseline {
+                // Handles belong to this runtime; a saved checkpoint can also lag its fragment.
+                world_state.invalidate_section("command_sessions");
                 state.history.set_world_state_baseline(world_state);
             }
             let fallback_ids = state.auto_compact_window_ids();
@@ -2743,7 +2745,7 @@ impl Session {
                 .track_guardian_session_event(self.thread_id, &event);
         }
         self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+        self.maybe_publish_terminal_agent_result(turn_context, &legacy_source)
             .await;
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
             .await;
@@ -2763,33 +2765,47 @@ impl Session {
         }
     }
 
-    /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
-    async fn maybe_notify_parent_of_terminal_turn(
+    /// Classifies terminal results for native parent delivery and opted-in hosts.
+    async fn maybe_publish_terminal_agent_result(
         &self,
         turn_context: &TurnContext,
         msg: &EventMsg,
     ) {
-        if turn_context.multi_agent_version != MultiAgentVersion::V2 {
-            return;
-        }
-
         if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
             return;
         }
 
-        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            agent_path: Some(_),
-            ..
-        }) = &turn_context.session_source
-        else {
+        let notify_native_parent = turn_context.multi_agent_version == MultiAgentVersion::V2
+            && matches!(
+                &turn_context.session_source,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    agent_path: Some(_),
+                    ..
+                })
+            );
+        let reporter = self
+            .outcome_reporting
+            .as_ref()
+            .map(|reporting| &reporting.reporter);
+        if !notify_native_parent && reporter.is_none() {
             return;
-        };
+        }
 
+        let terminal_error_message = {
+            let mut terminal_error = turn_context.terminal_error.lock().await;
+            if notify_native_parent {
+                terminal_error.take().map(|error| error.message)
+            } else {
+                terminal_error.as_ref().map(|error| error.message.clone())
+            }
+        };
         let mut error_info = None;
-        let status = match turn_context.terminal_error.lock().await.take() {
-            Some(error) => {
-                let status = AgentStatus::Errored(error.message);
-                self.agent_status.send_replace(status.clone());
+        let status = match terminal_error_message {
+            Some(message) => {
+                let status = AgentStatus::Errored(message);
+                if notify_native_parent {
+                    self.agent_status.send_replace(status.clone());
+                }
                 status
             }
             None => {
@@ -2814,24 +2830,31 @@ impl Session {
             return;
         }
 
-        self.services
-            .agent_control
-            .turn_finished(
-                AgentTurnOutcome {
-                    thread_id: self.thread_id,
-                    turn_id: turn_context.sub_id.clone(),
-                    source: turn_context.session_source.clone(),
-                    parent_turn_id: turn_context.turn_metadata_state.parent_turn_id(),
-                    initiating_agent_path: turn_context
-                        .turn_metadata_state
-                        .initiating_agent_path()
-                        .cloned(),
-                    status,
-                    error_info,
-                },
-                &self.services.rollout_thread_trace,
-            )
-            .await;
+        let outcome = AgentTurnOutcome {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            source: turn_context.session_source.clone(),
+            parent_turn_id: turn_context.turn_metadata_state.parent_turn_id(),
+            initiating_agent_path: turn_context
+                .turn_metadata_state
+                .initiating_agent_path()
+                .cloned(),
+            status,
+            error_info,
+        };
+        let host_outcome = if notify_native_parent {
+            let host_outcome = reporter.is_some().then(|| outcome.clone());
+            self.services
+                .agent_control
+                .turn_finished(outcome, &self.services.rollout_thread_trace)
+                .await;
+            host_outcome
+        } else {
+            Some(outcome)
+        };
+        if let Some((reporter, outcome)) = reporter.zip(host_outcome) {
+            reporter.report(outcome).await;
+        }
     }
 
     async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
@@ -4175,12 +4198,13 @@ impl Session {
         let world_state = self
             .build_world_state_for_step(step_context, /*new_window*/ false)
             .await?;
-        let (world_state_snapshot, fragments, world_state_item) = self
+        let (world_state_snapshot, mut fragments, world_state_item) = self
             .state
             .lock()
             .await
             .history
             .render_step_world_state(&world_state);
+        world_state.resolve_host_roster(&mut fragments).await;
         let items = crate::context_manager::updates::merge_world_state_updates(fragments);
         if !items.is_empty() {
             self.record_conversation_items(turn_context, &step_context.settings.model_info, &items)
@@ -5016,6 +5040,15 @@ impl Session {
         step_context: &StepContext,
         world_state: &WorldState,
     ) -> (Vec<WorldStateUpdate>, WorldStateSnapshot) {
+        let rendered = world_state.render_full_with_host_roster().await;
+        self.assemble_initial_context(step_context, rendered).await
+    }
+
+    pub(crate) async fn assemble_initial_context(
+        &self,
+        step_context: &StepContext,
+        (snapshot, updates): (WorldStateSnapshot, Vec<WorldStateUpdate>),
+    ) -> (Vec<WorldStateUpdate>, WorldStateSnapshot) {
         let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
@@ -5162,7 +5195,6 @@ impl Session {
                 .render_with_hints(context_window_hints),
             );
         }
-        let (snapshot, updates) = world_state.render_full();
         let (mut prefix, context) = split_prefix_updates(updates);
         let mut items = Vec::with_capacity(4);
         let mut context = context.into_iter();
@@ -5173,9 +5205,9 @@ impl Session {
             let mut initial_multi_agent_mode = None;
             let mut managed_developer_instructions = None;
             for update in context.by_ref() {
-                let fragment = match update.content {
-                    WorldStateUpdateContent::Fragment(fragment) => fragment,
-                    WorldStateUpdateContent::Item(item) => {
+                let fragment = match update.content.into_fragment() {
+                    Ok(fragment) => fragment,
+                    Err(item) => {
                         next_item = Some(*item);
                         break;
                     }
@@ -5387,14 +5419,11 @@ impl Session {
                 crate::compact_remote_v2::RETAINED_MESSAGE_TOKEN_BUDGET,
                 &history.file_audio_durations,
             );
-        let window = {
-            let mut state = self.state.lock().await;
-            state.start_new_context_window()
-        };
-        let (window_number, window_ids) = window;
-        let (context_updates, world_state_snapshot) = self
-            .build_initial_context_with_world_state(step_context, world_state.as_ref())
-            .await;
+        // Resolve the roster before allocating a new context window.
+        let rendered = world_state.render_full_with_host_roster().await;
+        let (window_number, window_ids) = self.state.lock().await.start_new_context_window();
+        let (context_updates, world_state_snapshot) =
+            self.assemble_initial_context(step_context, rendered).await;
         let context_items =
             crate::context_manager::updates::merge_world_state_updates(context_updates)
                 .into_iter()
@@ -5472,15 +5501,20 @@ impl Session {
                 Some(WorldStateItem::full(snapshot.into_object())),
             )
         } else {
-            let (world_state_items, world_state_item) = {
-                let mut state = self.state.lock().await;
-                let (fragments, rollout_item) = state.history.update_world_state(&world_state);
-                (
-                    crate::context_manager::updates::merge_world_state_updates(fragments),
-                    rollout_item,
-                )
-            };
-            (world_state_items, world_state_item)
+            let (snapshot, mut fragments, world_state_item) = self
+                .state
+                .lock()
+                .await
+                .history
+                .render_step_world_state(&world_state);
+            world_state.resolve_host_roster(&mut fragments).await;
+            let items = crate::context_manager::updates::merge_world_state_updates(fragments);
+            self.state
+                .lock()
+                .await
+                .history
+                .set_world_state_baseline(snapshot);
+            (items, world_state_item)
         };
         if !should_inject_full_context && turn_context_changed {
             context_items.extend(

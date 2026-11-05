@@ -302,6 +302,8 @@ pub enum Feature {
     ToolSearchAlwaysDeferMcpTools,
     /// Describe deferred tool namespaces in the model-visible world state.
     DeferredToolWorldState,
+    /// Publish retained command sessions through incremental world state.
+    CommandSessionsWorldState,
     /// Track top-level tool definitions in world state and emit incremental context updates.
     IncrementalTools,
     /// Suppress the model ID announcement in incremental context after a model switch.
@@ -442,7 +444,7 @@ pub enum Feature {
     GuardianTrustOrchestratorConnectors,
     /// Give Guardian access to the root conversation's message history tools.
     GuardianConversationHistoryTools,
-    /// Reconsider a synchronous Guardian denial once before publishing it.
+    /// Resample a synchronous Guardian denial once before publishing it.
     GuardianDenialReconsideration,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
@@ -492,6 +494,8 @@ pub enum Feature {
     RemoteCompactionV2,
     /// Prepare remote compaction in the background before the foreground limit is reached.
     AsyncCompaction,
+    /// Restrict background compaction to the root session.
+    AsyncCompactionRootOnly,
     /// Include retained images in the remote compaction context budget.
     CompactionImageBudget,
     /// Retain client-authored developer messages across compacted context windows.
@@ -1784,6 +1788,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::CommandSessionsWorldState,
+        key: "command_sessions_world_state",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::IncrementalTools,
         key: "incremental_tools",
         stage: Stage::Stable,
@@ -2344,6 +2354,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::AsyncCompaction,
         key: "async_compaction",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AsyncCompactionRootOnly,
+        key: "async_compaction_root_only",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

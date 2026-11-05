@@ -556,17 +556,6 @@ impl ContextManager {
         self.reference_context_item.clone()
     }
 
-    pub(crate) fn update_world_state(
-        &mut self,
-        world_state: &WorldState,
-    ) -> (Vec<WorldStateUpdate>, Option<WorldStateItem>) {
-        let (snapshot, fragments) =
-            world_state.render_history_diff(self.world_state_baseline.as_ref(), self.raw_items());
-        let rollout_item = self.world_state_item(&snapshot);
-        self.world_state_baseline = Some(snapshot);
-        (fragments, rollout_item)
-    }
-
     pub(crate) fn render_step_world_state(
         &self,
         world_state: &WorldState,
@@ -1099,8 +1088,8 @@ impl ContextManager {
         self.set_token_info_with_boundary(Some(info), covered_item_count);
     }
 
-    /// Restored or rewritten history keeps the existing last-model-output approximation.
-    fn reset_last_usage_boundary(&mut self) {
+    /// Align the context count after history changes or buffered model output is committed.
+    pub(crate) fn reset_last_usage_boundary(&mut self) {
         self.last_model_output_item_count = self
             .items
             .iter()

@@ -148,6 +148,9 @@ mod context_management_tools;
 #[path = "scenarios_code_mode_settled_helpers_tests.rs"]
 mod code_mode_settled_helpers;
 
+#[path = "scenarios_command_sessions_tests.rs"]
+mod command_sessions;
+
 #[path = "scenarios_strict_3p_cache.rs"]
 mod strict_3p_cache;
 
@@ -174,6 +177,9 @@ mod guardian_sender_context;
 
 #[path = "scenarios_guardian_direct_review.rs"]
 mod guardian_direct_review;
+
+#[path = "scenarios_guardian_direct_mcp.rs"]
+mod guardian_direct_mcp;
 
 #[path = "scenarios_guardian_extra_policy.rs"]
 mod guardian_extra_policy;
@@ -2212,7 +2218,7 @@ async fn multi_agent_catalog_parameters(disable_native_tools: bool) -> Result<()
     let (name, description) = if disable_native_tools {
         (
             "multi_agent_native_tools_hidden",
-            "Native tools are unavailable while the V2 runtime and its instructions remain enabled.",
+            "Native tools and native usage guidance are unavailable.",
         )
     } else {
         (

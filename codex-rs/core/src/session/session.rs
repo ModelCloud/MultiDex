@@ -9,6 +9,7 @@ use super::step_settings::StepSettingsUpdate;
 use super::*;
 use crate::agent::api::AgentControl;
 use crate::agent::host::AgentRuntimeServices;
+use crate::agent::host::AgentTurnOutcomeReporter;
 use crate::agent::host::InheritedSessionId;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::agents_md_manager::SessionInstructions;
@@ -56,9 +57,16 @@ use codex_utils_git_discovery::GitRootDiscovery;
 use codex_utils_path::replace_path_and_deduplicate;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
+use tokio_util::task::TaskTracker;
 
 type McpToolApprovalMetadataMap =
     HashMap<(String, String), std::sync::Weak<McpToolApprovalContext>>;
+
+/// A thread's installed reporter and the tasks that may still hand it an outcome.
+pub(crate) struct AgentOutcomeReporting {
+    pub(super) reporter: Arc<dyn AgentTurnOutcomeReporter>,
+    pub(crate) handoffs: TaskTracker,
+}
 
 /// Context for an initialized model agent
 ///
@@ -67,6 +75,7 @@ pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
     pub(crate) item_id_generator: ItemIdGenerator,
     pub(crate) agent_runtime: AgentRuntimeServices,
+    pub(crate) outcome_reporting: Option<AgentOutcomeReporting>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     /// Installed by Guardian before its first review; forwards items and cancellation without
@@ -827,6 +836,12 @@ impl Session {
         client
     }
 
+    pub(crate) fn outcome_handoffs_closed(&self) -> bool {
+        self.outcome_reporting
+            .as_ref()
+            .is_some_and(|reporting| reporting.handoffs.is_closed())
+    }
+
     pub(crate) fn new_item_id_generator() -> ItemIdGenerator {
         Arc::new(|prefix| ResponseItemId::with_suffix(prefix, uuid::Uuid::now_v7()))
     }
@@ -1113,6 +1128,8 @@ impl Session {
                 ));
             }
         };
+        let required_cyber_access_programs =
+            thread_extension_init.get::<crate::cyber_access_program::RequiredCyberAccessPrograms>();
         let inherited_session_id = thread_extension_init
             .remove::<InheritedSessionId>()
             .map(|inherited| inherited.0);
@@ -1251,6 +1268,13 @@ impl Session {
             thread_id.to_string(),
             thread_extension_init,
         );
+        if let Some(required) = &required_cyber_access_programs {
+            thread_extension_data.insert(
+                crate::cyber_access_program::RequiredCyberAccessProgramsSnapshot(Arc::clone(
+                    required,
+                )),
+            );
+        }
         thread_extension_data.insert(crate::context::GuardianReviewEvidence::default());
         crate::model_search::SearchOwner::restore(&thread_extension_data, &initial_history);
         // Kick off independent async setup tasks in parallel to reduce startup latency.
@@ -1881,10 +1905,28 @@ impl Session {
                 AnalyticsEventsClient::disabled()
             } else {
                 analytics_events_client.unwrap_or_else(|| {
-                    AnalyticsEventsClient::new(
+                    let api_key_headers = if codex_model_provider::provider_uses_first_party_auth_path(
+                        &config.model_provider,
+                    ) {
+                        match config.model_provider.build_header_map() {
+                            Ok(headers) => headers,
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to resolve analytics resource selectors");
+                                return AnalyticsEventsClient::disabled();
+                            }
+                        }
+                    } else {
+                        Default::default()
+                    };
+                    AnalyticsEventsClient::new_with_runtime(
                         Arc::clone(&auth_manager),
                         config.chatgpt_backend_url(),
                         config.analytics_enabled,
+                        config
+                            .features
+                            .enabled(Feature::RuntimeAgentInstances)
+                            .then(|| (Arc::clone(&runtime_auth), config.runtime_auth_mode)),
+                        api_key_headers,
                     )
                 })
             };
@@ -1940,6 +1982,12 @@ impl Session {
                     .await;
             }
 
+            let outcome_reporting = thread_extension_data
+                .get::<Arc<dyn AgentTurnOutcomeReporter>>()
+                .map(|reporter| AgentOutcomeReporting {
+                    reporter: Arc::clone(&reporter),
+                    handoffs: TaskTracker::new(),
+                });
             let (agent_runtime, mut startup_error) =
                 match AgentRuntimeServices::from_extensions(&thread_extension_data) {
                     Ok(runtime) => (runtime, None),
@@ -2001,6 +2049,7 @@ impl Session {
                 tx_event.clone(),
                 codex_responses_headers,
                 crate::cyber_access_program::ApiKeyCyberAccessPrograms::from_config(&config),
+                required_cyber_access_programs,
             );
             // Once tracing starts, startup cleanup must own the session before the next await.
             let rollout_thread_trace = if matches!(
@@ -2047,11 +2096,24 @@ impl Session {
                 exec_policy,
                 auth_manager: Arc::clone(&auth_manager),
                 runtime_auth,
-                openai_file_upload_client_pool: RouteAwareClientPool::new_without_request_logging(
-                    config.http_client_factory(),
-                    ClientRouteClass::Api,
-                )
-                .with_legacy_custom_ca_fallback(),
+                openai_file_upload_client_pool: if config
+                    .features
+                    .enabled(Feature::RuntimeAgentInstances)
+                    && codex_runtime_agent_instance::is_openai_api_url(&config.chatgpt_base_url)
+                {
+                    RouteAwareClientPool::new_without_request_logging(
+                        config
+                            .http_client_factory()
+                            .with_sensitive_header_protection(),
+                        ClientRouteClass::Api,
+                    )
+                } else {
+                    RouteAwareClientPool::new_without_request_logging(
+                        config.http_client_factory(),
+                        ClientRouteClass::Api,
+                    )
+                    .with_legacy_custom_ca_fallback()
+                },
                 session_telemetry,
                 models_manager: models_manager_swappable.clone(),
                 models_manager_swappable,
@@ -2099,6 +2161,7 @@ impl Session {
                 thread_id,
                 item_id_generator,
                 agent_runtime,
+                outcome_reporting,
                 installation_id,
                 tx_event: tx_event.clone(),
                 parent_observer_event_tx: OnceLock::new(),

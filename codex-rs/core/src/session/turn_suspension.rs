@@ -54,6 +54,8 @@ pub(super) async fn suspend_turn_and_shutdown(
         CodexErr::Fatal("accepted root turn suspension had no running task".to_string())
     })?;
     let turn_id = task.turn_context.sub_id.clone();
+    // A suspended task emits no terminal outcome.
+    drop(task.outcome_handoff);
     // Normal shutdown records a terminal turn event, preventing another worker from
     // recovering this turn under its original ID. Cancel the task without that event.
     task.cancellation_token.cancel();
@@ -80,13 +82,12 @@ pub(super) async fn suspend_turn_and_shutdown(
             let _ = task_handle.await;
         }
     }
-    // The task did not run while admission was pending. Preserve its initial input
-    // before closing the writer so a new worker can recover the same turn.
+    // Save any initial input the task had not claimed so a new worker can recover the turn.
     let recorded = session
-        .record_unadmitted_input(
+        .record_pending_initial_input(
             &task.turn_context,
             &turn.turn_state,
-            task.pending_admission_input,
+            task.pending_initial_input,
             /*abort_reason*/ None,
         )
         .await;

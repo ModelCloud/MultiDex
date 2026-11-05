@@ -564,6 +564,8 @@ impl HistoryCell for AgentMessageCell {
 /// because resolving their local file links depends on filesystem state that can change later.
 #[derive(Debug)]
 pub(crate) struct AgentMarkdownCell {
+    /// Identifies an interrupted reply that can still receive its authoritative completion.
+    pub(crate) interrupted_item: Option<(String, String)>,
     markdown_source: String,
     copy_source: Option<String>,
     cwd: PathBuf,
@@ -574,6 +576,18 @@ pub(crate) struct AgentMarkdownCell {
 }
 
 impl AgentMarkdownCell {
+    pub(crate) fn from_parsed_message(
+        visible_markdown: String,
+        source: String,
+        cwd: &Path,
+        context: Option<crate::inline_visualization::InlineVisualizationContext>,
+        questions: &[codex_protocol::items::AsyncUserInputQuestion],
+    ) -> Self {
+        Self::new_with_inline_visualizations(visible_markdown, cwd, context)
+            .with_questions(questions)
+            .with_copy_source(Some(source))
+    }
+
     pub(crate) fn with_copy_source(mut self, source: Option<String>) -> Self {
         self.copy_source = source;
         self
@@ -604,6 +618,7 @@ impl AgentMarkdownCell {
             (!crate::inline_visualization::contains_inline_visualization(&markdown_source))
                 .then(MarkdownRenderCache::default);
         Self {
+            interrupted_item: None,
             markdown_source,
             copy_source: None,
             cwd: cwd.to_path_buf(),
