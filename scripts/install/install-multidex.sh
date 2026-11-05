@@ -31,11 +31,11 @@ LOCAL_ARCHIVE="${MULTIDEX_ARCHIVE:-}"
 TMP_DIR=""
 PREFERRED_ASSET=""
 if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ -f /etc/os-release ]; then
-  # Ubuntu 24.04 needs glibc <= 2.39. The ordinary x86_64 asset may have been
-  # built on a newer system, so choose an OS-specific asset when available.
+  # Ubuntu releases have different glibc baselines. Choose an OS-specific
+  # asset when available instead of assuming the generic binary is compatible.
   . /etc/os-release
   case "${ID:-}:${VERSION_ID:-}" in
-    ubuntu:24.04|ubuntu:26.04)
+    ubuntu:22.04|ubuntu:24.04|ubuntu:26.04)
       PREFERRED_ASSET="multidex-package-$TARGET-ubuntu$VERSION_ID.tar.gz"
       ;;
   esac
