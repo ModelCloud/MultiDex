@@ -541,6 +541,7 @@ impl LocalAgentControl {
                 crate::thread_manager::build_models_manager(
                     &validation_config,
                     state.auth_manager(),
+                    /*runtime*/ None,
                 )
             };
         let available_models = models_manager

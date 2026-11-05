@@ -221,10 +221,19 @@ impl ChatWidget {
             ServerNotification::Error(notification) => {
                 if notification.will_retry {
                     if !from_replay {
-                        self.on_stream_error(
-                            notification.error.message,
-                            notification.error.additional_details,
-                        );
+                        let error = notification.error;
+                        let message =
+                            if let Some(AppServerCodexErrorInfo::ResponseStreamDisconnected {
+                                http_status_code: Some(429),
+                            }) = error.codex_error_info
+                                && let Some(attempt) =
+                                    error.message.strip_prefix("Reconnecting... ")
+                            {
+                                format!("Server is busy, reconnecting {attempt}")
+                            } else {
+                                error.message
+                            };
+                        self.on_stream_error(message, error.additional_details);
                     }
                 } else if from_replay || !safety_recourse::defer_error(self, &notification) {
                     self.last_non_retry_error = Some((
@@ -637,7 +646,8 @@ impl ChatWidget {
                 self.on_context_compaction_started(id, elapsed);
             }
             item @ ThreadItemPayload::CommandExecution { .. } => {
-                self.on_command_execution_started(item)
+                // Buffered notifications were received from this thread's live subscription.
+                self.on_command_execution_started(item, ThreadItemRenderSource::Live)
             }
             ThreadItemPayload::FileChange { id: _, changes, .. } => {
                 self.on_patch_apply_begin(file_update_changes_to_display(changes));
