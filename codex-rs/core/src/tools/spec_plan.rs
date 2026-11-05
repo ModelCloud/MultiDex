@@ -1462,6 +1462,14 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
             let spawn_agent_description =
                 model_messages.multi_agent_tool_description_override("spawn_agent");
+            // The OpenAI backend reserves the collaboration namespace and validates
+            // its tool schemas. Provider/model overrides are MultiDex extensions:
+            // keep them for other providers, but use the accepted schema for OpenAI.
+            let expose_model_overrides = turn_context
+                .config
+                .multi_agent_v2
+                .expose_spawn_agent_model_overrides
+                && !turn_context.provider.info().is_openai();
             let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
                 ToolExposure::DirectModelOnly
             } else {
@@ -1494,10 +1502,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                             agent_type_description,
                             expose_agent_type: !turn_context.config.agent_roles.is_empty(),
                             hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
-                            expose_spawn_agent_model_overrides: turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
+                            expose_spawn_agent_model_overrides: expose_model_overrides,
                             usage_hint_text: turn_context
                                 .config
                                 .multi_agent_v2
@@ -1518,12 +1523,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             if !turn_context.config.multi_agent_v2.disable_direct_message {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        SendMessageHandlerV2::new(
-                            turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
-                        ),
+                        SendMessageHandlerV2::new(expose_model_overrides),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("send_message"),
                         model_messages.multi_agent_tool_parameters_override("send_message"),
@@ -1533,12 +1533,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 );
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
-                        FollowupTaskHandlerV2::new(
-                            turn_context
-                                .config
-                                .multi_agent_v2
-                                .expose_spawn_agent_model_overrides,
-                        ),
+                        FollowupTaskHandlerV2::new(expose_model_overrides),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("followup_task"),
                         model_messages.multi_agent_tool_parameters_override("followup_task"),
@@ -1547,11 +1542,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     native_review,
                 );
             }
-            if turn_context
-                .config
-                .multi_agent_v2
-                .expose_spawn_agent_model_overrides
-            {
+            if expose_model_overrides {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
                         SetAgentSettingsHandlerV2,

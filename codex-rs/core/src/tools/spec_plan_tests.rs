@@ -2789,6 +2789,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 
     let v2 = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
         update_config(turn, |config| {
             config.multi_agent_v2.max_concurrent_threads_per_session = 17;
         });
@@ -2909,9 +2910,76 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
 }
 
 #[tokio::test]
+async fn openai_multi_agent_v2_uses_reserved_collaboration_schemas() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.expose_spawn_agent_model_overrides = true;
+        });
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
+        panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
+    };
+    assert!(
+        !plan
+            .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"set_agent_settings".to_string())
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name)
+        }) else {
+            panic!("expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE}");
+        };
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("tool should use object params");
+        for extension in ["provider", "model", "reasoning_effort"] {
+            assert!(
+                !properties.contains_key(extension),
+                "{tool_name} must not expose {extension} to OpenAI"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_openai_multi_agent_v2_keeps_provider_overrides() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
+        panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
+    };
+    assert!(
+        plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"set_agent_settings".to_string())
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name)
+        }) else {
+            panic!("expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE}");
+        };
+        assert!(
+            tool.parameters
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("provider"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn multi_agent_v2_can_disable_wait_agent() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        use_bedrock_provider(turn);
         update_config(turn, |config| {
             config.multi_agent_v2.wait_agent_enabled = false;
         });
