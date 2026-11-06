@@ -165,6 +165,40 @@ pub(crate) struct McpStartupRequirements {
     required_plugins: HashSet<String>,
 }
 
+/// Keep the initial input recoverable while startup can block on a host roster read.
+async fn preserve_initial_input_during<T>(
+    sess: &Session,
+    turn_context: &Arc<TurnContext>,
+    input: &mut Vec<TurnInput>,
+    prepare: impl Future<Output = T>,
+) -> CodexResult<T> {
+    if input.is_empty() || sess.host_roster_reader(turn_context).is_none() {
+        return Ok(prepare.await);
+    }
+
+    let exchange_input = async |replacement| {
+        let mut active = sess.active_turn.lock().await;
+        let task = active
+            .as_mut()
+            .and_then(|turn| turn.task.as_mut())
+            .filter(|task| Arc::ptr_eq(&task.turn_context, turn_context))
+            .ok_or_else(|| CodexErr::new(CodexErrorDetails::TurnAborted))?;
+        Ok::<_, CodexErr>(std::mem::replace(
+            &mut task.pending_initial_input,
+            replacement,
+        ))
+    };
+
+    let previous = exchange_input(Some(std::mem::take(input))).await?;
+    debug_assert!(previous.is_none());
+    let result = prepare.await;
+    // If suspension took the task, its cleanup owns the input.
+    *input = exchange_input(/* replacement */ None)
+        .await?
+        .ok_or_else(|| CodexErr::Fatal("initial input missing after turn preparation".into()))?;
+    Ok(result)
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -243,13 +277,18 @@ pub(crate) async fn run_turn(
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
     if auto_compaction_enabled
-        && let Err(err) = run_pre_sampling_compact(
+        && let Err(err) = preserve_initial_input_during(
             &sess,
             &turn_context,
-            &mut client_session,
-            &cancellation_token,
+            &mut input,
+            run_pre_sampling_compact(
+                &sess,
+                &turn_context,
+                &mut client_session,
+                &cancellation_token,
+            ),
         )
-        .await
+        .await?
     {
         // Compaction runs before the new input is recorded, so preserve it on every failure.
         let _ = run_hooks_and_record_inputs(
@@ -343,7 +382,12 @@ pub(crate) async fn run_turn(
     };
     // Record initial context while preparing diff display roots.
     let (record_context, display_roots) = tokio::join!(
-        sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
+        preserve_initial_input_during(
+            &sess,
+            &turn_context,
+            &mut input,
+            sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
+        ),
         async {
             // Guardian must not wait for remote Git discovery just to display diff paths.
             if crate::guardian::is_basic_session_source(&turn_context.session_source)
@@ -368,7 +412,7 @@ pub(crate) async fn run_turn(
             }
         },
     );
-    let mut world_state = record_context?;
+    let mut world_state = record_context??;
 
     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
         &sess,
@@ -1212,9 +1256,10 @@ async fn required_mcp_servers_for_input(
     }));
 
     let connector_slug_counts = if turn_context.apps_enabled() && !mentions.plain_names.is_empty() {
-        let cached_connectors =
-            connectors::list_cached_accessible_connectors_from_mcp_tools(&turn_context.config)
-                .await;
+        let cached_connectors = connectors::list_cached_accessible_connectors_from_mcp_tools(
+            &turn_context.config,
+            sess.services.auth_manager.auth().await.as_ref(),
+        );
         let accessible_connectors = match cached_connectors {
             Some(connectors) => connectors,
             None => sess
@@ -3237,7 +3282,7 @@ async fn try_run_sampling_request(
     let mut response_id_for_assessment = None;
     let mut pending_assessment: Option<codex_api::GuardianAssessment> = None;
     let mut response_completed = false;
-    let mut request_token_usage = None;
+    let mut request_token_usage: Option<codex_protocol::protocol::TokenUsage> = None;
     let mut includes_reasoning = step_context.settings.model_info.use_responses_lite;
     // Catalog policies can enable adaptive review independently of the legacy scorer flag.
     // Capture evidence whenever Guardian is available; the reviewer resolves the policy.
@@ -3250,28 +3295,33 @@ async fn try_run_sampling_request(
     } else {
         None
     };
-    let stream_request = client_session
-        .stream(
-            &prompt,
-            &step_context.settings.model_info,
-            &step_context.session_telemetry,
-            effort,
-            step_context.settings.reasoning_summary,
-            step_context.settings.service_tier.clone(),
-            responses_metadata,
-            &inference_trace,
-        )
-        .instrument(trace_span!("stream_request"));
-    let mut stream = tokio::select! {
+    let mut resampling = crate::guardian::ResponseResampling::new(&sess);
+    let mut stream_request = async |prompt: &Prompt| {
+        client_session
+            .stream(
+                prompt,
+                &step_context.settings.model_info,
+                &step_context.session_telemetry,
+                effort.clone(),
+                step_context.settings.reasoning_summary,
+                step_context.settings.service_tier.clone(),
+                responses_metadata,
+                &inference_trace,
+            )
+            .instrument(trace_span!("stream_request"))
+            .await
+    };
+    let multidex_preemption = async {
+        if let Some(token) = sampling_preemption.as_ref() {
+            token.cancelled().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let stream = tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-        _ = async {
-            if let Some(token) = sampling_preemption.as_ref() {
-                token.cancelled().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {
+        _ = multidex_preemption => {
             client_session.drop_connection();
             return Ok(SamplingRequestResult {
                 needs_follow_up: true,
@@ -3289,22 +3339,25 @@ async fn try_run_sampling_request(
                 last_agent_message: None,
             });
         }
-        result = stream_request => match result {
+        stream = stream_request(&prompt).or_cancel(&cancellation_token) => match stream {
             Ok(stream) => stream,
-            Err(error) => {
-                if let Some(finish_post_request) = finish_post_request {
-                    finish_post_request(PostModelRequest {
-                        status: ModelRequestStatus::Failed,
-                        error: Some(error.to_string()),
-                        token_usage: None,
-                    })
-                    .await;
-                }
-                return Err(error);
-            }
+            Err(_) => return Err(CodexErr::TurnAborted),
         },
     };
-    drop(prompt);
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            if let Some(finish_post_request) = finish_post_request {
+                finish_post_request(PostModelRequest {
+                    status: ModelRequestStatus::Failed,
+                    error: Some(error.to_string()),
+                    token_usage: None,
+                })
+                .await;
+            }
+            return Err(error);
+        }
+    };
     let can_interrupt = turn_context
         .config
         .features
@@ -3345,6 +3398,17 @@ async fn try_run_sampling_request(
     let receiving_span = trace_span!("receiving_stream");
     let mut drop_connection_after_stream = false;
     let outcome: CodexResult<SamplingRequestResult> = loop {
+        if response_completed && resampling.accepted_output.is_empty() {
+            if resampling.update_usage_boundary {
+                sess.state.lock().await.history.reset_last_usage_boundary();
+            }
+            break Ok(SamplingRequestResult {
+                needs_follow_up,
+                mailbox_preempted: *draining_for_mailbox,
+                multidex_preempted: false,
+                last_agent_message,
+            });
+        }
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -3362,16 +3426,16 @@ async fn try_run_sampling_request(
         );
 
         let receive_started = Instant::now();
+        let multidex_preemption = async {
+            if let Some(token) = sampling_preemption.as_ref() {
+                token.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let event = tokio::select! {
             biased;
-            _ = cancellation_token.cancelled() => break Err(CodexErr::TurnAborted),
-            _ = async {
-                if let Some(token) = sampling_preemption.as_ref() {
-                    token.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = multidex_preemption => {
                 drop_connection_after_stream = true;
                 break Ok(SamplingRequestResult {
                     needs_follow_up: true,
@@ -3380,7 +3444,22 @@ async fn try_run_sampling_request(
                     last_agent_message: None,
                 });
             }
-            _ = preempt.cancelled() => {
+            event = resampling
+                .next(&mut stream)
+                .instrument(trace_span!(parent: &handle_responses, "receiving"))
+                .or_cancel(&preempt)
+                .or_cancel(&cancellation_token) => event,
+        };
+        // Split the existing iteration span without adding another span per streamed delta.
+        handle_responses.record(
+            "codex.response.receive_wait_ms",
+            receive_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        // Account for an already-received terminal error even if cancellation raced it.
+        // Cancellation still stops ordinary stream events before they can run tools.
+        let event = match event {
+            Ok(Ok(event)) => event,
+            Ok(Err(_)) => {
                 if *draining_for_mailbox {
                     preempt = CancellationToken::new();
                     continue;
@@ -3403,12 +3482,8 @@ async fn try_run_sampling_request(
                     last_agent_message,
                 });
             }
-            event = stream.next().instrument(trace_span!(parent: &handle_responses, "receiving")) => event,
+            Err(_) => break Err(CodexErr::TurnAborted),
         };
-        handle_responses.record(
-            "codex.response.receive_wait_ms",
-            receive_started.elapsed().as_secs_f64() * 1000.0,
-        );
 
         if cancellation_token.is_cancelled()
             && !matches!(event.as_ref(), Some(Err(err))
@@ -3440,7 +3515,11 @@ async fn try_run_sampling_request(
             Ok(event) => event,
             Err(err) => {
                 if let CodexErrorDetails::ResponseIncomplete(incomplete) = err.details() {
-                    request_token_usage = incomplete.token_usage.clone();
+                    if let Some(usage) = &incomplete.token_usage {
+                        request_token_usage
+                            .get_or_insert_default()
+                            .add_assign(usage);
+                    }
                     sess.record_incomplete_response_usage(
                         &turn_context,
                         &step_context.settings,
@@ -3463,10 +3542,13 @@ async fn try_run_sampling_request(
             }
         };
 
+        record_turn_ttft_metric(&turn_context, &event).await;
+        let Some(event) = resampling.filter(event, &step_context.tool_router) else {
+            continue;
+        };
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);
-        record_turn_ttft_metric(&turn_context, &event).await;
 
         match event {
             ResponseEvent::Created { response_id } => {
@@ -3820,7 +3902,11 @@ async fn try_run_sampling_request(
                     .await;
                 }
                 response_completed = true;
-                request_token_usage = token_usage.clone();
+                if let Some(usage) = &token_usage {
+                    request_token_usage
+                        .get_or_insert_default()
+                        .add_assign(usage);
+                }
                 sess.services
                     .analytics_events_client
                     .track_code_mode_tool_call(
@@ -3850,9 +3936,13 @@ async fn try_run_sampling_request(
                         &turn_context,
                         &step_context.settings,
                         token_usage.as_ref(),
-                        super::TokenUsageContext::Sampling {
-                            includes_reasoning,
-                            input_item_count,
+                        if resampling.retry_pending {
+                            super::TokenUsageContext::SpendingOnly
+                        } else {
+                            super::TokenUsageContext::Sampling {
+                                includes_reasoning,
+                                input_item_count,
+                            }
                         },
                     )
                     .await;
@@ -3861,15 +3951,23 @@ async fn try_run_sampling_request(
                 if let Err(err) = budget_result {
                     break Err(err);
                 }
+                if resampling.retry_pending {
+                    response_completed = false;
+                    response_id_for_assessment = None;
+                    pending_assessment = None;
+                    includes_reasoning = step_context.settings.model_info.use_responses_lite;
+                    stream = match resampling
+                        .retry(stream_request(&prompt), &cancellation_token)
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => break Err(error),
+                    };
+                    continue;
+                }
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
-                break Ok(SamplingRequestResult {
-                    needs_follow_up,
-                    mailbox_preempted: *draining_for_mailbox,
-                    multidex_preempted: false,
-                    last_agent_message,
-                });
             }
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the

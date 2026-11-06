@@ -68,6 +68,7 @@ impl App {
                     | AppEvent::TerminalTitleSetupPreview { .. }
                     | AppEvent::TerminalTitleSetupCancelled
                     | AppEvent::OpenConfigEditor(_)
+                    | AppEvent::Provider(_)
                     | AppEvent::SyntaxThemeSelected { .. }
                     | AppEvent::SyntaxThemePreviewed
                     | AppEvent::OpenKeymapActionMenu { .. }
@@ -161,6 +162,19 @@ impl App {
 
         // Keep the picker check and model update in one event without recursively polling this
         // large dispatcher on the TUI thread's stack.
+        let event = match event {
+            AppEvent::ScopedModelPicker { backend, thread_id, event } => {
+                if backend != app_server.backend_id()
+                    || thread_id != self.chat_widget.thread_id()
+                    || self.chat_widget.model_catalog().provider_may_have_changed()
+                {
+                    return Ok(AppRunControl::Continue);
+                }
+                *event
+            }
+            event => event,
+        };
+
         let (event, sparkle_model) = match event {
             AppEvent::AstraSelectedFromModelPicker {
                 thread_id,
@@ -450,6 +464,10 @@ impl App {
                         if let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut() {
                             overlay.set_history_state(TranscriptHistoryState::Failed);
                         }
+                        tui.frame_requester().schedule_frame();
+                    }
+                    if let Some(pane) = self.side_companions.get_mut(&thread_id) {
+                        pane.view.history = TranscriptHistoryState::Failed;
                         tui.frame_requester().schedule_frame();
                     }
                     tracing::warn!(%thread_id, error = %err, "failed to load older transcript history");
@@ -946,11 +964,14 @@ impl App {
             AppEvent::ParkSideCompanion { pair, thread_id, stream, display } => {
                 if self.side_threads.contains_key(&pair) {
                     self.transcript_view.sync_history_tail(&self.transcript_cells);
+                    let mut answer = None;
                     if let Some(stream) = stream {
                         let cells = &mut self.transcript_cells;
                         let (start, replacement): (_, Arc<dyn HistoryCell>) = match stream {
-                            CapturedSideStream::Answer(cell) => {
-                                (trailing_run_start::<history_cell::AgentMessageCell>(cells), cell)
+                            CapturedSideStream::Answer { cell, item } => {
+                                let start = trailing_run_start::<history_cell::AgentMessageCell>(cells);
+                                answer = item.map(|item| super::side_companion::SideAnswer::new(item, start));
+                                (start, cell)
                             }
                             CapturedSideStream::Plan(cell) => {
                                 (trailing_run_start::<history_cell::ProposedPlanStreamCell>(cells), cell)
@@ -962,8 +983,10 @@ impl App {
                     }
                     self.side_companions.insert(thread_id, SideCompanion {
                         display,
+                        parked_tail: self.transcript_cells.len(),
                         cells: std::mem::take(&mut self.transcript_cells),
                         view: std::mem::take(&mut self.transcript_view),
+                        answer,
                     });
                 }
             }
@@ -1004,6 +1027,29 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
+            AppEvent::SidePanePressAfterReplay { peer, thread_id, area, mut press, draft_cursor } => {
+                if self.pending_thread_switch_resets == 0
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                    && self.conversation_focus_available(tui)
+                {
+                    let size = tui.prepare_draw_size()?;
+                    if side_pane::layout(self, tui, size.into()).is_some_and(|panes| panes.passive_thread == peer) {
+                        if let Some(cursor) = draft_cursor {
+                            // The editor can reflow during the slide. Keep the original text position.
+                            self.chat_widget.set_composer_cursor(cursor);
+                        }
+                        self.refresh_owned_transcript(tui)?;
+                        if draft_cursor.is_some() {
+                            let position = tui.terminal.last_known_cursor_pos;
+                            press.column = position.x;
+                            press.row = position.y;
+                        } else if !self.conversation_frame.side_pane().is_some_and(|panes| panes.focused == area) {
+                            return Ok(AppRunControl::Continue);
+                        }
+                        self.handle_owned_transcript_event(tui, app_server, &TuiEvent::Mouse(press))?;
+                    }
+                }
+            }
             AppEvent::ResetTranscriptForThreadSwitchPreservingScreen => {
                 self.reset_transcript_state_after_clear();
                 tui.clear_pending_history_lines();
@@ -1037,6 +1083,7 @@ impl App {
                 self.finish_initial_history_replay_buffer(tui);
             }
             AppEvent::ConsolidateAgentMessage {
+                interrupted_item,
                 source,
                 copy_source,
                 cwd,
@@ -1044,14 +1091,35 @@ impl App {
                 scrollback_reflow,
                 deferred_history_cell,
             } => {
+                let mut cell = history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source);
+                cell.interrupted_item = interrupted_item;
                 self.handle_consolidate_agent_message(
                     tui,
-                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source),
+                    cell,
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;
                 self.chat_widget.note_stream_consolidation_completed();
                 self.insert_pending_usage_output_after_stream_shutdown(tui);
+            }
+            AppEvent::CorrectFlushedAgentMessage { item, cell } => {
+                let belongs_to_item = |cell: &Arc<dyn HistoryCell>| {
+                    cell.as_any().downcast_ref::<history_cell::AgentMarkdownCell>().is_some_and(|cell| cell.interrupted_item.as_ref() == Some(&item))
+                };
+                if let Some(index) = self.transcript_cells.iter().position(belongs_to_item) {
+                    // Keep the reply where it first appeared, with intervening tools in order.
+                    if self.transcript_cells.extract_if(index + 1.., |cell| belongs_to_item(cell)).count() > 0 {
+                        self.native_history.retain(&self.transcript_cells);
+                        self.transcript_view.restart_search();
+                        self.transcript_view.history_loaded(&self.transcript_cells, 0..0);
+                        if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+                            overlay.replace_cells(self.transcript_cells.clone());
+                        }
+                    }
+                    self.replace_agent_message(tui, index..index + 1, cell, crate::app_event::ConsolidationScrollbackReflow::Required)?;
+                } else {
+                    self.insert_history_cell(tui, Box::new(cell));
+                }
             }
             AppEvent::ConsolidateProposedPlan(source) => {
                 let end = self.transcript_cells.len();
@@ -2353,7 +2421,7 @@ impl App {
                         .await;
                 }
             }
-            AppEvent::AstraSelectedFromModelPicker { .. } => unreachable!("picker event unwrapped"),
+            AppEvent::ScopedModelPicker { .. } | AppEvent::AstraSelectedFromModelPicker { .. } => unreachable!("picker event unwrapped"),
             AppEvent::BackgroundVoiceError { thread_id, message } => {
                 if self.chat_widget.thread_id() == Some(thread_id) {
                     self.chat_widget.add_error_message(message);
@@ -3627,6 +3695,7 @@ impl App {
                 self.chat_widget.cancel_terminal_title_setup();
                 self.chat_widget.refresh_config_panel(/*notice*/ None);
             }
+            AppEvent::Provider(event) => super::provider::handle(self, tui, app_server, event),
             AppEvent::OpenConfigEditor(handoff) => {
                 self.cancel_pending_key_chord();
                 if let Err(err) = tui.discard_pending_input_before_interactive_screen() {

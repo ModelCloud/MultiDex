@@ -2010,15 +2010,19 @@ name = "codex-analytics"
 version = "0.166.0"
 dependencies = [
  "codex-app-server-protocol",
+ "codex-features",
  "codex-git-utils",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
+ "codex-model-provider-info",
  "codex-plugin",
  "codex-protocol",
+ "codex-runtime-agent-instance",
  "codex-state",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "http 1.4.0",
  "os_info",
  "pretty_assertions",
  "serde",
@@ -2026,6 +2030,7 @@ dependencies = [
  "sha1 0.10.6",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2138,6 +2143,7 @@ dependencies = [
  "codex-queue-extension",
  "codex-rmcp-client",
  "codex-rollout",
+ "codex-runtime-agent-instance",
  "codex-sandboxing",
  "codex-shell-command",
  "codex-skills",
@@ -2226,6 +2232,7 @@ dependencies = [
  "toml 0.9.11+spec-1.1.0",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -2513,14 +2520,18 @@ name = "codex-chatgpt"
 version = "0.166.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "codex-connectors",
  "codex-core",
+ "codex-features",
  "codex-git-utils",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-plugin",
+ "codex-protocol",
+ "codex-runtime-agent-instance",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "pretty_assertions",
@@ -2528,6 +2539,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -2707,17 +2720,23 @@ name = "codex-cloud-tasks"
 version = "0.166.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
+ "codex-agent-identity",
+ "codex-backend-client",
  "codex-cloud-tasks-client",
  "codex-cloud-tasks-mock-client",
  "codex-core",
+ "codex-features",
  "codex-git-utils",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
+ "codex-runtime-agent-instance",
  "codex-tui",
  "codex-utils-cli",
+ "core_test_support",
  "crossterm",
  "http 1.4.0",
  "insta",
@@ -2727,12 +2746,15 @@ dependencies = [
  "serde",
  "serde_json",
  "supports-color 3.0.2",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width 0.2.1",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -3161,14 +3183,17 @@ name = "codex-core-plugins"
 version = "0.166.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "codex-analytics",
+ "codex-api",
  "codex-app-server-protocol",
  "codex-config",
  "codex-connectors",
  "codex-core-plugin-common",
  "codex-exec-server",
  "codex-exec-server-test-support",
+ "codex-features",
  "codex-git-utils",
  "codex-hooks",
  "codex-http-client",
@@ -3178,6 +3203,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-runtime-agent-instance",
  "codex-shell-command",
  "codex-skills",
  "codex-tools",
@@ -3440,6 +3466,7 @@ name = "codex-execpolicy"
 version = "0.166.0"
 dependencies = [
  "anyhow",
+ "caseless",
  "clap",
  "codex-utils-absolute-path",
  "multimap",
@@ -3451,6 +3478,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3771,9 +3799,29 @@ dependencies = [
 name = "codex-guardian-v3"
 version = "0.166.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "codex-analytics",
+ "codex-context-fragments",
+ "codex-core",
+ "codex-extension-api",
+ "codex-guardian-reviewer",
+ "codex-history",
  "codex-message-board",
  "codex-protocol",
  "codex-state",
+ "codex-thread-store",
+ "codex-utils-string",
+ "core_test_support",
+ "futures",
+ "insta",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-case",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3966,7 +4014,7 @@ dependencies = [
  "codex-uds",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
- "globset",
+ "ignore",
  "landlock",
  "libc",
  "pretty_assertions",
@@ -4051,6 +4099,7 @@ dependencies = [
  "arc-swap",
  "assert_matches",
  "async-channel",
+ "base64 0.22.1",
  "codex-api",
  "codex-async-utils",
  "codex-config",
@@ -4058,6 +4107,8 @@ dependencies = [
  "codex-diagnostics",
  "codex-exec-server",
  "codex-exec-server-test-support",
+ "codex-features",
+ "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-network-proxy",
@@ -4065,12 +4116,14 @@ dependencies = [
  "codex-plugin",
  "codex-protocol",
  "codex-rmcp-client",
+ "codex-runtime-agent-instance",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-path-uri",
  "codex-utils-plugins",
  "codex-utils-process",
  "futures",
+ "http 1.4.0",
  "insta",
  "lru",
  "pretty_assertions",
@@ -4086,6 +4139,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -4742,6 +4796,7 @@ dependencies = [
  "tracing-test",
  "url",
  "urlencoding",
+ "uuid",
  "webbrowser",
  "which 8.0.0",
  "windows-sys 0.61.2",
@@ -5400,6 +5455,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-utils-model-facing-id"
+version = "0.166.0"
+dependencies = [
+ "blake3",
+ "pretty_assertions",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "codex-utils-oss"
 version = "0.166.0"
 dependencies = [
@@ -5998,22 +6066,26 @@ dependencies = [
  "codex-login",
  "codex-model-provider-info",
  "codex-models-manager",
+ "codex-network-proxy",
  "codex-protocol",
  "codex-thread-store",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-path-uri",
+ "codex-utils-rustls-provider",
  "ctor 0.6.3",
  "futures",
  "notify",
  "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",
+ "rcgen",
  "regex-lite",
  "serde_json",
  "shlex",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "tracing-opentelemetry",
@@ -15950,7 +16022,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
-source = "git+https://github.com/openai-oss-forks/tokio-tungstenite?rev=0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186#0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186"
+source = "git+https://github.com/openai-oss-forks/tokio-tungstenite?rev=02cb49fa827411e9279e3688d19ab9e82661b0e8#02cb49fa827411e9279e3688d19ab9e82661b0e8"
 dependencies = [
  "futures-util",
  "log",
@@ -16438,7 +16510,7 @@ dependencies = [
 [[package]]
 name = "tungstenite"
 version = "0.27.0"
-source = "git+https://github.com/openai-oss-forks/tungstenite-rs?rev=4fffad30fe373adbdcffab9545e9e9bf4f2fc19f#4fffad30fe373adbdcffab9545e9e9bf4f2fc19f"
+source = "git+https://github.com/openai-oss-forks/tungstenite-rs?rev=db4be399bc1b8b5de2edb46c7187834edabf7e30#db4be399bc1b8b5de2edb46c7187834edabf7e30"
 dependencies = [
  "bytes",
  "data-encoding",

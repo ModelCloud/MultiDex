@@ -963,6 +963,7 @@ client_request_definitions! {
     },
     ThreadItemsList => "thread/items/list" {
         params: v2::ThreadItemsListParams,
+        inspect_params: true,
         // Explicitly concurrent: this primarily reads append-only rollout storage.
         serialization: None,
         response: v2::ThreadItemsListResponse,
@@ -2826,6 +2827,7 @@ mod tests {
                 cursor: None,
                 limit: None,
                 sort_direction: None,
+                defer_output: None,
             },
         };
         assert_eq!(thread_items_list.serialization_scope(), None);
