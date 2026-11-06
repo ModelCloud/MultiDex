@@ -18,7 +18,8 @@ async fn composer_submission_sends_once_and_requests_latest() {
     let (mut chat, mut events, mut operations) =
         make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.apply_external_edit("send once".to_string());
+    let prompt = "**send once**";
+    chat.apply_external_edit(prompt.to_string());
     while events.try_recv().is_ok() {}
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     assert_eq!(
@@ -33,7 +34,7 @@ async fn composer_submission_sends_once_and_requests_latest() {
     assert_eq!(
         items,
         vec![UserInput::Text {
-            text: "send once".into(),
+            text: prompt.into(),
             text_elements: Vec::new(),
         }]
     );
@@ -414,6 +415,59 @@ async fn parent_owned_thread_preserves_queued_input_before_draining() {
         VecDeque::from([history_record])
     );
     assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_clipboard_image_does_not_turn_a_held_bang_into_a_shell_command() {
+    let (mut chat, _events, mut operations) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
+    chat.handle_key_event(KeyCode::Char('!').into());
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+    assert_eq!(chat.bottom_pane.composer_recovery_snapshot().text, "!");
+
+    let paste = chat.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    let KeyEventAction::PasteImage { .. } = paste else {
+        panic!("expected a clipboard image request");
+    };
+    let image_path = PathBuf::from("image.png");
+    chat.attach_image(image_path.clone());
+    chat.handle_key_event(KeyCode::Enter.into());
+
+    let draft = chat.bottom_pane.composer_recovery_snapshot();
+    assert_eq!(draft.text, "[Image #1]!\n");
+    assert_eq!(draft.shell_mode, Some(false));
+    while let Ok(op) = operations.try_recv() {
+        assert!(
+            !matches!(op, Op::RunUserShellCommand { .. } | Op::UserTurn { .. }),
+            "{op:?}"
+        );
+    }
+
+    tokio::time::advance(Duration::from_secs(/*secs*/ 1)).await;
+    chat.handle_paste_burst_tick(FrameRequester::test_dummy());
+    chat.handle_key_event(KeyCode::Enter.into());
+
+    let Op::UserTurn { items, .. } = next_submit_op(&mut operations) else {
+        panic!("expected submitted user turn");
+    };
+    let placeholder = "[Image #1]";
+    assert_eq!(
+        items,
+        vec![
+            UserInput::LocalImage {
+                path: image_path,
+                detail: None,
+            },
+            UserInput::Text {
+                text: format!("{placeholder}!"),
+                text_elements: vec![
+                    TextElement::new((0..placeholder.len()).into(), Some(placeholder.to_string()))
+                        .into(),
+                ],
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1892,6 +1946,51 @@ async fn pending_steer_interrupt_uses_remapped_binding() {
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(chat.input_queue.submit_pending_steers_after_interrupt);
+}
+
+#[tokio::test]
+async fn resumed_steers_reconcile_by_client_id_and_hold_unmatched_admissions() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    // Both messages have the same text; only one has a receipt in the resumed history.
+    chat.input_queue.pending_steers = VecDeque::from([
+        PendingSteer {
+            client_id: "confirmed".into(),
+            admitted_turn_id: Some("finished".into()),
+            ..pending_steer("same text")
+        },
+        PendingSteer {
+            client_id: "unmatched".into(),
+            admitted_turn_id: Some("finished".into()),
+            ..pending_steer("same text")
+        },
+    ]);
+    chat.input_queue
+        .queued_user_messages
+        .push_back(UserMessage::from("next draft").into());
+    chat.input_queue
+        .queued_user_message_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+    let mut input = chat
+        .capture_thread_input_state()
+        .expect("saved session input");
+    input.reconcile_confirmed_messages(&["confirmed".into()]);
+    chat.restore_thread_input_state(
+        Some(input),
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["same text", "next draft"]
+    );
+    assert_eq!(
+        chat.input_queue.queued_user_messages[0].delivery,
+        MessageDelivery::Unconfirmed(Some("unmatched".into()))
+    );
+    assert!(!chat.maybe_send_next_queued_input());
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]

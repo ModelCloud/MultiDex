@@ -2216,6 +2216,7 @@ dependencies = [
  "codex-core",
  "codex-exec-server",
  "codex-feedback",
+ "codex-login",
  "codex-protocol",
  "codex-uds",
  "codex-utils-absolute-path",
@@ -3802,6 +3803,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "codex-analytics",
+ "codex-attachment-store",
  "codex-context-fragments",
  "codex-core",
  "codex-extension-api",
@@ -3811,6 +3813,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-thread-store",
+ "codex-tools",
  "codex-utils-string",
  "core_test_support",
  "futures",
@@ -3831,6 +3834,7 @@ dependencies = [
  "anyhow",
  "codex-protocol",
  "codex-protocol-test-support",
+ "codex-utils-absolute-path",
  "pretty_assertions",
  "schemars 0.8.22",
  "serde",
@@ -4068,6 +4072,7 @@ dependencies = [
  "http 1.4.0",
  "jsonwebtoken",
  "keyring",
+ "oauth2",
  "once_cell",
  "opentelemetry_sdk",
  "os_info",
@@ -4547,7 +4552,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -9628,9 +9632,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.25"
+version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3d782a365a015e0f5c04902246139249abf769125006fbe7649e2ee88169b4a"
+checksum = "7b009b6744c1445efd7244084e25e498636412effb6760b55067553baa925cc7"
 dependencies = [
  "crossbeam-deque",
  "globset",

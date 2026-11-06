@@ -747,6 +747,15 @@ impl App {
             });
         }
         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)?;
+        if !is_replay_only
+            && let Some(message) = self
+                .side_threads
+                .get_mut(&thread_id)
+                .and_then(|side| side.opening_message.take())
+        {
+            self.chat_widget
+                .submit_user_message_as_plain_user_turn(message);
+        }
         if self.side_retention_enabled(tui) {
             if self.side_threads.contains_key(&thread_id) {
                 self.sidebar_mut().show(
@@ -793,12 +802,14 @@ impl App {
         resume_restored_queue: bool,
     ) -> Result<()> {
         let retain_side_view = self.side_retention_enabled(tui);
+        let side_parent = |id| {
+            self.side_threads
+                .get(&self.side_pair_key(id)?)
+                .map(|side| side.parent_thread_id)
+        };
         let preserve_screen = retain_side_view
-            && self.side_pair_key(thread_id).is_some_and(|pair| {
-                self.chat_widget
-                    .thread_id()
-                    .and_then(|id| self.side_pair_key(id))
-                    == Some(pair)
+            && side_parent(thread_id).is_some_and(|parent| {
+                self.chat_widget.thread_id().and_then(side_parent) == Some(parent)
             });
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
@@ -1153,6 +1164,7 @@ impl App {
                 session_start_source,
                 /*remote_cwd_override*/ None,
                 /*selected_profile*/ None,
+                self.backend_preference_context.local_cwd.as_deref(),
             )
             .await
         {
@@ -1599,6 +1611,7 @@ impl App {
             .await
         {
             Ok(()) => {
+                self.remember_attached_host_project(app_server);
                 if let Some(mut input) = retained_input {
                     // A successful resume is the authority for clearing the old rejection.
                     input.provider_error = None;

@@ -90,6 +90,7 @@ impl App {
                     | AppEvent::InsertHistoryCell(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ParkSideCompanion { .. }
+                    | AppEvent::SideCreated { .. }
                     | AppEvent::SideReplayFinished(_)
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
@@ -222,7 +223,8 @@ impl App {
             }
             AppEvent::CloseMisalignmentReview => self.chat_widget.show_misalignment_policy_precaution(),
             AppEvent::SkillsListLoaded { ref cwd, .. }
-                if cwds_differ(cwd, self.config.cwd.as_path()) =>
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud
+                    || cwds_differ(cwd, self.config.cwd.as_path()) =>
             {
                 self.skill_load_warnings.startup_complete = true;
             }
@@ -1053,7 +1055,17 @@ impl App {
             AppEvent::ResetTranscriptForThreadSwitchPreservingScreen => {
                 self.reset_transcript_state_after_clear();
                 tui.clear_pending_history_lines();
-                tui.defer_thread_switch_clear();
+                let switched_tab = self.conversation_frame.chat_strip.is_some()
+                    && self.active_side_parent_thread_id().is_some()
+                    && self.conversation_frame.sidebar_input.is_some_and(|(_, painted_chat, _)| {
+                        painted_chat != self.current_displayed_thread_id()
+                    });
+                if self.conversation_frame.chooser_area().is_none()
+                    && self.chooser_focus().is_none()
+                    && !switched_tab
+                {
+                    tui.defer_thread_switch_clear();
+                }
                 self.pending_thread_switch_resets -= 1;
             }
             AppEvent::CommitRealtimeTranscriptHistory => {
@@ -1282,6 +1294,9 @@ impl App {
             AppEvent::ImagesPrepared(id) => {
                 self.chat_widget.on_images_prepared(id);
             }
+            // The Cloud preview does not have a skills catalog.
+            AppEvent::CodexOp(AppCommand::ListSkills { .. })
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud => {}
             AppEvent::CodexOp(AppCommand::ListSkills { cwds, force_reload: true })
                 if self.awaiting_side_replay(tui)
                     && let Some(thread_id) = self.active_thread_id
@@ -3382,10 +3397,17 @@ impl App {
             AppEvent::StartSide {
                 parent_thread_id,
                 user_message,
+                mode,
             } => {
-                return self
-                    .handle_start_side(tui, app_server, parent_thread_id, user_message)
-                    .await;
+                return Box::pin(self.handle_start_side(tui, app_server, parent_thread_id, user_message, mode)).await;
+            }
+            AppEvent::SideCreated {
+                backend_id: _,
+                parent,
+                request,
+                result,
+            } => {
+                Box::pin(self.finish_side_creation(tui, app_server, parent, request, result)).await;
             }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();

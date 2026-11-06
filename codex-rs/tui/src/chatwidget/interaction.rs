@@ -263,39 +263,16 @@ impl ChatWidget {
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
             }
-            key if key.kind == KeyEventKind::Press
-                && ((matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
-                    && key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
-                    || (cfg!(windows) && key_hint::shift(KeyCode::Insert).is_press(key))) =>
-            {
-                if Instant::now() < self.suppress_image_paste_until {
-                    self.suppress_image_paste_until =
-                        Instant::now() + clipboard::IMAGE_PASTE_REPEAT_WINDOW;
-                    return KeyEventAction::None;
+            _ => {
+                if let Some(action) = self.image_paste_key_action(key_event) {
+                    return action;
                 }
-                self.suppress_image_paste_until =
-                    Instant::now() + clipboard::IMAGE_PASTE_REPEAT_WINDOW;
-                let text_fallback = (cfg!(windows)
-                    && (key.modifiers == KeyModifiers::CONTROL
-                        || key_hint::shift(KeyCode::Insert).is_press(key)))
-                .then_some(key.code);
-                if text_fallback.is_some() {
-                    self.bottom_pane.prepare_composer_clipboard_paste();
+                if key_event.kind == KeyEventKind::Press {
+                    self.bottom_pane.clear_quit_shortcut_hint();
+                    self.quit_shortcut_expires_at = None;
+                    self.quit_shortcut_key = None;
                 }
-                return KeyEventAction::PasteImage { text_fallback };
             }
-            other if other.kind == KeyEventKind::Press => {
-                self.suppress_image_paste_until = Instant::now();
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
-            }
-            other if other.kind == KeyEventKind::Release => {
-                self.suppress_image_paste_until = Instant::now();
-            }
-            _ => {}
         }
 
         if key_event.kind == KeyEventKind::Press
@@ -432,6 +409,10 @@ impl ChatWidget {
         self.bottom_pane.set_footer_hint_override(items);
     }
 
+    pub(crate) fn dismiss_provider_view(&mut self, id: &'static str) {
+        self.bottom_pane.dismiss_view_by_id(id);
+    }
+
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
         self.request_redraw();
@@ -473,6 +454,10 @@ impl ChatWidget {
 
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.bottom_pane.no_modal_or_popup_active()
+    }
+
+    pub(crate) fn completion_can_yield_focus(&self) -> bool {
+        self.bottom_pane.completion_can_yield_focus()
     }
 
     pub(crate) fn can_launch_external_editor(&self) -> bool {
@@ -619,7 +604,12 @@ impl ChatWidget {
 
     // Returns true if caller should skip rendering this frame (a future frame is scheduled).
     pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
-        if self.bottom_pane.flush_paste_burst_if_due() {
+        let flushed = self.bottom_pane.flush_paste_burst_if_due();
+        self.finish_paste_burst_tick(frame_requester, flushed)
+    }
+
+    fn finish_paste_burst_tick(&mut self, frame_requester: FrameRequester, flushed: bool) -> bool {
+        if flushed {
             self.refresh_startup_recovery();
             // A paste just flushed; request an immediate redraw and skip this frame.
             self.request_redraw();

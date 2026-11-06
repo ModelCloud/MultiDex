@@ -586,6 +586,9 @@ pub struct GetAccountParams {
 #[ts(export_to = "v2/")]
 pub struct GetAccountResponse {
     pub account: Option<Account>,
+    /// ChatGPT user ID belonging to this account response, when available.
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub requires_openai_auth: bool,
     #[experimental("account/read.workspaceRouting")]
     pub workspace_routing: Option<WorkspaceRouting>,
@@ -651,6 +654,30 @@ impl std::fmt::Debug for GatewayOAuthChangedNotification {
             .finish()
     }
 }
+
+/// Read credential readiness for a configured provider without starting browser login.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthReadParams {
+    /// Defaults to the current provider when omitted.
+    #[ts(optional = nullable)]
+    pub model_provider: Option<String>,
+}
+
+pub type NullableGatewayOAuthReadParams = Option<GatewayOAuthReadParams>;
+
+/// Authorize a configured provider without changing the default or any thread's provider.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthLoginParams {
+    /// Defaults to the current provider when omitted.
+    #[ts(optional = nullable)]
+    pub model_provider: Option<String>,
+}
+
+pub type NullableGatewayOAuthLoginParams = Option<GatewayOAuthLoginParams>;
 
 /// Current effective gateway policy and credential readiness; never contains credentials.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

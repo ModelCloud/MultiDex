@@ -2,6 +2,7 @@
 //! A capture has a fixed end; consumers acknowledge records only after their writes succeed.
 
 use anyhow::ensure;
+use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_history::RetainedContextEvent;
 use codex_history::RolloutItem;
@@ -12,21 +13,43 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_thread_store::OriginalHistoryRequest;
 use codex_thread_store::ThreadStore;
+use codex_utils_string::to_json_string_bounded;
+use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Arc;
 
 /// Position in the containing snapshot's root history, independent of channel routing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceId {
     pub ordinal: u64,
 }
 
-/// The original rollout record retains roles, call IDs and host provenance unchanged.
+impl EvidenceId {
+    /// Stable board idempotency key shared by the housekeeper and delivery.
+    pub(crate) fn request_id(self, channel: &str) -> anyhow::Result<String> {
+        Ok(to_json_string_bounded(
+            &(self.ordinal, channel),
+            /*max_bytes*/ 512,
+        )?)
+    }
+
+    pub(crate) fn from_request_id(request: &str, channel: &str) -> anyhow::Result<Self> {
+        let (ordinal, destination): (u64, String) = serde_json::from_str(request)?;
+        ensure!(
+            destination == channel,
+            "evidence request ID channel mismatch"
+        );
+        Ok(Self { ordinal })
+    }
+}
+
+/// Original model-visible evidence, with roles, call IDs and verified source order.
 /// Its contents are deliberately excluded from Debug output.
 #[derive(Serialize)]
 pub struct OriginalEvidence {
     pub id: EvidenceId,
-    pub original: RolloutItem,
+    original: RolloutItem,
     #[serde(skip)]
     end: HistoryPosition,
 }
@@ -44,6 +67,11 @@ pub struct EvidenceSnapshot {
 impl EvidenceSnapshot {
     pub fn thread_id(&self) -> ThreadId {
         self.thread_id
+    }
+
+    /// Exclusive durable source boundary to bind later retrieval to this capture.
+    pub fn cutoff(&self) -> HistoryPosition {
+        self.end
     }
 
     pub fn records(&self) -> &[OriginalEvidence] {
@@ -84,48 +112,14 @@ impl EvidenceCursor {
         let end = history.end;
         let mut records = Vec::new();
         for record in history.items {
-            let include = match &record.item {
-                RolloutItem::ResponseItem(envelope) => selected(envelope)?,
-                RolloutItem::RetainedContext(RetainedContextEvent::VerifiedAnswer {
-                    answer,
-                    ..
-                }) => {
-                    ensure!(!answer.questions.is_empty(), "incomplete verified answer");
-                    true
-                }
-                RolloutItem::RetainedContext(RetainedContextEvent::DeliveredAssistantMessage {
-                    message,
-                    ..
-                }) => {
-                    ensure!(message.complete, "incomplete delivered assistant message");
-                    true
-                }
-                RolloutItem::SessionMeta(_)
-                | RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
-                    anyhow::bail!("evidence history was replaced");
-                }
-                RolloutItem::RetainedContext(RetainedContextEvent::AcceptedFileAudio {
-                    ..
-                })
-                | RolloutItem::DynamicToolsUpdated { .. }
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::TokenUsageRecord(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::SecurityRiskScore(_)
-                | RolloutItem::EventMsg(_)
-                | RolloutItem::RealtimeItem(_) => false,
-            };
-            if include {
+            if let Some(original) = review_original(record.item)? {
                 records.push(OriginalEvidence {
                     id: EvidenceId {
                         ordinal: record.end.end_ordinal_exclusive.checked_sub(1).ok_or_else(
                             || anyhow::anyhow!("evidence record has no source ordinal"),
                         )?,
                     },
-                    original: record.item,
+                    original,
                     end: record.end,
                 });
             }
@@ -275,4 +269,52 @@ fn selected(envelope: &ResponseItemEnvelope) -> anyhow::Result<bool> {
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::Other => false,
     })
+}
+
+/// Select original evidence at intake and strip host-only metadata before routing.
+fn review_original(mut item: RolloutItem) -> anyhow::Result<Option<RolloutItem>> {
+    let include = match &item {
+        RolloutItem::ResponseItem(envelope) => selected(envelope)?,
+        RolloutItem::RetainedContext(RetainedContextEvent::VerifiedAnswer { answer, .. }) => {
+            ensure!(!answer.questions.is_empty(), "incomplete verified answer");
+            true
+        }
+        RolloutItem::RetainedContext(RetainedContextEvent::DeliveredAssistantMessage {
+            message,
+            ..
+        }) => {
+            ensure!(message.complete, "incomplete delivered assistant message");
+            true
+        }
+        RolloutItem::SessionMeta(_) | RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
+            anyhow::bail!("evidence history was replaced");
+        }
+        RolloutItem::RetainedContext(RetainedContextEvent::AcceptedFileAudio { .. })
+        | RolloutItem::DynamicToolsUpdated { .. }
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::TokenUsageRecord(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::EventMsg(_)
+        | RolloutItem::RealtimeItem(_) => false,
+    };
+    if !include {
+        return Ok(None);
+    }
+    if let RolloutItem::ResponseItem(envelope) = &mut item {
+        // Admission uses private host provenance. Keep only the source order in the
+        // copy seen by the housekeeper, board readers and reviewer.
+        envelope.metadata = envelope
+            .metadata
+            .take()
+            .and_then(|metadata| metadata.user_input_order)
+            .map(|order| CodexHarnessMetadata {
+                user_input_order: Some(order),
+                ..Default::default()
+            });
+    }
+    Ok(Some(item))
 }
