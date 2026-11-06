@@ -16,7 +16,6 @@ use crate::CodexAppsToolsCache;
 use crate::CodexThreadSettingsOverrides;
 use crate::agent::AgentStatus;
 use crate::agent::LocalAgentControl;
-use crate::agent::api::AgentConfigUpdate;
 use crate::agent::api::AgentControl;
 use crate::agent::control::AgentControlInit;
 use crate::agent::host::InheritedSessionId;
@@ -76,6 +75,8 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
 use codex_login::default_client::originator;
+use codex_model_provider::ModelCatalogFactory;
+use codex_model_provider::ProviderAuthContext;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::manager::RefreshStrategy;
@@ -85,6 +86,7 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -361,6 +363,20 @@ impl ThreadInstructionsProvider for InheritedThreadInstructions {
 }
 
 impl StartThreadOptions {
+    fn effective_sources(
+        &self,
+        default_source: &SessionSource,
+    ) -> (SessionSource, Option<ThreadSource>) {
+        let (resumed_source, resumed_thread_source) = self
+            .initial_history
+            .get_resumed_session_sources()
+            .unwrap_or_else(|| (default_source.clone(), None));
+        (
+            self.session_source.clone().unwrap_or(resumed_source),
+            self.thread_source.clone().or(resumed_thread_source),
+        )
+    }
+
     /// Use the spawning thread's applied text in place of the destination's live thread provider.
     /// An empty text clears the thread contribution. Supply it again on cold resume.
     pub fn set_inherited_thread_instructions(&mut self, instructions: Instructions) {
@@ -1054,6 +1070,29 @@ impl ThreadManager {
 
     /// Select the app-server catalog using the same owner as thread requests.
     pub fn models_manager_for_config(&self, config: &Config) -> SharedModelsManager {
+        self.state.model_catalog.for_config(
+            config,
+            config.model_catalog.as_ref(),
+            self.catalog_auth_context(config),
+            /*same_owner*/ true,
+        )
+    }
+
+    /// Build a separate catalog with the harness's runtime identity and the caller's cache policy.
+    pub fn temporary_models_manager_for_config(
+        &self,
+        config: &Config,
+        factory: &dyn ModelCatalogFactory,
+    ) -> SharedModelsManager {
+        factory.build(
+            self.catalog_auth_context(config)
+                .model_provider(config.model_provider.clone()),
+            config.model_catalog.clone(),
+            config.features.enabled(Feature::ApiKeyModelDiscovery),
+        )
+    }
+
+    fn catalog_auth_context(&self, config: &Config) -> ProviderAuthContext {
         let credentials = self.auth_manager();
         let runtime = crate::runtime_auth::runtime_for_config(
             &self.state.runtime_auth,
@@ -1061,13 +1100,50 @@ impl ThreadManager {
             Arc::clone(&credentials),
             &self.state.installation_id,
         );
-        self.state.model_catalog.for_config(
-            config,
-            config.model_catalog.as_ref(),
+        ProviderAuthContext {
             credentials,
-            runtime,
-            /*same_owner*/ true,
+            runtime_auth: runtime.map(|runtime| (runtime, config.runtime_auth_mode)),
+        }
+    }
+
+    /// Resolves the model before starting or cold-resuming a thread with this manager's credentials.
+    /// Pass the same options to [`Self::start_thread`]. For a live thread, use
+    /// [`CodexThread::selected_model_info`].
+    pub async fn resolve_startup_model(
+        &self,
+        options: &StartThreadOptions,
+    ) -> CodexResult<Arc<ModelInfo>> {
+        if options.internal_parent.is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "startup model lookup does not support a captured internal parent".to_owned(),
+            ));
+        }
+        let (source, _) = options.effective_sources(&self.state.session_source);
+        let originator = self
+            .state
+            .effective_originator(
+                &options.initial_history,
+                options.metrics_service_name.as_deref(),
+                &source,
+                /*parent_thread_id*/ None,
+                /*forked_from_thread_id*/ None,
+                /*parent_originator*/ None,
+            )
+            .await;
+        let manager = self.state.models_for_thread(
+            &options.config,
+            &self.state.auth_manager,
+            &self.state.runtime_auth,
+            &originator,
+        );
+        let (_, info) = Session::resolve_startup_model(
+            manager.as_ref(),
+            &options.config,
+            &source,
+            options.allow_provider_model_fallback,
         )
+        .await?;
+        Ok(info.model)
     }
 
     pub fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
@@ -1336,17 +1412,9 @@ impl ThreadManager {
         forked_from_thread_id: Option<ThreadId>,
         startup: Option<Arc<crate::session::startup::SessionStartup>>,
     ) -> CodexResult<NewThread> {
-        let (resumed_session_source, resumed_thread_source) = options
-            .initial_history
-            .get_resumed_session_sources()
-            .unwrap_or_else(|| (self.state.session_source.clone(), None));
-        options.session_source = Some(
-            options
-                .session_source
-                .take()
-                .unwrap_or(resumed_session_source),
-        );
-        options.thread_source = options.thread_source.take().or(resumed_thread_source);
+        let (session_source, thread_source) = options.effective_sources(&self.state.session_source);
+        options.session_source = Some(session_source);
+        options.thread_source = thread_source;
         let parent = options.internal_parent.take();
         if parent.is_some()
             && (!matches!(options.session_source, Some(SessionSource::Internal(_)))
@@ -1865,6 +1933,28 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    fn models_for_thread(
+        &self,
+        config: &Config,
+        auth_manager: &Arc<AuthManager>,
+        runtime_auth: &crate::runtime_auth::RuntimeAuthSlot,
+        originator: &str,
+    ) -> SharedModelsManager {
+        let runtime = crate::runtime_auth::runtime_for_config(
+            runtime_auth,
+            config,
+            Arc::clone(auth_manager),
+            &self.installation_id,
+        );
+        let manager = self.model_catalog.for_thread(
+            config,
+            Arc::clone(auth_manager),
+            runtime,
+            Arc::ptr_eq(auth_manager, &self.auth_manager),
+        );
+        manager.for_originator(originator).unwrap_or(manager)
+    }
+
     pub(crate) fn shared_thread_instructions_provider(
         &self,
         root_thread_id: ThreadId,
@@ -2560,11 +2650,6 @@ impl ThreadManagerState {
                 }) => Some(*parent_thread_id),
                 _ => None,
             });
-        // Host controllers can already be shared with live threads. Publish root settings
-        // only after registration succeeds, so a failed start cannot update their tree.
-        let initial_host_config = (self.agent_control_factory.is_some()
-            && parent_thread_id.is_none())
-        .then(|| AgentConfigUpdate::ServiceTier(config.service_tier.clone()));
         // Both resume entry points must restore identities before children can be loaded lazily.
         if let InitialHistory::Resumed(resumed) = &initial_history
             && initial_history.get_multi_agent_version() == Some(MultiAgentVersion::V2)
@@ -2737,21 +2822,12 @@ impl ThreadManagerState {
         } else {
             Arc::new(mcp_manager.for_plugins_manager(Arc::clone(&plugins_manager)))
         };
-        let runtime = crate::runtime_auth::runtime_for_config(
+        let models_manager = self.models_for_thread(
+            &config,
+            &auth_manager,
             &runtime_auth,
-            &config,
-            Arc::clone(&auth_manager),
-            &self.installation_id,
+            &startup_context.originator,
         );
-        let manager = self.model_catalog.for_thread(
-            &config,
-            Arc::clone(&auth_manager),
-            runtime,
-            Arc::ptr_eq(&auth_manager, &self.auth_manager),
-        );
-        let models_manager = manager
-            .for_originator(&startup_context.originator)
-            .unwrap_or(manager);
         let spawn_result = Session::spawn(SessionSpawnArgs {
             attached_thread,
             startup,
@@ -2845,7 +2921,7 @@ impl ThreadManagerState {
             }
         }
         let finalize_result = self
-            .finalize_thread_spawn(session, io, tracked_session_source, initial_host_config)
+            .finalize_thread_spawn(session, io, tracked_session_source)
             .await;
         let new_thread = match finalize_result {
             Ok(new_thread) => new_thread,
@@ -2877,7 +2953,6 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
-        initial_host_config: Option<AgentConfigUpdate>,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2898,23 +2973,31 @@ impl ThreadManagerState {
             .mcp_ema_cancellation()
             .clone();
         {
+            let pending_service_tier = if self.agent_control_factory.is_some()
+                || matches!(
+                    &session.agent_runtime,
+                    crate::agent::host::AgentRuntimeServices::Host(services)
+                        if services.service_tier.is_some()
+                ) {
+                session.lock_pending_service_tier().await
+            } else {
+                None
+            };
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
-                if let Some(update) = initial_host_config {
-                    session
-                        .services
-                        .agent_control
-                        .propagate_config_update(update);
-                }
                 ema_cancellation.publish();
                 let thread = Arc::new(CodexThread::new(
-                    session,
+                    Arc::clone(&session),
                     io,
                     ThreadStartupMetadata::from(&session_configured),
                     session_configured.rollout_path.clone(),
                     session_source,
                 ));
                 e.insert(thread.clone());
+                if let Some((mut state, update)) = pending_service_tier {
+                    crate::agent::host::propagate_config_update(&session, update);
+                    state.shared_service_tier_pending = false;
+                }
                 return Ok(NewThread {
                     thread_id,
                     thread,

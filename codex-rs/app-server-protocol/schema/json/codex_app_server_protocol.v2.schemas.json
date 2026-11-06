@@ -525,6 +525,17 @@
         }
       ]
     },
+    "AgentMessageModeration": {
+      "properties": {
+        "moderated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "moderated"
+      ],
+      "type": "object"
+    },
     "AgentPath": {
       "type": "string"
     },
@@ -3594,7 +3605,14 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GatewayOAuthReadParams"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -3617,7 +3635,14 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GatewayOAuthLoginParams"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -9069,9 +9094,35 @@
       "title": "GatewayOAuthChangedNotification",
       "type": "object"
     },
+    "GatewayOAuthLoginParams": {
+      "description": "Authorize a configured provider without changing the default or any thread's provider.",
+      "properties": {
+        "modelProvider": {
+          "description": "Defaults to the current provider when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "GatewayOAuthLoginResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "GatewayOAuthLoginResponse",
+      "type": "object"
+    },
+    "GatewayOAuthReadParams": {
+      "description": "Read credential readiness for a configured provider without starting browser login.",
+      "properties": {
+        "modelProvider": {
+          "description": "Defaults to the current provider when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "GatewayOAuthReadResponse": {
@@ -9224,6 +9275,14 @@
         },
         "requiresOpenaiAuth": {
           "type": "boolean"
+        },
+        "userId": {
+          "default": null,
+          "description": "ChatGPT user ID belonging to this account response, when available.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -12231,6 +12290,13 @@
             "integer",
             "null"
           ]
+        },
+        "modelProvider": {
+          "description": "List models for this configured provider instead of the app-server default.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "title": "ModelListParams",
@@ -12839,6 +12905,30 @@
         "compact"
       ],
       "type": "string"
+    },
+    "NullableGatewayOAuthLoginParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GatewayOAuthLoginParams"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Nullable_GatewayOAuthLoginParams"
+    },
+    "NullableGatewayOAuthReadParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GatewayOAuthReadParams"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Nullable_GatewayOAuthReadParams"
     },
     "NullableGetAccountRateLimitsParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -15134,6 +15224,16 @@
             "$ref": "#/definitions/UserInput"
           },
           "type": "array"
+        },
+        "responsesapiClientMetadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Metadata retained with this input, including across reconnect and restoration.",
+          "type": [
+            "object",
+            "null"
+          ]
         }
       },
       "required": [
@@ -21053,6 +21153,17 @@
               "anyOf": [
                 {
                   "$ref": "#/definitions/MemoryCitation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "moderation": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AgentMessageModeration"
                 },
                 {
                   "type": "null"

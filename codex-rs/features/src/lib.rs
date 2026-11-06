@@ -306,6 +306,8 @@ pub enum Feature {
     CommandSessionsWorldState,
     /// Track top-level tool definitions in world state and emit incremental context updates.
     IncrementalTools,
+    /// Publish incremental tool declarations on regular OpenAI Responses.
+    IncrementalToolsLegacy,
     /// Suppress the model ID announcement in incremental context after a model switch.
     SuppressModelChangeAnnouncements,
     /// Preserve inherited tool declarations in MCP-disabled prediction forks.
@@ -378,8 +380,7 @@ pub enum Feature {
     ComputerUse,
     /// Enable the PS-backed remote plugin catalog.
     RemotePlugin,
-    /// Prefetch the plugin directory, featured plugins, and recommendations at app-server startup.
-    /// Inventory-only hosts can disable this. Legacy suggestions read the cached directory.
+    /// Removed compatibility flag for plugin discovery prefetch.
     PluginDiscoveryPrefetch,
     /// Enable remote plugin sharing flows.
     PluginSharing,
@@ -770,7 +771,7 @@ impl Features {
                 "image_detail_original" | "resize_all_images" | "item_ids" => {
                     continue;
                 }
-                "personality" | "plugin_hooks" => {
+                "personality" | "plugin_discovery_prefetch" | "plugin_hooks" => {
                     continue;
                 }
                 "skill_env_var_dependency_prompt" => {
@@ -1320,14 +1321,14 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CodeModeHostGrpc,
         key: "code_mode_host_grpc",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodeModeHostOutputTruncation,
         key: "code_mode_host_output_truncation",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodeModePrewarm,
@@ -1800,6 +1801,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::IncrementalToolsLegacy,
+        key: "incremental_tools_legacy",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::SuppressModelChangeAnnouncements,
         key: "suppress_model_change_announcements",
         stage: Stage::Stable,
@@ -1952,8 +1959,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::PluginDiscoveryPrefetch,
         key: "plugin_discovery_prefetch",
-        stage: Stage::Stable,
-        default_enabled: true,
+        stage: Stage::Removed,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::PluginSharing,

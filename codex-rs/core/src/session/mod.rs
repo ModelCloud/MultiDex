@@ -3,6 +3,7 @@ pub(crate) mod startup;
 use crate::PromptCacheKey;
 use crate::WithTurnExtensionData;
 use crate::runtime_auth::RuntimeAuthSlot;
+use codex_login::AuthOwner;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -97,6 +98,7 @@ use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpRuntimeInput;
+use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_network_proxy::NetworkProxy;
@@ -140,6 +142,7 @@ use codex_protocol::models::ImageReference;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::openai_models::CatalogModel;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -204,6 +207,7 @@ use futures::prelude::*;
 use rmcp::model::RequestId;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -477,11 +481,11 @@ pub(crate) enum ForkPersistence {
 }
 
 /// Normal appends keep this generation; compaction and rollback start a new one.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct CompactionPrefix {
     pub(crate) generation: u64,
     pub(crate) len: usize,
-    pub(crate) auth_owner_generation: Option<u64>,
+    pub(crate) auth_owner: Option<AuthOwner>,
 }
 
 pub(crate) enum CompactedHistoryInstallation<'a> {
@@ -597,6 +601,44 @@ pub(crate) fn assign_missing_item_id(
 }
 
 impl Session {
+    pub(crate) async fn resolve_startup_model(
+        models_manager: &dyn ModelsManager,
+        config: &Config,
+        session_source: &SessionSource,
+        allow_provider_model_fallback: bool,
+    ) -> CodexResult<(String, CatalogModel)> {
+        let refresh_strategy = if session_source.is_non_root_agent() {
+            RefreshStrategy::Offline
+        } else {
+            RefreshStrategy::OnlineIfUncached
+        };
+        if config.features.enabled(Feature::RuntimeAgentInstances)
+            || config.model.is_none()
+            || refresh_strategy != RefreshStrategy::Offline
+        {
+            let _ = models_manager
+                .list_models(refresh_strategy, config.http_client_factory())
+                .await;
+        }
+        let model = models_manager
+            .get_default_model(
+                &config.model,
+                allow_provider_model_fallback,
+                refresh_strategy,
+                config.http_client_factory(),
+            )
+            .await;
+        if model.trim().is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
+            ));
+        }
+        let model_info = models_manager
+            .get_model_info(model.as_str(), &config.to_models_manager_config())
+            .await;
+        Ok((model, model_info))
+    }
+
     /// Spawn and initialize a new session.
     /// Hide the concrete startup future from callers while keeping initialization lazy.
     #[inline(never)]
@@ -782,35 +824,13 @@ impl Session {
             Arc::clone(&auth_manager),
             &installation_id,
         );
-        let refresh_strategy = if session_source.is_non_root_agent() {
-            codex_models_manager::manager::RefreshStrategy::Offline
-        } else {
-            codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
-        };
-        if configured_runtime.is_some()
-            || config.model.is_none()
-            || !matches!(
-                refresh_strategy,
-                codex_models_manager::manager::RefreshStrategy::Offline
-            )
-        {
-            let _ = models_manager
-                .list_models(refresh_strategy, config.http_client_factory())
-                .await;
-        }
-        let model = models_manager
-            .get_default_model(
-                &config.model,
-                allow_provider_model_fallback,
-                refresh_strategy,
-                config.http_client_factory(),
-            )
-            .await;
-        if model.trim().is_empty() {
-            return Err(CodexErr::InvalidRequest(
-                "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
-            ));
-        }
+        let (model, model_info) = Self::resolve_startup_model(
+            models_manager.as_ref(),
+            &config,
+            &session_source,
+            allow_provider_model_fallback,
+        )
+        .await?;
         let requested_approvals_reviewer = config
             .requested_approvals_reviewer
             .unwrap_or(config.approvals_reviewer);
@@ -822,11 +842,17 @@ impl Session {
             .auto_review_required_for_model(&model)
             && !trusted_guardian_reviewer
         {
-            let config = Arc::make_mut(&mut config);
-            if matches!(
-                config.legacy_sandbox_policy(),
-                SandboxPolicy::DangerFullAccess
-            ) {
+            let permission_profile = config.permissions.effective_permission_profile();
+            if permission_profile.enforcement() != SandboxEnforcement::External
+                && permission_profile.network_sandbox_policy().is_enabled()
+                && {
+                    let file_system = permission_profile.file_system_sandbox_policy();
+                    file_system.has_full_disk_write_access()
+                        // Preserve the legacy fallback for writable URIs that cannot be projected locally.
+                        && file_system.entries.iter().all(|entry| entry.legacy_writable_path().is_ok())
+                }
+            {
+                let config = Arc::make_mut(&mut config);
                 let permission_profile = PermissionProfile::workspace_write();
                 config
                     .permissions
@@ -864,13 +890,6 @@ impl Session {
             );
         }
 
-        // Resolve base instructions for the session. Priority order:
-        // 1. config.base_instructions override
-        // 2. conversation history => session_meta.base_instructions
-        // 3. rendered instructions_template for current model
-        let model_info = models_manager
-            .get_model_info(model.as_str(), &config.to_models_manager_config())
-            .await;
         let auth = auth_manager.auth_cached();
         // Forked subagents keep their parent's activation with the copied history.
         // Fresh children restore configured preferences before applying startup defaults.
@@ -2254,8 +2273,9 @@ impl Session {
                     .swap(manager.for_originator(&originator).unwrap_or(manager));
             }
             state.session_configuration = updated;
-            if root_service_tier_changed {
-                self.services.agent_control.propagate_config_update(
+            if root_service_tier_changed && !state.shared_service_tier_pending {
+                crate::agent::host::propagate_config_update(
+                    self,
                     AgentConfigUpdate::ServiceTier(
                         state
                             .session_configuration
@@ -2323,6 +2343,21 @@ impl Session {
             .await)
     }
 
+    pub(crate) async fn selected_model_info(&self) -> Arc<ModelInfo> {
+        let (settings, overrides) = {
+            let state = self.state.lock().await;
+            let config = &state.session_configuration;
+            (
+                Arc::clone(&config.step_settings),
+                config.model_info_overrides.clone(),
+            )
+        };
+        settings
+            .resolve_model_info(self.services.models_manager.as_ref(), &overrides)
+            .await
+            .model
+    }
+
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         self.resume_config_snapshot().await.0
     }
@@ -2358,6 +2393,25 @@ impl Session {
         state
             .session_configuration
             .thread_settings_snapshot(&state.session_configuration.environments)
+    }
+
+    /// Keep this guard through registration and publication to order the initial tier
+    /// with settings commits from the already-running submission loop.
+    pub(crate) async fn lock_pending_service_tier(
+        &self,
+    ) -> Option<(MutexGuard<'_, SessionState>, AgentConfigUpdate)> {
+        let state = self.state.lock().await;
+        if !state.shared_service_tier_pending {
+            return None;
+        }
+        let update = AgentConfigUpdate::ServiceTier(
+            state
+                .session_configuration
+                .step_settings
+                .service_tier
+                .clone(),
+        );
+        Some((state, update))
     }
 
     pub(crate) async fn restorable_thread_settings(&self) -> CodexThreadSettingsOverrides {
@@ -4296,6 +4350,18 @@ impl Session {
         .await
     }
 
+    fn inherits_root_service_tier(&self, session_source: &SessionSource) -> bool {
+        match &self.agent_runtime {
+            crate::agent::host::AgentRuntimeServices::Controller => matches!(
+                session_source,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+            ),
+            crate::agent::host::AgentRuntimeServices::Host(_) => {
+                crate::agent::host::host_child_uses_shared_service_tier(self)
+            }
+        }
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "step settings and both environment snapshots must be captured under active_turn then state"
@@ -4326,11 +4392,9 @@ impl Session {
                     .then(|| self.services.turn_environments.configured_snapshot_now()),
             )
         };
-        if matches!(
-            turn_context.session_source,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        ) {
-            let root_service_tier = self.services.agent_control.service_tier();
+        if self.inherits_root_service_tier(&turn_context.session_source) {
+            let root_service_tier =
+                crate::agent::host::service_tier(self, settings.selected().service_tier.clone());
             if settings.selected().service_tier != root_service_tier {
                 let mut selected = settings.selected().clone();
                 selected.service_tier = root_service_tier;
@@ -4795,8 +4859,7 @@ impl Session {
                     // Validate immediately before slicing and replacing the captured prefix.
                     if state.history.history_version() != prefix.generation
                         || state.history.annotated_items().len() < prefix.len
-                        || self.services.model_client.auth_owner_generation()
-                            != prefix.auth_owner_generation
+                        || self.services.model_client.auth_owner() != prefix.auth_owner
                     {
                         return false;
                     }

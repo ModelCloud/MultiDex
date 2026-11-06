@@ -1,6 +1,7 @@
 //! Adapts native Cloud requests and the currently open conversation’s reply stream.
 //! A replacement becomes active only after its native attachment opens successfully.
 
+mod auth;
 mod events;
 mod requests;
 
@@ -19,12 +20,18 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub use auth::connect;
+
 type ReplyStream = BoxStream<'static, Result<cloud::Event, cloud::Error>>;
 
 /// Rejected locally before an admission request can be sent.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct PreflightRejection(&'static str);
+
+#[derive(Debug, thiserror::Error)]
+#[error("Cloud stream is not connected. Reopen the conversation before sending.")]
+struct MissingReplyAttachment;
 
 struct Attachment {
     thread_id: String,
@@ -124,7 +131,7 @@ impl Replies {
         &mut self,
         id: &str,
         output: &mpsc::UnboundedSender<AppServerEvent>,
-    ) -> Result<(), PreflightRejection> {
+    ) -> Result<(), MissingReplyAttachment> {
         // Notice a ready disconnect before sending. A continuous stream of events
         // must still allow commands to make progress.
         let _ = tokio::task::unconstrained(self.forward_next(output)).now_or_never();
@@ -133,16 +140,14 @@ impl Replies {
             .as_ref()
             .is_none_or(|active| active.thread_id != id)
         {
-            return Err(PreflightRejection(
-                "Cloud stream is not connected. Reopen the conversation before sending.",
-            ));
+            return Err(MissingReplyAttachment);
         }
         Ok(())
     }
 }
 
 /// Opens an app-server client backed by the authenticated native Cloud client.
-pub fn connect(client: cloud::Client, account: protocol::GetAccountResponse) -> AppServerClient {
+fn start_worker(client: cloud::Client, account: protocol::GetAccountResponse) -> AppServerClient {
     let (app_client, commands, output) = CloudClient::channel(/*capacity*/ 32);
     let mut requests = requests::Requests {
         client,
@@ -175,7 +180,21 @@ async fn run_worker(
                 let _ = command.response.send(Ok(Ok(Value::Null)));
                 return;
             }
-            CloudOperation::Request(request) => Ok((*request, cloud::SubmissionMode::StartIfIdle)),
+            CloudOperation::Request(request) => {
+                Ok((*request, cloud::SubmissionMode::StartIfIdle, None))
+            }
+            CloudOperation::StartProjectThread {
+                request_id,
+                params,
+                project,
+            } => Ok((
+                protocol::ClientRequest::ThreadStart {
+                    request_id,
+                    params: *params,
+                },
+                cloud::SubmissionMode::StartIfIdle,
+                Some(project),
+            )),
             CloudOperation::SubmitUserMessage(params) => Ok((
                 protocol::ClientRequest::TurnStart {
                     // Native admission is keyed by the caller's stable message ID.
@@ -183,6 +202,7 @@ async fn run_worker(
                     params: *params,
                 },
                 cloud::SubmissionMode::Steer,
+                None,
             )),
             CloudOperation::Notify(_) => {
                 Err(eyre!("Cloud client notifications are not supported yet."))
@@ -192,9 +212,9 @@ async fn run_worker(
             )),
         };
         let result = match request {
-            Ok((request, mode)) => tokio::select! {
+            Ok((request, mode, project)) => tokio::select! {
                 _ = output.closed() => return,
-                result = handle_request(request, mode, requests, replies, output) => result,
+                result = handle_request(request, mode, project, requests, replies, output) => result,
             },
             Err(error) => Err(error),
         };
@@ -204,12 +224,13 @@ async fn run_worker(
                 .is_some()
             {
                 -32601
-            } else if user_message_submission
-                && (error.is::<PreflightRejection>()
-                    || matches!(
-                        error.downcast_ref::<cloud::MutationError>(),
-                        Some(cloud::MutationError::InvalidRequest)
-                    ))
+            } else if error.is::<PreflightRejection>()
+                || user_message_submission
+                    && (error.is::<MissingReplyAttachment>()
+                        || matches!(
+                            error.downcast_ref::<cloud::MutationError>(),
+                            Some(cloud::MutationError::InvalidRequest)
+                        ))
             {
                 -32602
             } else {
@@ -225,6 +246,7 @@ async fn run_worker(
 async fn handle_request(
     request: protocol::ClientRequest,
     mode: cloud::SubmissionMode,
+    project: Option<cloud::ProjectEnvironment>,
     requests: &mut requests::Requests,
     replies: &mut Replies,
     output: &mpsc::UnboundedSender<AppServerEvent>,
@@ -250,7 +272,7 @@ async fn handle_request(
         replies.admit_turn(&params.thread_id, output)?;
     }
     match replies
-        .while_listening(requests.handle(request, mode, output), output)
+        .while_listening(requests.handle(request, mode, project, output), output)
         .await?
     {
         requests::Response::Value(value) => Ok(value),

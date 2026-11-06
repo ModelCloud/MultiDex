@@ -20,6 +20,7 @@ export type { AdditionalNetworkPermissions } from "./AdditionalNetworkPermission
 export type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile";
 export type { AgentMessageDelivery } from "./AgentMessageDelivery";
 export type { AgentMessageDeltaNotification } from "./AgentMessageDeltaNotification";
+export type { AgentMessageModeration } from "./AgentMessageModeration";
 export type { AllowDenyRequirement } from "./AllowDenyRequirement";
 export type { AnalyticsConfig } from "./AnalyticsConfig";
 export type { AppBranding } from "./AppBranding";
@@ -208,7 +209,9 @@ export type { FsWriteFileResponse } from "./FsWriteFileResponse";
 export type { GatewayAuth } from "./GatewayAuth";
 export type { GatewayOAuthCancelResponse } from "./GatewayOAuthCancelResponse";
 export type { GatewayOAuthChangedNotification } from "./GatewayOAuthChangedNotification";
+export type { GatewayOAuthLoginParams } from "./GatewayOAuthLoginParams";
 export type { GatewayOAuthLoginResponse } from "./GatewayOAuthLoginResponse";
+export type { GatewayOAuthReadParams } from "./GatewayOAuthReadParams";
 export type { GatewayOAuthReadResponse } from "./GatewayOAuthReadResponse";
 export type { GatewayOAuthStatus } from "./GatewayOAuthStatus";
 export type { GcpProviderId } from "./GcpProviderId";

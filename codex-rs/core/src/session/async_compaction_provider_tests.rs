@@ -48,10 +48,10 @@ async fn multidex_base_client_does_not_override_background_turn_provider(change_
         .expect("unshared session")
         .services
         .model_client = local_client;
-    let base_auth_owner = sess.services.model_client.auth_owner_generation();
+    let base_auth_owner = sess.services.model_client.auth_owner();
     assert_eq!(base_auth_owner, None);
     let model_client = sess.model_client_for_provider(&turn.provider).await;
-    let auth_owner = model_client.auth_owner_generation();
+    let auth_owner = model_client.auth_owner();
     assert!(auth_owner.is_some());
 
     let request = responses::mount_sse_once(
@@ -129,12 +129,12 @@ async fn multidex_base_client_does_not_override_background_turn_provider(change_
 
     if change_auth_owner {
         sess.services.auth_manager.reload().await;
-        assert_ne!(model_client.auth_owner_generation(), auth_owner);
+        assert_ne!(model_client.auth_owner(), auth_owner);
     }
     let candidate = wait_for_pending(&sess, &step).await;
     assert_eq!(candidate.is_some(), !change_auth_owner);
     if let Some(candidate) = candidate {
-        assert_eq!(candidate.prefix.auth_owner_generation, auth_owner);
+        assert_eq!(candidate.prefix.auth_owner, auth_owner);
     }
     shutdown(&sess).await;
 }

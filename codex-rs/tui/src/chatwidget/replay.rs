@@ -306,6 +306,7 @@ impl ChatWidget {
                 if self.complete_realtime_delegated_agent_item(
                     &turn_id,
                     &ThreadItemPayload::AgentMessage {
+                        moderation: None,
                         id: id.clone(),
                         text: text.clone(),
                         phase: phase.clone(),
@@ -319,6 +320,7 @@ impl ChatWidget {
                 }
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
+                        moderation: None,
                         id,
                         content: vec![AgentMessageContent::Text { text }],
                         phase,
@@ -426,10 +428,9 @@ impl ChatWidget {
                         &output,
                     )
                 {
-                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
-                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
-                        "• ".dim(),
-                        "  ",
+                    self.add_to_history(history_cell::DelegatedMessageCell::new(
+                        &source_thread_id,
+                        prompt,
                     ));
                 }
             }

@@ -81,6 +81,8 @@ impl ReasoningEffortPin {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Shared root tier publication starts when the runtime wins registration.
+    pub(crate) shared_service_tier_pending: bool,
     /// Catalog to carry across compaction, independent of an explicit resume override.
     pub(crate) persisted_dynamic_tools: Arc<[DynamicToolSpec]>,
     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
@@ -160,6 +162,7 @@ impl SessionState {
             active_disabled_plugin_ids: Vec::new(),
             persisted_dynamic_tools: Arc::clone(&session_configuration.dynamic_tools),
             session_configuration,
+            shared_service_tier_pending: false,
             base_instructions_provenance: None,
             history,
             pending_audio_duration_ids: BTreeSet::new(),

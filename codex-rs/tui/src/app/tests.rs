@@ -129,6 +129,9 @@ use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::nth_user_position;
 use crate::app_backtrack::user_count;
 use crate::app_event::HistoryBatchEntryResponse;
+use crate::app_server_session::user_message_submission::ActiveTurnSteerRace;
+use crate::app_server_session::user_message_submission::active_turn_not_steerable_turn_error;
+use crate::app_server_session::user_message_submission::active_turn_steer_race;
 use crate::test_support::boxed_future;
 use codex_app_server_protocol::ThreadItem;
 
@@ -3324,7 +3327,7 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()> 
 
 #[tokio::test]
 async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()> {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
     // Both pane footers should fit the same way on Unix and Windows.
     std::fs::write(
         &app.local_settings.user_config_path,
@@ -3337,7 +3340,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         config.codex_home.join("config.toml"),
         // Each thread reloads this footer. Omit the platform-specific working directory.
         format!(
-            "openai_base_url = '{}/v1'\n[tui]\nstatus_line = ['model-with-reasoning']",
+            "openai_base_url = '{}/v1'\ndefault_permissions = ':workspace'\n[permissions.side-reader]\nextends = ':read-only'\n[tui]\nstatus_line = ['model-with-reasoning']",
             model.uri()
         ),
     )?;
@@ -3381,7 +3384,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         app.chat_widget.config_ref(),
     ));
     let read_only = PermissionProfileSelection {
-        profile_id: ":read-only".into(),
+        profile_id: "side-reader".into(),
         approval_policy: Some(AskForApproval::OnRequest),
         approvals_reviewer: Some(ApprovalsReviewer::User),
         display_label: "Read Only".into(),
@@ -3389,17 +3392,118 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     app.select_permission_profile(&mut app_server, read_only.clone())
         .await;
 
+    enable_side_retention(&mut app)?;
+    app.local_settings.tui.animations = false;
+    tui.set_owned_screen(/*owned*/ true)?;
     let control = Box::pin(app.handle_start_side(
         &mut tui,
         &mut app_server,
         parent_thread_id,
         Some("Side question".into()),
+        crate::app_event::SideStartMode::Reuse,
     ))
     .await?;
 
-    let side_thread_id = app
-        .active_thread_id
-        .expect("side conversation should become active");
+    // The config refresh reloads workspace preferences from the fixture home.
+    enable_side_retention(&mut app)?;
+    app.local_settings.tui.animations = false;
+    // Hold the completion in the event queue while painting the pending sidebar.
+    let pending = side_frame(&mut app, &mut tui, Size::new(120, 12))?;
+    let loading = pending
+        .lines()
+        .find(|row| row.contains("Starting side chat"))
+        .unwrap();
+    insta::assert_snapshot!(loading.split_once('│').unwrap().1.trim(), @"◌ Starting side chat…");
+    // Finish in the background, then change the parent's permissions before the first child turn.
+    app.sidebar_mut()
+        .show(sidebar::SidebarContent::Chooser, sidebar::PaneFocus::Main);
+    let resize_size = Size::new(/*width*/ 120, /*height*/ 12);
+    let original_terminal = std::mem::replace(
+        &mut tui.terminal,
+        crate::tui::Terminal::with_screen_size_and_cursor_position_for_test(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            resize_size,
+            Default::default(),
+        ),
+    );
+    app.chat_widget
+        .apply_external_edit("unsent parent draft".into());
+    side_frame(&mut app, &mut tui, resize_size)?;
+    app.begin_pane_resize(&mut tui)?;
+    assert!(app.pane_resize.is_some());
+    loop {
+        let event = time::timeout(Duration::from_secs(5), app_event_rx.recv())
+            .await?
+            .expect("event stream");
+        let created = matches!(event, AppEvent::SideCreated { .. });
+        boxed_future!(app.handle_event(&mut tui, &mut app_server, event)).await?;
+        if created {
+            assert!(app.side_thread_for_parent(parent_thread_id).is_some());
+            break;
+        }
+    }
+    // SideCreated has just replaced the chooser. Enter still finishes the resize.
+    boxed_future!(app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyCode::Enter.into())
+    ))
+    .await?;
+    assert!(app.pane_resize.is_none());
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "unsent parent draft"
+    );
+    while let Ok(event) = app_event_rx.try_recv() {
+        assert!(!matches!(
+            event,
+            AppEvent::CodexOp(AppCommand::UserTurn { .. })
+        ));
+        boxed_future!(app.handle_event(&mut tui, &mut app_server, event)).await?;
+    }
+    assert!(
+        !std::iter::from_fn(|| op_rx.try_recv().ok()).any(|op| matches!(op, Op::UserTurn { .. }))
+    );
+    tui.terminal = original_terminal;
+    app.chat_widget.apply_external_edit(String::new());
+    let side_thread_id = app.side_thread_for_parent(parent_thread_id).unwrap();
+    assert_eq!(app.active_thread_id, Some(parent_thread_id));
+    assert_eq!(
+        app.agents_overview
+            .selected_permission_profiles
+            .get(&side_thread_id),
+        Some(&read_only.profile_id)
+    );
+    app.select_permission_profile(
+        &mut app_server,
+        PermissionProfileSelection {
+            profile_id: ":danger-full-access".into(),
+            display_label: "Full access".into(),
+            ..read_only.clone()
+        },
+    )
+    .await;
+    let mut saw_thread_started = false;
+    loop {
+        let event = app_server.next_event().await.expect("app-server event");
+        let mut parent_changed = false;
+        if let codex_app_server_client::AppServerEvent::ServerNotification(n) = &event.event {
+            saw_thread_started |= matches!(n.as_ref(), ServerNotification::ThreadStarted(started) if started.thread.id == side_thread_id.to_string());
+            parent_changed = matches!(n.as_ref(), ServerNotification::ThreadSettingsUpdated(settings)
+                if settings.thread_id == parent_thread_id.to_string()
+                    && settings.thread_settings.active_permission_profile.as_ref().is_some_and(|p| p.id == ":danger-full-access"));
+        }
+        app.handle_backend_event(&app_server, event).await;
+        if parent_changed {
+            break;
+        }
+    }
+    app.select_agent_thread(&mut tui, &mut app_server, side_thread_id)
+        .await?;
+    assert_eq!(
+        app.config.permissions.permission_profile(),
+        &PermissionProfile::read_only()
+    );
     assert!(matches!(control, AppRunControl::Continue));
     assert_ne!(side_thread_id, parent_thread_id);
     assert!(app.side_threads.contains_key(&side_thread_id));
@@ -3430,7 +3534,6 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         assert_eq!(app.active_thread_id, Some(expected));
     }
 
-    let mut saw_thread_started = false;
     loop {
         let event = time::timeout(
             std::time::Duration::from_secs(/*secs*/ 2),
@@ -3476,6 +3579,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     app.app_event_tx.send(AppEvent::StartSide {
         parent_thread_id,
         user_message: None,
+        mode: crate::app_event::SideStartMode::Reuse,
     });
     assert!(!app.can_read_terminal_after_thread_switch(&tui, &app_event_rx));
     drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
@@ -3650,6 +3754,28 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         format!("Inactive\n{inactive}\n\nFocused\n{focused}")
     );
 
+    keys!(leader, KeyCode::Char('t').into());
+    assert!(!tui.has_deferred_thread_switch_clear());
+    let chooser = side_frame(&mut app, &mut tui, size)?;
+    assert_app_snapshot!(
+        "sidebar_existing_chat",
+        chooser
+            .lines()
+            .filter_map(|line| line.split_once('│').map(|(_, sidebar)| sidebar.trim_end()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let sidebar_x = app.conversation_frame.chooser_area().unwrap().x;
+    app.local_settings.tui.animations = true;
+    keys!(KeyCode::Enter.into());
+    assert!(!tui.has_deferred_thread_switch_clear());
+    assert_eq!(app.current_displayed_thread_id(), Some(side_thread_id));
+    // A press-only terminal reports held Enter as another press after the replay.
+    keys!(KeyCode::Enter.into());
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "child draft!");
+    assert!(side_frame(&mut app, &mut tui, size)?.contains(child_row));
+    assert_eq!(app.conversation_frame.chat_strip.unwrap().x, sidebar_x);
+    app.local_settings.tui.animations = false;
     // The pending permission change refuses a parent switch even though selection returns Ok.
     app.pending_server_profiles
         .insert(side_thread_id, read_only.clone());
@@ -3757,7 +3883,8 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
                 &mut tui,
                 &mut app_server,
                 parent_thread_id,
-                /*user_message*/ None
+                /*user_message*/ None,
+                crate::app_event::SideStartMode::Reuse,
             ))
             .await?;
             drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
@@ -4190,6 +4317,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     app.enqueue_thread_notification(parent, delta).await?;
     let streaming = side_frame(&mut app, &mut tui, size)?;
     let item = ThreadItemPayload::AgentMessage {
+        moderation: None,
         id: "reply".into(),
         text: "Already visible while unfocused.".into(),
         phase: None,
@@ -4342,8 +4470,30 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
             .contains("Feedback recorded (no logs).")
     }));
 
+    // A completion restored with the parent draft must not receive the chooser's Enter.
+    let child_draft = app.chat_widget.composer_text_with_pending();
+    keys!(prefix, main);
+    app.chat_widget.set_composer_cursor(/*cursor*/ 0);
+    let kill_line = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+    for _ in 0..app.chat_widget.composer_text_with_pending().lines().count() {
+        keys!(kill_line, kill_line);
+    }
+    app.chat_widget.insert_str("/qui");
+    keys!(
+        KeyCode::Esc.into(),
+        prefix,
+        side,
+        prefix,
+        KeyCode::Char('t').into()
+    );
+    assert!(!app.chat_widget.no_modal_or_popup_active());
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "/qui");
+    keys!(KeyCode::Enter.into());
+    assert_eq!(app.current_displayed_thread_id(), Some(side_thread_id));
+    assert_eq!(app.chat_widget.composer_text_with_pending(), child_draft);
+
     // Copy a retained range with the child composer still focused.
-    app.transcript_view.jump_to_latest();
+    side_frame(&mut app, &mut tui, even)?;
     let parent = app.side_companions.get_mut(&parent_thread_id).unwrap();
     parent.view.jump_to_latest();
     assert!(parent.view.begin_select_mode(&parent.cells));
@@ -4354,6 +4504,151 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     keys!(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL));
     assert!(tui.clipboard.is_busy());
     assert_eq!(app.current_displayed_thread_id(), Some(side_thread_id));
+
+    // Open a sibling from the chooser, then revisit each retained conversation.
+    let chooser_key = KeyEvent::from(KeyCode::Char('t'));
+    let [up, down, enter] =
+        [KeyCode::Char('k'), KeyCode::Char('j'), KeyCode::Enter].map(KeyEvent::from);
+    side_frame(&mut app, &mut tui, even)?;
+    let sidebar_x = app.conversation_frame.chat_strip.unwrap().x;
+    keys!(prefix, chooser_key, down, enter);
+    app.local_settings.tui.keymap = toml::from_str("[global]\nleader = 'f12'")?;
+    enable_side_retention(&mut app)?;
+    app.local_settings.tui.animations = false;
+    while app.current_displayed_thread_id() == Some(parent_thread_id) {
+        let event = time::timeout(Duration::from_secs(5), app_event_rx.recv())
+            .await?
+            .expect("side creation event");
+        boxed_future!(app.handle_event(&mut tui, &mut app_server, event)).await?;
+    }
+    let sibling = app.current_displayed_thread_id().expect("new side chat");
+    assert_ne!(sibling, side_thread_id);
+    drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
+    read_side_history(&mut app, &mut tui, "sibling")?;
+    app.chat_widget.insert_str("sibling draft");
+    let frame = side_frame(&mut app, &mut tui, even)?;
+    let header = frame.lines().next().unwrap().split_once('│').unwrap().1;
+    assert_app_snapshot!("side_chat_tabs", header.trim_end());
+    assert_eq!(app.conversation_frame.chat_strip.unwrap().x, sidebar_x);
+
+    keys!(prefix, chooser_key, up, enter);
+    assert_eq!(app.current_displayed_thread_id(), Some(side_thread_id));
+    assert_eq!(app.chat_widget.composer_text_with_pending(), child_draft);
+    assert!(side_frame(&mut app, &mut tui, even)?.contains(child_row));
+    let strip = app.conversation_frame.chat_strip.unwrap();
+    let down = MouseEventKind::Down(MouseButton::Left);
+    let click = mouse(down, strip.x + 12, strip.y);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, click)).await?;
+    drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
+    assert_eq!(app.current_displayed_thread_id(), Some(sibling));
+    assert!(!tui.has_deferred_thread_switch_clear());
+    let draft = app.chat_widget.composer_text_with_pending();
+    assert_eq!(draft, "sibling draft");
+    assert!(side_frame(&mut app, &mut tui, even)?.contains("sibling-24"));
+
+    let colors = crate::terminal_probe::DefaultColors {
+        fg: (224, 224, 224),
+        bg: (20, 20, 20),
+    };
+    let mut tab_styles = Vec::new();
+    let mut redraws = crate::tui::test_support::record_frame_requests(&mut tui);
+    for (focus, owner) in [("sidebar", sibling), ("main", parent_thread_id)] {
+        assert_eq!(app.current_displayed_thread_id(), Some(owner));
+        side_frame(&mut app, &mut tui, even)?;
+        let strip = app.conversation_frame.chat_strip.unwrap();
+        let (tabs, _) = app
+            .sidebar()
+            .unwrap()
+            .chat_tabs()
+            .strip()
+            .strip_targets(strip);
+        let [inactive, selected] = tabs
+            .map(|(_, _, area)| area.x + 1)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("both side-chat tabs are visible");
+        for (state, column, row, palette, redraw) in [
+            ("rest", selected, strip.y + 1, Some(colors), None),
+            ("hover", inactive, strip.y, Some(colors), Some(true)),
+            ("fallback", inactive + 1, strip.y, None, Some(false)),
+            ("selected", selected, strip.y, Some(colors), Some(true)),
+            ("leave", selected, strip.y + 1, Some(colors), Some(false)),
+        ] {
+            while redraws.try_recv().is_ok() {}
+            let event = mouse(MouseEventKind::Moved, column, row);
+            boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, event)).await?;
+            if let Some(redraw) = redraw {
+                assert_eq!(redraws.try_recv().is_ok(), redraw, "{focus} {state}");
+            }
+            crate::terminal_palette::with_test_default_colors(palette, || {
+                side_frame(&mut app, &mut tui, even)
+            })?;
+            let buffer = tui.terminal.previous_buffer();
+            let style = |x| {
+                let cell = &buffer[(x, strip.y)];
+                format!("{:?}/{:?}/{:?}", cell.fg, cell.bg, cell.modifier)
+            };
+            tab_styles.push(format!(
+                "{focus} {state}  inactive {}  selected {}",
+                style(inactive),
+                style(selected),
+            ));
+        }
+        if owner == sibling {
+            keys!(prefix, KeyCode::Char('r').into());
+            assert!(app.pane_resize.is_some());
+            let event = mouse(MouseEventKind::Moved, inactive, strip.y);
+            boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, event)).await?;
+            assert_eq!(app.hovered_sidebar_tab(tui.link_hover.position()), None);
+            keys!(KeyCode::Esc.into(), prefix, main);
+        }
+    }
+    assert_app_snapshot!("side_chat_tab_hover", tab_styles.join("\n"));
+
+    app.chat_widget
+        .dispatch_command(crate::slash_command::SlashCommand::Side);
+    drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
+    assert_eq!(app.current_displayed_thread_id(), Some(sibling));
+    assert_eq!(app.side_threads.len(), 2);
+
+    keys!(prefix, chooser_key, prefix, KeyCode::Char('=').into());
+    side_frame(&mut app, &mut tui, even)?;
+    assert_eq!(app.conversation_frame.chooser_area().unwrap().width, 100);
+    keys!(prefix, KeyCode::Char('r').into(), KeyCode::Left.into());
+    let frame = side_frame(&mut app, &mut tui, even)?;
+    let (_, hint) = frame
+        .lines()
+        .last()
+        .and_then(|row| row.split_once('│'))
+        .expect("sidebar footer");
+    insta::assert_snapshot!(hint.trim(), @"Resize · ←/h →/l · Shift+←/→ 10 cols · Enter/Esc done");
+    keys!(KeyCode::Esc.into());
+    side_frame(&mut app, &mut tui, even)?;
+    let divider = divider_at(&tui, 4);
+    // An even sidebar width at 200 columns survives the saved percentage round trip.
+    let target = divider - 11;
+    let left = MouseButton::Left;
+    for (kind, x) in [
+        (MouseEventKind::Down(left), divider),
+        (MouseEventKind::Drag(left), target),
+        (MouseEventKind::Up(left), target),
+    ] {
+        boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, mouse(kind, x, /*row*/ 4)))
+            .await?;
+    }
+    assert!(side_frame(&mut app, &mut tui, even)?.contains("Open in sidebar"));
+    assert_eq!(divider_at(&tui, 4), target);
+    keys!(enter);
+    side_frame(&mut app, &mut tui, even)?;
+    assert!(app.conversation_frame.side_pane().is_some());
+    assert_eq!(divider_at(&tui, 4), target);
+    // A focused child has only its tab strip at this height.
+    let strip = side_pane::split_layout(&app, &tui, Rect::new(0, 0, even.width, 1)).unwrap();
+    assert_eq!(strip.divider_area(), Some(Rect::new(target, 0, 1, 1)));
+    keys!(prefix, chooser_key);
+    side_frame(&mut app, &mut tui, even)?;
+    assert!(app.conversation_frame.chooser_area().is_some());
+    assert_eq!(divider_at(&tui, 4), target);
 
     app_server.shutdown().await?;
     Ok(())
@@ -5333,6 +5628,19 @@ async fn side_defers_parent_approval_overlay_until_parent_replay() -> Result<()>
 
     assert_eq!(app.chat_widget.has_active_view(), true);
 
+    enable_side_retention(&mut app)?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    app.sidebar_mut().show(
+        super::sidebar::SidebarContent::Chooser,
+        super::sidebar::PaneFocus::Sidebar,
+    );
+    let frame = side_frame(&mut app, &mut tui, Size::new(/*width*/ 80, /*height*/ 18))?;
+    assert!(
+        frame.contains("Yes, proceed") && !frame.contains("Open in sidebar"),
+        "{frame}"
+    );
+
     Ok(())
 }
 
@@ -5722,6 +6030,7 @@ async fn active_thread_file_change_approval_recovers_buffered_changes() {
                 thread_id.to_string(),
                 "turn-active-approval".to_string(),
                 ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "agent-1".to_string(),
                     text: "streaming".to_string(),
                     phase: None,
@@ -10461,6 +10770,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                             }],
                         }),
                         ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                            moderation: None,
                             id: "assistant-2".to_string(),
                             text: "done".to_string(),
                             phase: None,

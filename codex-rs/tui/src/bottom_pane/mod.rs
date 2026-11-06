@@ -26,6 +26,7 @@ pub(crate) use chat_composer::TranscriptFooter;
 pub(crate) use composer_gap::ComposerGap;
 pub(crate) use footer::footer_hint_items_line;
 pub(crate) use footer::inset_footer_hint_area;
+pub(crate) use footer::render_unfocused_status;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -221,6 +222,7 @@ pub(crate) use picker_option::picker_option_list;
 pub(crate) use picker_option::picker_option_row;
 pub(crate) mod popup_consts;
 mod scroll_state;
+pub(crate) use scroll_state::ScrollState;
 mod selection_popup_common;
 pub(crate) use selection_popup_common::menu_surface_padding_height;
 pub(crate) use selection_popup_common::render_menu_surface;
@@ -850,6 +852,19 @@ impl BottomPane {
         self.push_view(Box::new(modal));
     }
 
+    fn is_composer_activity_key(key: KeyEvent) -> bool {
+        matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && !key_hint::has_ctrl_or_alt(key.modifiers)
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Enter
+                    | KeyCode::Tab
+            )
+    }
+
     /// Preserve restricted drafts, allowing recovery commands only for connected unavailable threads.
     pub(crate) fn handle_restricted_key(
         &mut self,
@@ -894,17 +909,7 @@ impl BottomPane {
                 view.observe_key_event_while_covered(key_event, routed_key);
             }
         }
-        let records_composer_activity =
-            matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                && !key_hint::has_ctrl_or_alt(key_event.modifiers)
-                && matches!(
-                    key_event.code,
-                    KeyCode::Char(_)
-                        | KeyCode::Backspace
-                        | KeyCode::Delete
-                        | KeyCode::Enter
-                        | KeyCode::Tab
-                );
+        let records_composer_activity = Self::is_composer_activity_key(key_event);
         if self.warnings_active() {
             if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 self.record_composer_activity_at(Instant::now());
@@ -1954,8 +1959,13 @@ impl BottomPane {
 
     /// Return true when no popups or modal views are active, regardless of task state.
     pub(crate) fn can_launch_external_editor(&self) -> bool {
+        self.completion_can_yield_focus() && !self.composer.popup_active()
+    }
+
+    /// A hidden completion popup can yield to another pane. Prompts and queries keep input.
+    pub(crate) fn completion_can_yield_focus(&self) -> bool {
         !self.has_active_view()
-            && !self.composer.popup_active()
+            && !self.composer.query_active()
             && !self.questions.as_ref().is_some_and(|q| q.expanded)
     }
 

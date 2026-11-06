@@ -2054,9 +2054,11 @@ impl ChatComposer {
 
     /// Whether a popup or query owns input.
     pub(crate) fn popup_active(&self) -> bool {
-        self.history_search.is_some()
-            || self.draft.textarea.vim_query().is_some()
-            || self.popups.active()
+        self.query_active() || self.popups.active()
+    }
+
+    pub(crate) fn query_active(&self) -> bool {
+        self.history_search.is_some() || self.draft.textarea.vim_query().is_some()
     }
 
     #[inline]
@@ -4413,30 +4415,6 @@ impl ChatComposer {
         }
     }
 
-    pub(crate) fn set_status_line(&mut self, status_line: Option<FooterContent>) -> bool {
-        if self.footer.status_line_value == status_line {
-            return false;
-        }
-        self.footer.status_line_value = status_line;
-        true
-    }
-
-    pub(crate) fn set_status_line_enabled(&mut self, enabled: bool) -> bool {
-        if self.footer.status_line_enabled == enabled {
-            return false;
-        }
-        self.footer.status_line_enabled = enabled;
-        true
-    }
-
-    pub(crate) fn set_side_conversation_context_label(&mut self, label: Option<String>) -> bool {
-        if self.footer.side_conversation_context_label == label {
-            return false;
-        }
-        self.footer.side_conversation_context_label = label;
-        true
-    }
-
     /// Replaces the contextual footer label for the currently viewed agent.
     ///
     /// Returning `false` means the value was unchanged, so callers can skip redraw work. This
@@ -4666,9 +4644,12 @@ impl ChatComposer {
             }
         }
         let transcript_hint_area = inset_footer_hint_area(footer_rect);
-        let warning_notice = self.warning_notice_layout(transcript_hint_area, options);
+        let warning_notice = self
+            .warning_notice_layout(transcript_hint_area, options)
+            .filter(|_| !options.unfocused);
         let warning_area = warning_notice.as_ref().map(|(area, _)| *area);
         match options.footer {
+            _ if options.unfocused => {}
             Some(footer) => {
                 self.render_transcript_footer(transcript_hint_area, buf, footer, warning_area);
             }
@@ -5008,7 +4989,7 @@ impl ChatComposer {
         }
         if let Some(lines) = self.prompt_suggestion_lines(textarea_rect.width, options) {
             Paragraph::new(lines).render(textarea_rect, buf);
-        } else if !self.draft.input_enabled || textarea_is_empty {
+        } else if !options.unfocused && (!self.draft.input_enabled || textarea_is_empty) {
             let text = if self.draft.input_enabled {
                 self.placeholder_text.to_string()
             } else {
@@ -5072,7 +5053,9 @@ impl ChatComposer {
             self.cursor_pos_with_options(area, options),
             buf,
         );
-        if options.footer.is_some_and(|footer| footer.is_interactive) {
+        if options.unfocused {
+            buf.set_style(composer_rect, crate::style::quiet_workspace_style());
+        } else if options.footer.is_some_and(|footer| footer.is_interactive) {
             buf.set_style(composer_rect, Style::default().dim());
         }
     }
