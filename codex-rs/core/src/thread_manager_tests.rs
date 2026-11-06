@@ -3624,8 +3624,10 @@ async fn multi_agent_v2_override_regression_swappable_manager_preserves_discover
                 .disable(codex_features::Feature::ApiKeyModelDiscovery)
                 .expect("disable API-key model discovery");
         }
-        let initial_manager = build_models_manager(&config, auth_manager.clone(), /*runtime*/ None);
-        let replacement_manager = build_models_manager(&config, auth_manager.clone(), /*runtime*/ None);
+        let initial_manager =
+            build_models_manager(&config, auth_manager.clone(), /*runtime*/ None);
+        let replacement_manager =
+            build_models_manager(&config, auth_manager.clone(), /*runtime*/ None);
         let swappable = crate::state::SwappableModelsManager::new(initial_manager, auth_manager);
         swappable.swap(replacement_manager);
 

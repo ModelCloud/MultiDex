@@ -113,13 +113,11 @@ pub fn build_models_manager(
             } else {
                 None
             };
-        manager = Arc::new(
-            codex_models_manager::manager::ModelsManagerOverlay::new(
-                manager,
-                additional_models,
-                default_model,
-            ),
-        );
+        manager = Arc::new(codex_models_manager::manager::ModelsManagerOverlay::new(
+            manager,
+            additional_models,
+            default_model,
+        ));
     }
     manager.set_api_key_model_discovery_enabled(
         config.features.enabled(Feature::ApiKeyModelDiscovery),
