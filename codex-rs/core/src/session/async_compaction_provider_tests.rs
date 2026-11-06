@@ -114,7 +114,7 @@ async fn multidex_base_client_does_not_override_background_turn_provider(change_
         CompactionPhase::MidTurn,
         &cancellation,
         &status,
-        (Some("routing".to_string()), auth_owner),
+        (Some("routing".to_string()), auth_owner.clone()),
     )
     .await;
     wait_for_background_compaction_for_test(&sess).await;
