@@ -102,6 +102,7 @@ use codex_protocol::protocol::TurnEnvironmentRequest;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
+use codex_runtime_agent_instance::RuntimeAuthManager;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
@@ -611,6 +612,7 @@ impl ThreadManager {
             codex_home.to_path_buf(),
             restriction_product,
             Arc::clone(&auth_manager),
+            Arc::clone(&runtime_auth),
             skills_service.clone(),
         ));
         let mcp_manager = Arc::new(McpManager::new_with_extensions(
@@ -822,10 +824,12 @@ impl ThreadManager {
             /*bundled_skills_enabled*/ true,
             restriction_product,
         ));
+        let runtime_auth = crate::runtime_auth::RuntimeAuthSlot::default();
         let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.clone(),
             restriction_product,
             Arc::clone(&auth_manager),
+            Arc::clone(&runtime_auth),
             skills_service.clone(),
         ));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
@@ -842,7 +846,7 @@ impl ThreadManager {
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         Self {
             state: Arc::new(ThreadManagerState {
-                runtime_auth: Default::default(),
+                runtime_auth,
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
@@ -894,6 +898,50 @@ impl ThreadManager {
 
     pub fn auth_manager(&self) -> Arc<AuthManager> {
         self.state.auth_manager.clone()
+    }
+
+    /// Return the harness owner initialized at startup, if runtime auth was enabled.
+    pub fn runtime_auth_manager(&self) -> Option<Arc<RuntimeAuthManager>> {
+        self.state.runtime_auth.get().cloned()
+    }
+
+    /// Share the harness runtime with an API client using this effective ChatGPT configuration.
+    pub fn runtime_auth_for_config(
+        &self,
+        config: &Config,
+    ) -> std::io::Result<Option<(Arc<RuntimeAuthManager>, codex_features::RuntimeAuthMode)>> {
+        if config
+            .features
+            .enabled(codex_features::Feature::RuntimeAgentInstances)
+        {
+            codex_model_provider::validate_runtime_destination(Some(&config.chatgpt_base_url))
+                .map_err(std::io::Error::other)?;
+        }
+        if !codex_runtime_agent_instance::is_openai_api_url(&config.chatgpt_base_url) {
+            return Ok(None);
+        }
+        Ok(crate::runtime_auth::runtime_for_config(
+            &self.state.runtime_auth,
+            config,
+            Arc::clone(&self.state.auth_manager),
+            &self.state.installation_id,
+        )
+        .map(|runtime| (runtime, config.runtime_auth_mode)))
+    }
+
+    /// Initialize the selected thread owner's runtime, including after a feature enablement.
+    pub fn runtime_auth_for_mcp_manager(
+        &self,
+        config: &Config,
+        mcp_manager: &McpManager,
+    ) -> std::io::Result<Option<(Arc<RuntimeAuthManager>, codex_features::RuntimeAuthMode)>> {
+        Ok(crate::runtime_auth::runtime_for_config(
+            &mcp_manager.plugins_manager().runtime_auth_slot(),
+            config,
+            mcp_manager.auth_manager(),
+            &self.state.installation_id,
+        )
+        .map(|runtime| (runtime, config.runtime_auth_mode)))
     }
 
     pub fn skills_service(&self) -> Arc<HostSkillsService> {
@@ -2624,20 +2672,70 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        // Resume may supply a different credential owner. Keep its runtime separate from the
-        // harness default, and let sessions using that parent's credentials inherit its owner.
-        let runtime_auth = if let Some(runtime_auth) = inherited_runtime_auth {
-            runtime_auth
-        } else if Arc::ptr_eq(&auth_manager, &self.auth_manager) {
-            Arc::clone(&self.runtime_auth)
+        // A resumed actor and its descendants share an owner, not the harness default's credentials.
+        let (runtime_auth, plugins_manager, analytics_events_client) = if Arc::ptr_eq(
+            &auth_manager,
+            &self.auth_manager,
+        ) {
+            (
+                inherited_runtime_auth.unwrap_or_else(|| Arc::clone(&self.runtime_auth)),
+                Arc::clone(&self.plugins_manager),
+                self.analytics_events_client.clone(),
+            )
         } else {
             let threads = self.threads.read().await;
-            parent_thread_id
+            if let Some(parent) = parent_thread_id
                 .or(forked_from_thread_id)
                 .and_then(|id| threads.get(&id))
                 .filter(|parent| Arc::ptr_eq(&parent.session.services.auth_manager, &auth_manager))
-                .map(|parent| Arc::clone(&parent.session.services.runtime_auth))
-                .unwrap_or_default()
+            {
+                (
+                    inherited_runtime_auth
+                        .unwrap_or_else(|| Arc::clone(&parent.session.services.runtime_auth)),
+                    Arc::clone(&parent.session.services.plugins_manager),
+                    Some(parent.session.services.analytics_events_client.clone()),
+                )
+            } else {
+                let runtime_auth = inherited_runtime_auth.unwrap_or_default();
+                let plugins = Arc::new(
+                    self.plugins_manager
+                        .for_auth_context(Arc::clone(&auth_manager), Arc::clone(&runtime_auth)),
+                );
+                let runtime_provider = config
+                    .features
+                    .enabled(Feature::RuntimeAgentInstances)
+                    .then(|| (Arc::clone(&runtime_auth), config.runtime_auth_mode));
+                let analytics = self.analytics_events_client.as_ref().map(|client| {
+                        let api_key_headers = if codex_model_provider::provider_uses_first_party_auth_path(
+                            &config.model_provider,
+                        ) {
+                            match config.model_provider.build_header_map() {
+                                Ok(headers) => headers,
+                                Err(error) => {
+                                    tracing::warn!(%error, "failed to resolve analytics resource selectors");
+                                    return codex_analytics::AnalyticsEventsClient::disabled();
+                                }
+                            }
+                        } else {
+                            Default::default()
+                        };
+                        client.for_auth_context(
+                            Arc::clone(&auth_manager),
+                            config.chatgpt_base_url.clone(),
+                            runtime_provider,
+                            api_key_headers,
+                        )
+                    });
+                if let Some(client) = &analytics {
+                    plugins.set_analytics_events_client(client.clone());
+                }
+                (runtime_auth, plugins, analytics)
+            }
+        };
+        let mcp_manager = if Arc::ptr_eq(&plugins_manager, &self.plugins_manager) {
+            mcp_manager
+        } else {
+            Arc::new(mcp_manager.for_plugins_manager(Arc::clone(&plugins_manager)))
         };
         let runtime = crate::runtime_auth::runtime_for_config(
             &runtime_auth,
@@ -2668,7 +2766,7 @@ impl ThreadManagerState {
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
-            plugins_manager: Arc::clone(&self.plugins_manager),
+            plugins_manager,
             mcp_manager,
             code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
             extensions,
@@ -2705,7 +2803,7 @@ impl ThreadManagerState {
             turn_extension_init,
             client_mcp_extensions,
             reserved_thread_id,
-            analytics_events_client: self.analytics_events_client.clone(),
+            analytics_events_client,
             image_store: Arc::clone(&self.image_store),
             thread_store: Arc::clone(&self.thread_store),
             attestation_provider: self.attestation_provider.clone(),

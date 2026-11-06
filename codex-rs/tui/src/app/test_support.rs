@@ -40,6 +40,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     Box::new(App {
+        provider_writes: HashMap::new(),
         feature_write_lock: Arc::default(),
         config_notification_test_generation: 0,
         config_notification_test_pending: None,
@@ -125,7 +126,13 @@ pub(crate) async fn make_test_app() -> Box<App> {
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
         side_threads: HashMap::new(),
+        sidebars: HashMap::new(),
         side_companions: HashMap::new(),
+        zoomed_thread: None,
+        exact_sidebar_width: None,
+        divider_drag: None,
+        pane_resize: None,
+        passive_link_drag: None,
         abandoned_side_threads: HashSet::new(),
         active_thread_id: None,
         active_thread_rx: None,

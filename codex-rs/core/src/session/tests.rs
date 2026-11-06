@@ -25,7 +25,6 @@ use crate::config::RuntimeConfigRefresh;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::TurnAborted;
-use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -7282,6 +7281,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         thread_id,
         item_id_generator,
         agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,
+        outcome_reporting: None,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         parent_observer_event_tx: OnceLock::new(),
@@ -9631,6 +9631,7 @@ where
         thread_id,
         item_id_generator,
         agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,
+        outcome_reporting: None,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         parent_observer_event_tx: OnceLock::new(),

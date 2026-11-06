@@ -94,6 +94,7 @@ pub mod context;
 mod context_manager;
 mod current_time;
 pub mod cyber_access_program;
+pub use cyber_access_program::RequiredCyberAccessPrograms;
 mod elicitation;
 mod environment_selection;
 pub mod exec;
@@ -128,6 +129,7 @@ pub use mention_syntax::TOOL_MENTION_SIGIL;
 pub use utils::path_utils;
 pub(crate) mod plugins;
 pub use plugins::plugins_manager_for_config;
+pub use plugins::plugins_manager_for_config_with_runtime;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
@@ -159,9 +161,12 @@ mod thread_manager;
 mod thread_spawn;
 mod thread_store_builder;
 pub use agent::host::AgentMcpMetadataRecipient;
+pub use agent::host::AgentRef;
 pub use agent::host::AgentRuntimeOwnership;
+pub use agent::host::AgentSessionReader;
 pub use agent::host::AgentTurnAdmission;
 pub use agent::host::AgentTurnAdmissionRequest;
+pub use agent::host::AgentTurnOutcomeReporter;
 pub use agent::host::AgentUsageAccounting;
 pub use agent::host::AgentUsageReport;
 pub use agent::host::HostThreadSpawnReservation;

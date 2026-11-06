@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::inline_visualization::InlineVisualizationContext;
@@ -297,17 +298,50 @@ pub(crate) struct AgentPickerThreadRefresh {
 /// Source-backed replacement for the outgoing widget's width-bound streaming rows.
 #[derive(Debug)]
 pub(crate) enum CapturedSideStream {
-    Answer(Arc<crate::history_cell::AgentMarkdownCell>),
+    Answer {
+        cell: Arc<crate::history_cell::AgentMarkdownCell>,
+        item: Option<(String, String)>,
+    },
     Plan(Arc<crate::history_cell::ProposedPlanCell>),
 }
 
 /// Presentation retained alongside the transcript while its composer is inactive.
 #[derive(Debug)]
 pub(crate) struct CapturedSideDisplay {
+    pub(crate) rendered_completion_turn_ids: std::collections::HashSet<String>,
     pub(crate) active: Option<Box<dyn HistoryCell>>,
     pub(crate) auxiliary: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
-    pub(crate) draft: String,
+    pub(crate) draft: Box<crate::bottom_pane::TextArea>,
     pub(crate) status: Option<String>,
+    pub(crate) work: Option<CapturedSideWork>,
+    pub(crate) last_completed_agent_message: Option<(String, String)>,
+    pub(crate) cwd: AbsolutePathBuf,
+    pub(crate) visualizations: Option<crate::inline_visualization::InlineVisualizationContext>,
+}
+
+/// The inactive composer keeps counting from the time already spent in the active pane.
+#[derive(Debug)]
+pub(crate) struct CapturedSideWork {
+    pub(crate) turn_id: String,
+    pub(crate) row: Box<crate::status_indicator_widget::StatusIndicatorWidget>,
+    pub(crate) timer: crate::status_indicator_widget::StatusTimer,
+}
+
+impl CapturedSideWork {
+    pub(crate) fn new(
+        turn_id: String,
+        mut row: crate::status_indicator_widget::StatusIndicatorWidget,
+        elapsed: Duration,
+    ) -> Self {
+        let mut timer = crate::status_indicator_widget::StatusTimer::default();
+        timer.reset(elapsed);
+        row.set_interrupt_hint_visible(/*visible*/ false);
+        Self {
+            turn_id,
+            row: Box::new(row),
+            timer,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -680,6 +714,15 @@ pub(crate) enum AppEvent {
 
     /// Release input and drawing after the destination snapshot's queued history edits.
     SideReplayFinished(ThreadId),
+
+    /// Deliver the original pointer press after the target conversation's replay finishes.
+    SidePanePressAfterReplay {
+        peer: ThreadId,
+        draft_cursor: Option<usize>,
+        thread_id: ThreadId,
+        area: ratatui::layout::Rect,
+        press: crossterm::event::MouseEvent,
+    },
 
     /// Clear history queued by the previous thread before the new thread's replay events.
     ResetTranscriptForThreadSwitch,
@@ -1288,12 +1331,19 @@ pub(crate) enum AppEvent {
     /// `deferred_history_cell` lets callers add the final stream tail to the
     /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
+        interrupted_item: Option<(String, String)>,
         source: String,
         copy_source: Option<String>,
         cwd: PathBuf,
         inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,
         deferred_history_cell: Option<Box<dyn HistoryCell>>,
+    },
+
+    /// Update a message already committed before a tool started with its completed text.
+    CorrectFlushedAgentMessage {
+        item: (String, String),
+        cell: crate::history_cell::AgentMarkdownCell,
     },
 
     /// Replace the contiguous run of streaming `ProposedPlanStreamCell`s at the
@@ -1317,6 +1367,13 @@ pub(crate) enum AppEvent {
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
+
+    /// A queued action may only change the chat on the backend that displayed the picker.
+    ScopedModelPicker {
+        backend: crate::backend_id::BackendId,
+        thread_id: Option<ThreadId>,
+        event: Box<AppEvent>,
+    },
 
     /// Apply a model-picker selection to the active conversation and saved local defaults.
     ApplyModelSelection {
@@ -1758,6 +1815,8 @@ pub(crate) enum AppEvent {
 
     /// Remember the Command Center grouping across launches.
     PersistAgentsOverviewGrouping(codex_config::types::AgentsOverviewGrouping),
+
+    Provider(crate::app::provider::Event),
 
     /// Open an existing editor above the configuration panel.
     OpenConfigEditor(crate::config_panel::ConfigEditorHandoff),

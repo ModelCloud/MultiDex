@@ -98,6 +98,7 @@ use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::MULTIDEX_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::OPENROUTER_PROVIDER_ID;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::is_multidex_model;
@@ -187,6 +188,7 @@ mod permission_profile_selection;
 mod permissions;
 mod requirements;
 mod resolved_permission_profile;
+pub(crate) use guardian_policy::resolve_guardian_policy_text;
 pub(crate) use guardian_policy::resolve_guardian_reviewer;
 mod runtime_refresh;
 pub(crate) use runtime_refresh::RuntimeConfigRefresh;
@@ -735,6 +737,8 @@ pub struct Config {
     /// `# Policy Configuration` section rather than replacing the whole
     /// guardian developer prompt.
     pub guardian_policy_config: Option<String>,
+    /// Guardian publication observed before startup loading or last policy refresh.
+    pub guardian_policy_revision: u64,
 
     /// Additional Guardian policy from requirements.toml or config.toml.
     /// Rendered into `{{ extra_policy }}` alongside the resolved tenant policy.
@@ -752,9 +756,6 @@ pub struct Config {
     /// Optional replacement for the gated history-retrieval instructions.
     /// Blank config values are treated as unset, like other Guardian policy overrides.
     pub guardian_conversation_history_prompt: Option<String>,
-
-    /// Optional bounded developer message for the gated denial reconsideration pass.
-    pub guardian_denial_reconsideration_prompt: Option<String>,
 
     /// Optional per-response history-tool budget. Guardian defaults to 4,000 tokens and
     /// preserves stricter parent tool limits.
@@ -854,6 +855,9 @@ pub struct Config {
 
     /// Own the fullscreen transcript when the alternate screen is enabled.
     pub tui_fullscreen_transcript: bool,
+
+    /// Preferred docked sidebar width as a percentage of the terminal.
+    pub tui_sidebar_width_percent: Option<u8>,
 
     /// Mouse wheel speed multiplier for transcript scrolling; defaults to one row per event.
     pub tui_mouse_scroll_speed: Option<f64>,
@@ -1720,6 +1724,14 @@ impl Config {
             .unwrap_or(model_messages.auto_review().policy)
     }
 
+    /// Native Guardian agent history requires the reviewed thread's OpenAI provider.
+    pub fn guardian_native_multi_agent_history_enabled(&self) -> bool {
+        self.model_provider_id == OPENAI_PROVIDER_ID
+            && self
+                .features
+                .enabled(Feature::GuardianNativeMultiAgentHistory)
+    }
+
     pub(crate) fn multi_agent_version_override(&self) -> Option<MultiAgentVersion> {
         if self.features.enabled(Feature::MultiAgentV2) {
             Some(MultiAgentVersion::V2)
@@ -1869,6 +1881,11 @@ impl Config {
             self.chatgpt_base_url.clone(),
             self.http_client_factory(),
             self.apps_mcp_product_sku.clone(),
+        )
+        .with_runtime_auth_mode(
+            (self.features.enabled(Feature::RuntimeAgentInstances)
+                && codex_runtime_agent_instance::is_openai_api_url(&self.chatgpt_base_url))
+            .then_some(self.runtime_auth_mode),
         )
     }
 
@@ -4357,26 +4374,9 @@ impl Config {
             .and_then(|skills| skills.max_context_tokens);
         let include_environment_context = cfg.include_environment_context.unwrap_or(true);
         let include_environment_context_time = cfg.include_environment_context_time.unwrap_or(true);
-        let guardian_policy_config =
-            guardian_policy_config_from_requirements(config_layer_stack.requirements_toml())
-                .or_else(|| {
-                    cfg.auto_review
-                        .as_ref()
-                        .and_then(|auto_review| normalize_guardian_policy_config(
-                            auto_review.policy.as_deref(),
-                        ))
-                });
-        let guardian_extra_policy = normalize_guardian_policy_config(
-            config_layer_stack
-                .requirements_toml()
-                .guardian_extra_policy
-                .as_deref(),
-        )
-        .or_else(|| {
-            cfg.auto_review.as_ref().and_then(|auto_review| {
-                normalize_guardian_policy_config(auto_review.extra_policy.as_deref())
-            })
-        });
+        let (guardian_policy_config, guardian_extra_policy) = resolve_guardian_policy_text(
+            config_layer_stack.requirements_toml(), cfg.auto_review.as_ref(),
+        );
         let guardian_transcript_mode = cfg
             .features
             .as_ref()
@@ -4434,20 +4434,6 @@ impl Config {
             .auto_review
             .as_ref()
             .and_then(|auto_review| auto_review.conversation_history_max_output_tokens);
-        let guardian_denial_reconsideration_prompt = cfg.auto_review.as_ref().and_then(|auto_review| {
-            normalize_guardian_policy_config(
-                auto_review.experimental_denial_reconsideration_prompt.as_deref(),
-            )
-        });
-        if guardian_denial_reconsideration_prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.len() > crate::context::GuardianDenialReconsideration::MAX_BYTES)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "auto_review.experimental_denial_reconsideration_prompt exceeds 1,000 UTF-8 bytes",
-            ));
-        }
         let personality = personality.or(cfg.personality);
 
         let experimental_compact_prompt_path = cfg.experimental_compact_prompt_file.as_ref();
@@ -4814,12 +4800,12 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
+            guardian_policy_revision: 0,
             guardian_extra_policy,
             guardian_policy_template,
             guardian_transcript_mode,
             guardian_sync_elastic_budget,
             guardian_conversation_history_prompt,
-            guardian_denial_reconsideration_prompt,
             guardian_conversation_history_max_output_tokens,
             guardian_review_timeout: cfg
                 .auto_review
@@ -4946,6 +4932,7 @@ impl Config {
                 .tui
                 .as_ref()
                 .is_none_or(|tui| tui.fullscreen_transcript),
+            tui_sidebar_width_percent: cfg.tui.as_ref().and_then(|tui| tui.sidebar_width_percent),
             tui_mouse_scroll_speed: cfg.tui.as_ref().and_then(|tui| tui.mouse_scroll_speed),
             tui_copy_on_select: cfg
                 .tui

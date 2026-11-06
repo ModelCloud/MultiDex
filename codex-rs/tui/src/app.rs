@@ -169,6 +169,8 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
+use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::Stylize;
@@ -253,6 +255,7 @@ mod pets;
 mod platform_actions;
 mod plugin_mentions;
 mod prompt_suggestions;
+pub(crate) mod provider;
 mod rate_limit_refresh;
 mod realtime_delivery;
 mod realtime_settings;
@@ -265,14 +268,17 @@ mod resume_config;
 mod resume_preparation;
 mod right_click_paste;
 pub(crate) use right_click_paste::PasteEnvironment;
+mod pane_motion;
 mod safety_buffering;
 mod safety_recourse;
 mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
 mod side;
+mod side_companion;
 mod side_focus;
 mod side_pane;
+mod sidebar;
 mod startup;
 pub(crate) mod startup_bootstrap;
 mod startup_prompts;
@@ -295,6 +301,7 @@ mod voice_owner;
 #[path = "app/warnings_tests.rs"]
 mod warnings_tests;
 mod working_directory;
+mod workspace_hud;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
@@ -303,10 +310,10 @@ use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
 pub(crate) use self::platform_actions::WindowsSandboxHost;
 use self::platform_actions::*;
-use self::side::SideCompanion;
 use self::side::SideParentStatus;
 use self::side::SideParentStatusChange;
 use self::side::SideThreadState;
+use self::side_companion::SideCompanion;
 use self::startup_prompts::*;
 use self::thread_events::*;
 
@@ -539,6 +546,7 @@ struct InitialHistoryReplayBuffer {
 }
 
 pub(crate) struct App {
+    provider_writes: HashMap<crate::backend_id::BackendId, crate::model_catalog::ProviderWrite>,
     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
     config_notification_test_generation: u64,
     config_notification_test_pending: Option<u64>,
@@ -652,8 +660,15 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     agents_overview: agents_overview::AgentsOverviewState,
     side_threads: HashMap<ThreadId, SideThreadState>,
+    sidebars: HashMap<Option<ThreadId>, sidebar::SidebarPane>,
     /// A parked parent view survives child cleanup until its own replay finishes.
     side_companions: HashMap<ThreadId, SideCompanion>,
+    zoomed_thread: Option<ThreadId>,
+    /// Exact sidebar allocation at the terminal width where the width preset was applied.
+    exact_sidebar_width: Option<(u16, u16)>,
+    divider_drag: Option<side_pane::DividerDrag>,
+    pane_resize: Option<side_pane::PaneResize>,
+    passive_link_drag: Option<(ThreadId, Rect)>,
     abandoned_side_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
@@ -880,7 +895,37 @@ impl App {
     ) -> Result<AppRunControl> {
         self.transcript_view
             .sync_patch_approval(self.chat_widget.current_patch_approval());
+        // A chooser action must never decide a modal that has not been painted yet.
+        if self.conversation_frame.chooser_area().is_some()
+            && self.chat_widget.has_active_modal()
+            && matches!(
+                &event,
+                TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_)
+            )
+        {
+            tui.frame_requester().schedule_frame();
+            return Ok(AppRunControl::Continue);
+        }
         tui.link_hover.observe(&event);
+        if self.handle_pane_resize(tui, &event).await {
+            return Ok(AppRunControl::Continue);
+        }
+        if let TuiEvent::Mouse(mouse) = &event
+            && (self.key_chord_matcher.workspace_leader().is_some()
+                || self.chat_widget.quick_dial_menu_open())
+            && !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && self.conversation_frame.hud_contains(*mouse)
+        {
+            if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+                self.cancel_pending_key_chord();
+                tui.frame_requester().schedule_frame();
+            }
+            self.refresh_link_hover(tui)?;
+            return Ok(AppRunControl::Continue);
+        }
         self.refresh_link_hover(tui)?;
         self.invalidate_right_click_paste(&event);
         self.finish_clipboard(tui, &event);
@@ -920,7 +965,10 @@ impl App {
             }
             self.backtrack.select_exit_key = None;
         }
-        if self.handle_rendered_selection_event(tui, &event)? {
+        if self.continue_passive_link_drag(tui, &event)?
+            || self.handle_divider_event(tui, &event).await?
+            || self.handle_rendered_selection_event(tui, &event)?
+        {
             return Ok(AppRunControl::Continue);
         }
         if matches!(&event, TuiEvent::Key(_))
@@ -948,6 +996,19 @@ impl App {
             }
             _ => false,
         };
+        if let TuiEvent::Key(key) = &event
+            && crate::text_selection::is_copy_key(*key)
+            && !transcript_owns_input
+            && self.conversation_focus_available(tui)
+            && let Some(painted) = self.conversation_frame.side_pane()
+            && let Some(current) =
+                side_pane::layout(self, tui, tui.terminal.last_known_screen_size.into())
+            && current.passive_thread == painted.passive_thread
+            && self.handle_passive_transcript_event(tui, current.passive_thread, &event)
+        {
+            self.cancel_pending_key_chord();
+            return Ok(AppRunControl::Continue);
+        }
         if self.reconnect.offline
             && !transcript_owns_input
             && !self.chat_widget.keymap_contexts().is_warnings()
@@ -974,9 +1035,18 @@ impl App {
             self.handle_draw_pre_render(tui, screen_size)?;
         }
 
-        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost)
-            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
-        {
+        let dismiss_chord = match &event {
+            TuiEvent::Paste(_) | TuiEvent::FocusLost => true,
+            TuiEvent::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Moved => false,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.key_chord_matcher.workspace_leader().is_none()
+                }
+                _ => true,
+            },
+            _ => false,
+        };
+        if dismiss_chord {
             self.cancel_pending_key_chord();
         }
         if matches!(&event, TuiEvent::FocusLost)
@@ -1018,6 +1088,58 @@ impl App {
         if let TuiEvent::Key(key) = &event
             && self.handle_side_focus_key(tui, app_server, *key).await
         {
+            return Ok(AppRunControl::Continue);
+        }
+        if self.handle_chooser_input(tui, &event) {
+            return Ok(AppRunControl::Continue);
+        }
+        if let TuiEvent::Mouse(press) = &event
+            && press.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.conversation_focus_available(tui)
+            && let Some(painted) = self.conversation_frame.side_pane()
+            && painted.passive.contains((press.column, press.row).into())
+        {
+            // A hidden, resized or replaced pane can still be in the last painted frame.
+            let size = tui.prepare_draw_size()?;
+            if let Some(current) = side_pane::layout(self, tui, size.into())
+                && current.passive_thread == painted.passive_thread
+                && let Some(peer) = self.current_displayed_thread_id()
+                && painted.passive.union(painted.focused) == Rect::from(size)
+            {
+                let painted_area = painted.passive;
+                if let Some(url) = self.transcript_link_at(*press) {
+                    if press.modifiers.is_empty() {
+                        self.passive_link_drag = Some((current.passive_thread, painted.passive));
+                        self.handle_passive_transcript_event(tui, current.passive_thread, &event);
+                    } else {
+                        self.open_url_in_browser(url);
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
+                if self.reconnect.offline {
+                    return Ok(AppRunControl::Continue);
+                }
+                let draft_cursor = self
+                    .side_companions
+                    .get_mut(&current.passive_thread)
+                    .and_then(|pane| {
+                        let draft = &mut pane.display.draft;
+                        draft
+                            .handle_mouse(*press, Default::default())
+                            .then(|| draft.cursor())
+                    });
+                if let Err(err) = self.toggle_side_conversation(tui, app_server).await {
+                    self.chat_widget.add_error_message(err.to_string());
+                } else if self.current_displayed_thread_id() == Some(current.passive_thread) {
+                    self.app_event_tx.send(AppEvent::SidePanePressAfterReplay {
+                        peer,
+                        draft_cursor,
+                        thread_id: current.passive_thread,
+                        area: painted_area,
+                        press: *press,
+                    });
+                }
+            }
             return Ok(AppRunControl::Continue);
         }
         self.cancel_primed_browsing_for_event(&event);
@@ -1224,24 +1346,7 @@ impl App {
                     {
                         self.discard_startup_modal_input(tui)?;
                     }
-                    if self.chat_widget.ambient_pet_image_enabled() {
-                        let ambient_pet_area = self.conversation_area(screen_size.into());
-                        if let Err(err) = tui.draw_ambient_pet_image(
-                            self.chat_widget
-                                .ambient_pet_draw(ambient_pet_area, rendered_area.bottom()),
-                        ) {
-                            self.handle_ambient_pet_image_render_error(tui, err)?;
-                        }
-                    }
-                    if let Some(request) = self.chat_widget.pet_picker_preview_draw() {
-                        if let Err(err) = tui.draw_pet_picker_preview_image(Some(request)) {
-                            self.handle_pet_picker_preview_image_render_error(tui, err)?;
-                        }
-                    } else if self.chat_widget.should_clear_pet_picker_preview_image()
-                        && let Err(err) = tui.draw_pet_picker_preview_image(/*request*/ None)
-                    {
-                        self.handle_pet_picker_preview_image_render_error(tui, err)?;
-                    }
+                    self.draw_pet_images(tui, screen_size, rendered_area)?;
                     if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {
                         self.chat_widget
                             .set_external_editor_state(ExternalEditorState::Active);
@@ -1256,6 +1361,7 @@ impl App {
             let frozen = self.chat_widget.is_external_writer_view();
             let visible = self.current_displayed_thread_id().filter(|&id| {
                 tui.is_terminal_focused()
+                    && !self.conversation_frame.chooser_covers_transcript()
                     && matches!(self.overlay, None | Some(Overlay::Transcript(_)))
                     && self.chat_widget.no_modal_or_popup_active()
                     && self.initial_history_replay_buffer.is_none()

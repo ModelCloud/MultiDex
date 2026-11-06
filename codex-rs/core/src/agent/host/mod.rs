@@ -1,13 +1,16 @@
 mod admission;
+mod completion;
 mod invocation;
 mod mcp_metadata;
 mod ownership;
+mod session_reader;
 mod spawn;
 mod types;
 mod usage;
 
 pub use admission::AgentTurnAdmission;
 pub use admission::AgentTurnAdmissionRequest;
+pub use completion::AgentTurnOutcomeReporter;
 pub use invocation::HostToolInvocationLookup;
 pub(crate) use invocation::InvocationReservation;
 pub use invocation::ToolInvocationContext;
@@ -17,6 +20,8 @@ pub(crate) use invocation::tool_invocation;
 pub use mcp_metadata::AgentMcpMetadataRecipient;
 pub use ownership::AgentRuntimeOwnership;
 pub(crate) use ownership::AgentRuntimeServices;
+pub use session_reader::AgentRef;
+pub use session_reader::AgentSessionReader;
 pub use types::HostThreadSpawnReservation;
 pub use types::InheritedSessionId;
 pub use types::PreparedChildContext;

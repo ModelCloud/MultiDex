@@ -60,7 +60,9 @@ fn header_auth_exposes_a_valid_chatgpt_account_id() {
 }
 
 #[tokio::test]
+#[serial(codex_auth_env)]
 async fn cancelled_refresh_marks_only_started_exchanges_as_unsettled() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
     let home = tempdir()?;
     write_auth_file(
         AuthFileParams {
@@ -1877,6 +1879,13 @@ async fn external_auth_provider_can_install_headers() {
     headers.insert("x-external-auth", http::HeaderValue::from_static("enabled"));
     let auth = CodexAuth::Headers(AuthHeaders::new(headers));
     let codex_home = tempdir().expect("tempdir");
+    login_with_api_key(
+        codex_home.path(),
+        "stored-key",
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    )
+    .unwrap();
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
@@ -1893,6 +1902,7 @@ async fn external_auth_provider_can_install_headers() {
         .await
         .expect("external auth should install");
 
+    assert!(!manager.reload_with_cached_auth().await.unwrap());
     assert_eq!(manager.auth_cached(), Some(auth));
     assert!(
         manager
