@@ -106,7 +106,9 @@ pub(crate) struct AppKeymap {
     pub(crate) change_host: Vec<KeyBinding>,
     pub(crate) focus_main_composer: Vec<KeyBinding>,
     pub(crate) focus_sidebar_content: Vec<KeyBinding>,
+    pub(crate) focus_sidebar_tabs: Vec<KeyBinding>,
     pub(crate) hide_pane: Vec<KeyBinding>,
+    pub(crate) close_sidebar_tab: Vec<KeyBinding>,
     pub(crate) focus_pane_left: Vec<KeyBinding>,
     pub(crate) focus_pane_right: Vec<KeyBinding>,
     pub(crate) minimize_pane_width: Vec<KeyBinding>,
@@ -707,7 +709,9 @@ impl RuntimeKeymap {
             classic_keymap = keymap.clone();
             classic_keymap.global.focus_main_composer = None;
             classic_keymap.global.focus_sidebar_content = None;
+            classic_keymap.global.focus_sidebar_tabs = None;
             classic_keymap.global.hide_pane = None;
+            classic_keymap.global.close_sidebar_tab = None;
             classic_keymap.global.focus_pane_left = None;
             classic_keymap.global.focus_pane_right = None;
             &classic_keymap
@@ -773,10 +777,20 @@ impl RuntimeKeymap {
                 &[],
                 "tui.keymap.global.focus_sidebar_content",
             )?,
+            focus_sidebar_tabs: resolve_bindings(
+                keymap.global.focus_sidebar_tabs.as_ref(),
+                &[],
+                "tui.keymap.global.focus_sidebar_tabs",
+            )?,
             hide_pane: resolve_bindings(
                 keymap.global.hide_pane.as_ref(),
                 &[],
                 "tui.keymap.global.hide_pane",
+            )?,
+            close_sidebar_tab: resolve_bindings(
+                keymap.global.close_sidebar_tab.as_ref(),
+                &[],
+                "tui.keymap.global.close_sidebar_tab",
             )?,
             focus_pane_left: resolve_bindings(
                 keymap.global.focus_pane_left.as_ref(),
@@ -1800,7 +1814,9 @@ impl RuntimeKeymap {
                 change_host: Vec::new(),
                 focus_main_composer: Vec::new(),
                 focus_sidebar_content: Vec::new(),
+                focus_sidebar_tabs: Vec::new(),
                 hide_pane: Vec::new(),
+                close_sidebar_tab: Vec::new(),
                 focus_pane_left: Vec::new(),
                 focus_pane_right: Vec::new(),
                 minimize_pane_width: Vec::new(),
@@ -2170,6 +2186,7 @@ impl RuntimeKeymap {
                 "global.focus_sidebar_content",
                 &self.app.focus_sidebar_content,
             ),
+            ("global.focus_sidebar_tabs", &self.app.focus_sidebar_tabs),
             ("global.focus_pane_left", &self.app.focus_pane_left),
             ("global.focus_pane_right", &self.app.focus_pane_right),
             ("global.minimize_pane_width", minimize),
@@ -2180,6 +2197,7 @@ impl RuntimeKeymap {
             ("global.move_divider_right", &self.app.move_divider_right),
             ("global.toggle_pane_zoom", &self.app.toggle_pane_zoom),
             ("global.hide_pane", &self.app.hide_pane),
+            ("global.close_sidebar_tab", &self.app.close_sidebar_tab),
             ("chat.open_presets", &self.chat.open_presets),
             ("chat.toggle_voice", &self.chat.toggle_voice),
         ] {
@@ -2219,6 +2237,7 @@ impl RuntimeKeymap {
                 "focus_sidebar_content",
                 self.app.focus_sidebar_content.as_slice(),
             ),
+            ("focus_sidebar_tabs", self.app.focus_sidebar_tabs.as_slice()),
             ("focus_pane_left", self.app.focus_pane_left.as_slice()),
             ("focus_pane_right", self.app.focus_pane_right.as_slice()),
             ("minimize_pane_width", minimize),
@@ -2229,6 +2248,7 @@ impl RuntimeKeymap {
             ("move_divider_right", divider_right),
             ("toggle_pane_zoom", self.app.toggle_pane_zoom.as_slice()),
             ("hide_pane", self.app.hide_pane.as_slice()),
+            ("close_sidebar_tab", self.app.close_sidebar_tab.as_slice()),
             ("open_agents", self.app.open_agents.as_slice()),
             ("open_transcript", self.app.open_transcript.as_slice()),
             ("find_transcript", self.app.find_transcript.as_slice()),
@@ -2405,6 +2425,7 @@ impl RuntimeKeymap {
                     "focus_sidebar_content",
                     self.app.focus_sidebar_content.as_slice(),
                 ),
+                ("focus_sidebar_tabs", self.app.focus_sidebar_tabs.as_slice()),
                 ("focus_pane_left", self.app.focus_pane_left.as_slice()),
                 ("focus_pane_right", self.app.focus_pane_right.as_slice()),
                 ("minimize_pane_width", minimize),
@@ -2415,6 +2436,7 @@ impl RuntimeKeymap {
                 ("move_divider_right", divider_right),
                 ("toggle_pane_zoom", self.app.toggle_pane_zoom.as_slice()),
                 ("hide_pane", self.app.hide_pane.as_slice()),
+                ("close_sidebar_tab", self.app.close_sidebar_tab.as_slice()),
                 ("open_agents", self.app.open_agents.as_slice()),
                 ("open_transcript", self.app.open_transcript.as_slice()),
                 ("find_transcript", self.app.find_transcript.as_slice()),
@@ -2549,6 +2571,10 @@ impl RuntimeKeymap {
                     self.app.focus_sidebar_content.as_slice(),
                 ),
                 (
+                    "global.focus_sidebar_tabs",
+                    self.app.focus_sidebar_tabs.as_slice(),
+                ),
+                (
                     "global.focus_pane_left",
                     self.app.focus_pane_left.as_slice(),
                 ),
@@ -2567,6 +2593,10 @@ impl RuntimeKeymap {
                     self.app.toggle_pane_zoom.as_slice(),
                 ),
                 ("global.hide_pane", self.app.hide_pane.as_slice()),
+                (
+                    "global.close_sidebar_tab",
+                    self.app.close_sidebar_tab.as_slice(),
+                ),
                 (
                     "global.select_transcript",
                     self.app.select_transcript.as_slice(),
@@ -2608,6 +2638,10 @@ impl RuntimeKeymap {
                     self.app.focus_sidebar_content.as_slice(),
                 ),
                 (
+                    "global.focus_sidebar_tabs",
+                    self.app.focus_sidebar_tabs.as_slice(),
+                ),
+                (
                     "global.focus_pane_left",
                     self.app.focus_pane_left.as_slice(),
                 ),
@@ -2626,6 +2660,10 @@ impl RuntimeKeymap {
                     self.app.toggle_pane_zoom.as_slice(),
                 ),
                 ("global.hide_pane", self.app.hide_pane.as_slice()),
+                (
+                    "global.close_sidebar_tab",
+                    self.app.close_sidebar_tab.as_slice(),
+                ),
                 ("global.focus_activity", self.app.focus_activity.as_slice()),
                 (
                     "global.find_transcript",
@@ -4183,18 +4221,16 @@ mod tests {
 
     #[test]
     fn pane_binding_only_shadows_side_toggle_in_workspace_sessions() {
-        let keymap = toml::from_str("[global]\nfocus_pane_right = 'ctrl-/'").unwrap();
-        let classic = RuntimeKeymap::for_session(&keymap, /*workspace*/ false).unwrap();
-        assert_eq!(
-            classic.app.toggle_side_conversation,
-            RuntimeKeymap::defaults().app.toggle_side_conversation
-        );
-        let workspace = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
-        assert!(workspace.app.toggle_side_conversation.is_empty());
-        assert_eq!(
-            workspace.app.focus_pane_right,
-            vec![key_hint::ctrl(KeyCode::Char('/'))]
-        );
+        for action in ["focus_pane_right", "focus_sidebar_tabs"] {
+            let keymap = toml::from_str(&format!("[global]\n{action} = 'ctrl-/'")).unwrap();
+            let classic = RuntimeKeymap::for_session(&keymap, /*workspace*/ false).unwrap();
+            assert_eq!(
+                classic.app.toggle_side_conversation,
+                RuntimeKeymap::defaults().app.toggle_side_conversation
+            );
+            let workspace = RuntimeKeymap::for_session(&keymap, /*workspace*/ true).unwrap();
+            assert!(workspace.app.toggle_side_conversation.is_empty());
+        }
     }
 
     #[test]

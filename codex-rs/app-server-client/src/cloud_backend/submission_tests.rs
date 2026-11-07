@@ -38,6 +38,7 @@ async fn native_submission_uses_one_admission_and_keeps_preflight_guards() -> Re
         cloud::Credentials::new("synthetic-bearer", "synthetic-account")?,
     )?;
     let account = protocol::GetAccountResponse {
+        user_id: None,
         account: None,
         requires_openai_auth: true,
         workspace_routing: None,
@@ -73,8 +74,17 @@ async fn native_submission_uses_one_admission_and_keeps_preflight_guards() -> Re
         .expect(2)
         .mount(&server)
         .await;
-    let Err(crate::TypedRequestError::Server { source, .. }) =
-        cloud_handle.submit_user_message(submission("x")).await
+    let url = "data:image/png;base64,iVBORw0KGgo=";
+    let image = protocol::UserInput::Image {
+        image: protocol::ImageReference::Inline { url: url.into() },
+        detail: None,
+    };
+    let Err(crate::TypedRequestError::Server { source, .. }) = cloud_handle
+        .submit_user_message(protocol::TurnStartParams {
+            input: vec![image.clone()],
+            ..submission("x")
+        })
+        .await
     else {
         panic!("a lost receipt must remain uncertain");
     };
@@ -84,7 +94,16 @@ async fn native_submission_uses_one_admission_and_keeps_preflight_guards() -> Re
     let Err(crate::TypedRequestError::Server { source, .. }) = handle
         .request_typed::<protocol::TurnStartResponse>(protocol::ClientRequest::TurnStart {
             request_id: protocol::RequestId::Integer(1),
-            params: submission("m"),
+            params: protocol::TurnStartParams {
+                input: vec![
+                    image,
+                    protocol::UserInput::Text {
+                        text: "describe the image".into(),
+                        text_elements: Vec::new(),
+                    },
+                ],
+                ..submission("m")
+            },
         })
         .await
     else {
@@ -118,6 +137,39 @@ async fn native_submission_uses_one_admission_and_keeps_preflight_guards() -> Re
         };
         assert_eq!(source.code, -32602);
     }
+    let queued = handle
+        .request(protocol::ClientRequest::TurnStart {
+            request_id: protocol::RequestId::Integer(3),
+            params: protocol::TurnStartParams {
+                input: vec![protocol::UserInput::LocalImage {
+                    path: "queued.png".into(),
+                    detail: None,
+                }],
+                ..submission("queued-image")
+            },
+        })
+        .await?
+        .expect_err("a queued attachment must fail before admission");
+    assert_eq!(queued.code, -32602);
+    assert_eq!(
+        queued.message,
+        "Prepare local images before sending them to Cloud."
+    );
+    let invalid_image = handle
+        .request(protocol::ClientRequest::TurnStart {
+            request_id: protocol::RequestId::Integer(4),
+            params: protocol::TurnStartParams {
+                input: vec![protocol::UserInput::Image {
+                    image: protocol::ImageReference::Inline { url: String::new() },
+                    detail: None,
+                }],
+                ..submission("invalid-image")
+            },
+        })
+        .await?
+        .expect_err("an invalid image must fail before admission");
+    assert_eq!(invalid_image.code, -32602);
+
     drop(reply_sender);
     let Err(crate::TypedRequestError::Server { source, .. }) =
         cloud_handle.submit_user_message(submission("closed")).await
@@ -137,6 +189,12 @@ async fn native_submission_uses_one_admission_and_keeps_preflight_guards() -> Re
     client.shutdown().await?;
     worker.await?;
     let calls = server.received_requests().await.unwrap();
+    assert!(calls.iter().all(|request| {
+        request
+            .body
+            .windows(url.len())
+            .any(|bytes| bytes == url.as_bytes())
+    }));
     assert_eq!(
         calls
             .iter()

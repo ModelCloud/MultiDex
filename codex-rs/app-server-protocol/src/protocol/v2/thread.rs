@@ -944,6 +944,8 @@ pub struct QueuedSubmission {
     pub id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// Metadata retained with this input, including across reconnect and restoration.
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -953,6 +955,9 @@ pub struct ThreadQueueAddParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// ResponsesAPI metadata captured from the client submitting this input.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -991,6 +996,9 @@ pub struct ThreadQueueUpdateParams {
     pub thread_id: String,
     pub queued_submission_id: String,
     pub input: Vec<UserInput>,
+    /// Non-empty metadata replaces the input's metadata; omission or an empty map preserves it.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

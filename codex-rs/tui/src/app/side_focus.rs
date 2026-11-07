@@ -3,11 +3,40 @@
 
 use super::sidebar::PaneFocus;
 use super::sidebar::SidebarContent;
+use super::sidebar_close::Action::CloseTab;
 use super::*;
 use crate::activation_key_guard::ActivationKeySuppression;
+use crate::app_event::SideStartMode;
+use crate::app_server_session::SideChatStorage;
+use crate::bottom_pane::ScrollState;
+use crate::keymap::ListAction;
+use crate::sidebar_chooser;
+use crate::sidebar_chooser::ChooserAction;
+use crate::sidebar_tab_strip::TabTarget;
 use crate::transcript_view::TranscriptView;
 
 impl App {
+    pub(super) fn hovered_sidebar_tab(
+        &self,
+        point: Option<ratatui::layout::Position>,
+    ) -> Option<ThreadId> {
+        let point = point?;
+        let strip = self.conversation_frame.sidebar_tab_strip()?;
+        if self.pane_resize.is_some() || !strip.contains(point) {
+            return None;
+        }
+        let pane = self.sidebar()?;
+        let tabs = pane.chat_tabs().strip();
+        let (TabTarget::Tab(id), _) = tabs.hit(strip, point)? else {
+            return None;
+        };
+        if self.conversation_frame.chat_strip.is_some() {
+            (tabs.selected != Some(id)).then_some(id)
+        } else {
+            pane.creation.is_none().then_some(id)
+        }
+    }
+
     pub(super) fn sidebar_chooser_available(&self) -> bool {
         !self.reconnect.offline
             && !self.conversation_frame.has_caller_inset()
@@ -15,15 +44,116 @@ impl App {
             && self.chat_widget.sidebar_chooser_available()
     }
 
-    pub(super) fn handle_chooser_input(&mut self, tui: &tui::Tui, event: &TuiEvent) -> bool {
-        let focus = self.chooser_focus();
-        if focus.is_none()
-            || !self.conversation_focus_available(tui)
-            || !self.sidebar_chooser_available()
+    async fn open_sidebar_tabs(
+        &mut self,
+        tui: &mut tui::Tui,
+        server: &mut AppServerSession,
+    ) -> Result<()> {
+        if let Some(parent) = self.active_side_parent_thread_id() {
+            self.select_agent_thread(tui, server, parent).await?;
+            if self.current_displayed_thread_id() != Some(parent) {
+                return Ok(());
+            }
+            self.focus_returned_parent_composer(parent).await?;
+        }
+        self.zoomed_thread = None;
+        let parent = self.current_displayed_thread_id();
+        let pane = self.sidebar_mut();
+        pane.closing_chats.retain(|_, task| !task.is_finished());
+        let was_open = pane.visible_content() == Some(SidebarContent::Chooser);
+        pane.show(SidebarContent::Chooser, PaneFocus::Sidebar);
+        if !was_open
+            && pane.creation.is_none()
+            && pane.saved_chats_request.is_none()
+            && let Some(parent) = parent
+            && server.can_list_saved_side_chats(parent)
         {
+            let request = uuid::Uuid::new_v4();
+            pane.set_saved_chats_request(Some(request));
+            let codex_home = self.config.codex_home.clone();
+            let mut view = server.request_view();
+            let tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                let result = view
+                    .list_saved_side_chats(parent, codex_home.as_path())
+                    .await
+                    .map_err(|err| format!("Failed to load saved side chats: {err}"));
+                tx.send(AppEvent::SavedSideChatsLoaded {
+                    backend_id: view.backend_id(),
+                    parent,
+                    request,
+                    result,
+                });
+            });
+        }
+        tui.frame_requester().schedule_frame();
+        Ok(())
+    }
+
+    pub(super) async fn handle_sidebar_input(
+        &mut self,
+        tui: &mut tui::Tui,
+        server: &mut AppServerSession,
+        event: &TuiEvent,
+    ) -> bool {
+        if !self.conversation_focus_available(tui) || !self.sidebar_chooser_available() {
             return false;
         }
-        let open = match event {
+        if let TuiEvent::Mouse(mouse) = event
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left | MouseButton::Middle)
+            )
+        {
+            let point = (mouse.column, mouse.row).into();
+            let frame = &self.conversation_frame;
+            let chooser = frame.chooser_area();
+            let pane = self.sidebar();
+            if (frame.chat_strip.is_some_and(|area| area.contains(point))
+                || chooser.is_some_and(|area| area.contains(point)))
+                && frame.sidebar_input != pane.map(sidebar::SidebarPane::input_state)
+            {
+                // A tab may have closed or the chooser scrolled since this frame was painted.
+                tui.frame_requester().schedule_frame();
+                return true;
+            }
+            if let Some(pane) = pane
+                && (frame.chat_strip.is_some()
+                    || (pane.creation.is_none() && pane.saved_chats_request.is_none()))
+                && let Some(strip) = frame.sidebar_tab_strip()
+                && strip.contains(point)
+            {
+                let target = pane.chat_tabs().strip().hit(strip, point);
+                let middle = mouse.kind == MouseEventKind::Down(MouseButton::Middle);
+                let result = if let Some((TabTarget::Tab(id), tab)) = target
+                    && (middle || crate::sidebar_chooser::close_cell(tab).contains(point))
+                {
+                    sidebar_close::request(self, tui, server, id, CloseTab).await
+                } else if !middle && matches!(target, Some((TabTarget::Add, _))) {
+                    self.open_sidebar_tabs(tui, server).await
+                } else if let Some((TabTarget::Tab(id), _)) = target
+                    && self.current_displayed_thread_id() != Some(id)
+                {
+                    let zoomed = self.zoomed_thread.is_some()
+                        && self.zoomed_thread == self.current_displayed_thread_id();
+                    let result = self.select_agent_thread(tui, server, id).await;
+                    if zoomed && self.current_displayed_thread_id() == Some(id) {
+                        self.zoomed_thread = Some(id);
+                    }
+                    result
+                } else {
+                    return true;
+                };
+                if let Err(err) = result {
+                    self.chat_widget.add_error_message(err.to_string());
+                }
+                return true;
+            }
+        }
+        if self.chooser_focus().is_none() {
+            return false;
+        }
+        let (action, activation) = match event {
             TuiEvent::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 tui.frame_requester().schedule_frame();
                 let Some(area) = self
@@ -35,44 +165,161 @@ impl App {
                         .show(SidebarContent::Chooser, PaneFocus::Main);
                     return false;
                 };
-                self.sidebar_mut()
-                    .show(SidebarContent::Chooser, PaneFocus::Sidebar);
-                if crate::sidebar_chooser::choice_contains(area, mouse.row) {
-                    true
-                } else if mouse.row == area.bottom() - 1 && mouse.column > area.x {
-                    let column = mouse.column - area.x - 1;
-                    let hints = crate::sidebar_chooser::footer(&self.keymap, area);
-                    match hints.items.iter().position(|range| range.contains(&column)) {
-                        Some(0) => true,      // Open.
-                        Some(1 | 3) => false, // Back or hide.
-                        _ => return true,
-                    }
-                } else {
+                let pane = self.sidebar_mut();
+                pane.show(SidebarContent::Chooser, PaneFocus::Sidebar);
+                if pane.creation.is_some() || pane.saved_chats_request.is_some() {
                     return true;
                 }
+                let choice = pane.choice;
+                let count = pane.chat_tabs().choice_count();
+                let action = if let Some(index) =
+                    crate::sidebar_chooser::choice_at(area, count, choice, mouse.row)
+                {
+                    ChooserAction::Open(index)
+                } else if mouse.row == area.bottom() - 1 && mouse.column > area.x {
+                    let column = mouse.column - area.x - 1;
+                    let (hints, actions) = sidebar_chooser::footer(&self.keymap, area, choice);
+                    let Some(action) = hints
+                        .items
+                        .into_iter()
+                        .zip(actions)
+                        .find_map(|(range, action)| action.filter(|_| range.contains(&column)))
+                    else {
+                        return true;
+                    };
+                    action
+                } else {
+                    return true;
+                };
+                (action, None)
             }
-            _ if focus != Some(PaneFocus::Sidebar) => return false,
-            TuiEvent::Key(key)
-                if key.kind == KeyEventKind::Press
-                    && key.modifiers.is_empty()
-                    && matches!(key.code, KeyCode::Esc | KeyCode::Enter) =>
-            {
-                self.chat_widget.suppress_current_view_key_until_release(
-                    KeyBinding::from_event(*key),
-                    Instant::now(),
-                    ActivationKeySuppression::ViewTransition,
-                );
+            _ if self.chooser_focus() != Some(PaneFocus::Sidebar) => return false,
+            TuiEvent::Key(key) => {
+                let Some(list_action) = self.keymap.list.action_for(*key) else {
+                    return true;
+                };
+                let area = self.conversation_frame.chooser_area();
+                let pane = self.sidebar_mut();
                 tui.frame_requester().schedule_frame();
-                key.code == KeyCode::Enter
+                let action = match (list_action, key.kind) {
+                    (ListAction::Accept, KeyEventKind::Press) => ChooserAction::Open(pane.choice),
+                    (ListAction::Cancel, KeyEventKind::Press) => ChooserAction::Back,
+                    (ListAction::MoveLeft | ListAction::MoveRight, KeyEventKind::Press)
+                        if pane.selected_chat().is_some() =>
+                    {
+                        ChooserAction::Back
+                    }
+                    _ => {
+                        let count = pane.chat_tabs().choice_count();
+                        let visible = area.map_or(1, |area| {
+                            sidebar_chooser::page_size(area, count, pane.choice)
+                        });
+                        let mut selection = ScrollState {
+                            selected_idx: Some(pane.choice),
+                            ..Default::default()
+                        };
+                        selection.apply_vertical_action(list_action, count, visible);
+                        pane.choice = selection.selected_idx.unwrap_or_default();
+                        return true;
+                    }
+                };
+                let activation = self
+                    .routed_key_activation
+                    .take()
+                    .unwrap_or_else(|| KeyBinding::from_event(*key));
+                (action, Some(activation))
             }
-            _ => return matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)),
+            _ => return matches!(event, TuiEvent::Paste(_)),
         };
-        if open {
-            self.chat_widget
-                .dispatch_command(crate::slash_command::SlashCommand::Side);
+
+        let open = matches!(action, ChooserAction::Open(_));
+        let pane = self.sidebar_mut();
+        if open && pane.saved_chats_request.is_some() {
+            return true;
         }
-        if !open || self.chat_widget.thread_id().is_none() {
-            self.sidebar_mut().hide();
+        if let Some(creation) = &pane.creation {
+            match (&creation.state, open) {
+                (sidebar::CreationState::Waiting { .. }, true) => {}
+                (sidebar::CreationState::Waiting { .. }, false) => pane.hide(),
+                (sidebar::CreationState::Failed { cleanup, .. }, _) => {
+                    if let Some(id) = *cleanup
+                        && !self.discard_side_thread(server, id).await
+                    {
+                        return true;
+                    }
+                    let message = self
+                        .sidebar_mut()
+                        .creation
+                        .take()
+                        .and_then(|creation| creation.message);
+                    if open && let Some(parent_thread_id) = self.current_displayed_thread_id() {
+                        self.app_event_tx.send(AppEvent::StartSide {
+                            parent_thread_id,
+                            user_message: message,
+                            mode: SideStartMode::New,
+                        });
+                    } else {
+                        self.restore_side_user_message(message);
+                    }
+                }
+            }
+        } else {
+            let target = match action {
+                ChooserAction::Open(index) => pane.chat_tabs().choice(index),
+                ChooserAction::Back => pane.selected_chat(),
+                ChooserAction::Hide => None,
+            };
+            if let Some(id) = target {
+                let pane = self.sidebar_mut();
+                if pane
+                    .closing_chats
+                    .get(&id)
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    self.chat_widget.add_info_message(
+                        "Side chat is still closing. Try again in a moment.".to_string(),
+                        /*hint*/ None,
+                    );
+                    return true;
+                }
+                let saved = !pane.chat_tabs().ids.contains(&id);
+                if saved && let Some(parent) = self.current_displayed_thread_id() {
+                    self.abandoned_side_threads.remove(&id);
+                    self.side_threads.insert(
+                        id,
+                        side::SideThreadState {
+                            storage: SideChatStorage::Attached,
+                            ..side::SideThreadState::new(parent)
+                        },
+                    );
+                }
+                if let Err(err) = self.select_agent_thread(tui, server, id).await {
+                    self.chat_widget.add_error_message(err.to_string());
+                }
+                if saved && self.current_displayed_thread_id() != Some(id) {
+                    self.side_threads.remove(&id);
+                }
+            } else if open && let Some(parent_thread_id) = self.chat_widget.thread_id() {
+                self.app_event_tx.send(AppEvent::StartSide {
+                    parent_thread_id,
+                    user_message: None,
+                    mode: SideStartMode::New,
+                });
+            } else {
+                if open {
+                    self.chat_widget
+                        .dispatch_command(crate::slash_command::SlashCommand::Side);
+                }
+                self.sidebar_mut().hide();
+            }
+        }
+        // Selecting a chat replaces its widget. Guard the composer that will receive repeats.
+        if let Some(activation) = activation {
+            self.chat_widget.suppress_current_view_key_until_release(
+                activation,
+                Instant::now(),
+                ActivationKeySuppression::ViewTransition,
+            );
         }
         true
     }
@@ -84,11 +331,15 @@ impl App {
         key: KeyEvent,
     ) -> bool {
         let bindings = &self.keymap.app;
+        let close = self.current_displayed_thread_id().filter(|id| {
+            bindings.close_sidebar_tab.is_pressed(key) && self.side_threads.contains_key(id)
+        });
         let left = bindings.focus_pane_left.is_pressed(key);
         let right = bindings.focus_pane_right.is_pressed(key);
         let main =
             bindings.focus_main_composer.is_pressed(key) && self.main_composer_shortcut_available();
         let sidebar = bindings.focus_sidebar_content.is_pressed(key);
+        let tabs = bindings.focus_sidebar_tabs.is_pressed(key) && self.sidebar_chooser_available();
         let hide = bindings.hide_pane.is_pressed(key);
         let width_change = if bindings.move_divider_left.is_pressed(key) {
             2
@@ -97,6 +348,7 @@ impl App {
         } else {
             0
         };
+        let can_resize = self.can_resize_sidebar(tui);
         let focused_percent = [
             (&bindings.equalize_pane_widths, 50),
             (&bindings.minimize_pane_width, 0),
@@ -104,7 +356,7 @@ impl App {
         ]
         .into_iter()
         .find_map(|(binding, percent)| binding.is_pressed(key).then_some(percent))
-        .filter(|_| self.open_pane_focus().is_some());
+        .filter(|_| can_resize);
         let zoom_target = if bindings.toggle_pane_zoom.is_pressed(key) {
             self.open_pane_focus()
         } else {
@@ -113,9 +365,17 @@ impl App {
         if width_change != 0 && !self.can_nudge_side_width(tui) {
             return false;
         }
-        let resize = bindings.resize_panes.is_pressed(key) && self.open_pane_focus().is_some();
+        let resize = bindings.resize_panes.is_pressed(key) && can_resize;
         let resizing = resize || width_change != 0 || focused_percent.is_some();
-        if !(left || right || main || sidebar || hide || zoom_target.is_some() || resizing)
+        if !(close.is_some()
+            || tabs
+            || left
+            || right
+            || main
+            || sidebar
+            || hide
+            || zoom_target.is_some()
+            || resizing)
             || !self.conversation_focus_available(tui)
         {
             return false;
@@ -142,7 +402,11 @@ impl App {
             && !on_child
             && (self.transcript_view.has_active_interaction()
                 || self.backtrack.overlay_preview_active);
-        let result = if resize {
+        let result = if let Some(id) = close {
+            sidebar_close::request(self, tui, app_server, id, CloseTab).await
+        } else if tabs {
+            self.open_sidebar_tabs(tui, app_server).await
+        } else if resize {
             self.begin_pane_resize(tui)
         } else if let Some(percent) = focused_percent {
             self.set_focused_pane_width(tui, percent).await
@@ -152,7 +416,7 @@ impl App {
             self.zoomed_thread = (self.zoomed_thread != Some(target)).then_some(target);
             tui.frame_requester().schedule_frame();
             Ok(())
-        } else if child.is_none() && chooser.is_some() {
+        } else if chooser.is_some() {
             if hide || (sidebar && chooser == Some(PaneFocus::Sidebar)) {
                 self.sidebar_mut().hide();
             } else {
@@ -187,10 +451,7 @@ impl App {
             result
         } else if sidebar && child.is_none() {
             self.focus_current_parent_view(tui);
-            self.sidebar_mut()
-                .show(SidebarContent::Chooser, PaneFocus::Sidebar);
-            tui.frame_requester().schedule_frame();
-            Ok(())
+            self.open_sidebar_tabs(tui, app_server).await
         } else if hide || sidebar {
             self.hide_focused_side_pane(tui, app_server).await
         } else {
@@ -200,8 +461,9 @@ impl App {
         if let Err(err) = result {
             self.chat_widget.add_error_message(err.to_string());
         }
-        let view_changed =
-            leaves_transcript || self.current_displayed_thread_id() != previous_thread;
+        let view_changed = leaves_transcript
+            || self.current_displayed_thread_id() != previous_thread
+            || (main && chooser == Some(PaneFocus::Sidebar));
         let suppression = if view_changed {
             ActivationKeySuppression::ViewTransition
         } else {
