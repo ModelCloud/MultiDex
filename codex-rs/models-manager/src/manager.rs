@@ -384,6 +384,13 @@ impl ModelsManager for ModelsManagerOverlay {
         })
     }
 
+    fn ensure_initialized(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        self.inner.ensure_initialized(http_client_factory)
+    }
+
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.inner.set_api_key_model_discovery_enabled(enabled);
     }
