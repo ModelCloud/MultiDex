@@ -96,6 +96,8 @@ mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
+#[path = "tests/side_chat_policy_tests.rs"]
+mod side_chat_policy_tests;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -2247,9 +2249,8 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() 
             token_usage_notification(thread_id, "turn-1", Some(window)),
         )));
         assert!(matches!(
-            (extensions, app.chat_widget.status_line_content()),
-            (false, Some(FooterContent::HyperlinkLine(_)))
-                | (true, Some(FooterContent::Extension { .. }))
+            app.chat_widget.status_line_content(),
+            Some(FooterContent::HyperlinkLine(_))
         ));
         let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 60);
         assert!(
@@ -3322,6 +3323,356 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()> 
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sidebar_reopens_saved_side_chat_after_restart() -> Result<()> {
+    use crate::app_server_session::ResumeModelSettings;
+    use crate::app_server_session::SideChatStorage;
+    use codex_app_server_client::AppServerEvent;
+
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    let model = core_test_support::responses::start_mock_server().await;
+    app_test_support::MockResponsesConfig::new(&model.uri()).write(&app.config.codex_home)?;
+    app.config = app
+        .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+        .await?;
+    let config = app.config.clone();
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    let parent = server.start_thread(&config).await?.session.thread_id;
+    side_chat_policy_tests::ask(&mut server, &model, parent, "Parent-only prompt").await?;
+    server.thread_set_name(parent, "New name".into()).await?;
+    let incomplete = server
+        .fork_side_thread(
+            &app.local_settings,
+            config.clone(),
+            parent,
+            /*selected_profile*/ None,
+            SideChatStorage::Attached,
+        )
+        .await?
+        .session
+        .thread_id;
+    let fork = server
+        .sidebar_fork(
+            app.local_settings.clone(),
+            config.clone(),
+            parent,
+            /*profile*/ None,
+            SideChatStorage::Attached,
+        )
+        .await?;
+    assert_eq!(fork.boundary, Ok(()));
+    let child = server
+        .fork_side_thread(
+            &app.local_settings,
+            config.clone(),
+            parent,
+            /*selected_profile*/ None,
+            SideChatStorage::Attached,
+        )
+        .await?
+        .session
+        .thread_id;
+    // Older daemons copy the parent's name before the client can write the side-chat boundary.
+    server.thread_set_name(child, "New name".into()).await?;
+    server
+        .thread_inject_items(
+            child,
+            codex_context_fragments::SideConversationPolicy::Attached.fork_items(),
+        )
+        .await?;
+    let children = [fork.thread.session.thread_id, child];
+    server.shutdown().await?;
+
+    let child_id = child.to_string();
+    // A cold resume before the first prompt can seed the summary from the parent's history.
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    let started = server
+        .resume_thread(
+            &app.local_settings,
+            config.clone(),
+            child,
+            ResumeModelSettings::PreserveExistingThread,
+        )
+        .await?;
+    assert!(
+        started.turns.is_empty(),
+        "inherited turns should stay hidden"
+    );
+    side_chat_policy_tests::ask(&mut server, &model, child, "Child-only prompt").await?;
+    let expected_child_turn = server
+        .thread_read(child, /*include_turns*/ true)
+        .await?
+        .turns
+        .pop()
+        .expect("completed child turn");
+    server.shutdown().await?;
+
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    let started = server
+        .resume_thread(
+            &app.local_settings,
+            config,
+            parent,
+            ResumeModelSettings::PreserveExistingThread,
+        )
+        .await?;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    while events.try_recv().is_ok() {}
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    enable_side_retention(&mut app)?;
+    app.local_settings.tui.animations = false;
+    tui.set_owned_screen(/*owned*/ true)?;
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyCode::Char('t').into(),
+    ] {
+        boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key))).await?;
+    }
+    let size = Size::new(/*width*/ 208, /*height*/ 12);
+    let loading = side_frame(&mut app, &mut tui, size)?;
+    let (_, loading) = loading
+        .lines()
+        .find_map(|line| {
+            line.split_once('│')
+                .filter(|(_, pane)| pane.contains("Loading side chats"))
+        })
+        .expect("pending side-chat discovery");
+    insta::assert_snapshot!(loading.trim(), @"Loading side chats…");
+    loop {
+        let event = time::timeout(Duration::from_secs(5), events.recv())
+            .await?
+            .expect("event stream");
+        let loaded = matches!(event, AppEvent::SavedSideChatsLoaded { .. });
+        boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
+        if loaded {
+            break;
+        }
+    }
+    let frame = side_frame(&mut app, &mut tui, size)?;
+    let picker = frame
+        .lines()
+        .filter_map(|line| line.split_once('│').map(|(_, pane)| pane.trim_end()))
+        .skip_while(|line| !line.contains("Open in sidebar"))
+        .take_while(|line| !line.contains(" open · "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(picker.trim_end(), @"
+    Open in sidebar
+
+      + New side chat                        Start from the main chat
+
+      Side chats  2
+    › ○ Side chat 1
+      ○ Child-only prompt
+    ");
+    app.local_settings.tui.keymap = toml::from_str("[list]\naccept = ['f5 g']")?;
+    enable_side_retention(&mut app)?;
+    for key in [KeyCode::Char('j'), KeyCode::F(5), KeyCode::Char('g')] {
+        boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into())))
+            .await?;
+    }
+    assert_eq!(app.current_displayed_thread_id(), Some(child));
+    let tabs = app.sidebar().unwrap().chat_tabs();
+    assert_eq!(
+        [tabs.choice(/*index*/ 1), tabs.choice(/*index*/ 2)],
+        [Some(children[0]), Some(child)]
+    );
+    assert_eq!(app.active_side_parent_thread_id(), Some(parent));
+    let channel = &app.thread_event_channels[&child];
+    assert_eq!(channel.attachment(), ThreadEventAttachment::Live);
+    {
+        let store = channel.store.lock().await;
+        let [restored] = store.turns.as_slice() else {
+            panic!("expected only the completed child turn");
+        };
+        assert_eq!(restored.items, expected_child_turn.items);
+    }
+    drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+    let release = KeyEvent::new_with_kind(
+        KeyCode::Char('g'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
+    boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(release))).await?;
+    app.chat_widget.insert_str("/rename New name");
+    boxed_future!(app.handle_tui_event(
+        &mut tui,
+        &mut server,
+        TuiEvent::Key(KeyCode::Enter.into())
+    ))
+    .await?;
+    drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+    // The name notification still updates the tab after focus returns to the parent.
+    app.select_agent_thread(&mut tui, &mut server, parent)
+        .await?;
+    drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+    loop {
+        let event = time::timeout(Duration::from_secs(/*secs*/ 5), server.next_event())
+            .await?
+            .expect("app-server event stream");
+        let renamed = matches!(
+            &event.event,
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::ThreadNameUpdated(update)
+                    if update.thread_id == child_id && update.thread_name.as_deref() == Some("New name"))
+        );
+        app.handle_app_server_event(&server, event.event).await;
+        if renamed {
+            break;
+        }
+    }
+    let frame = side_frame(&mut app, &mut tui, size)?;
+    assert!(
+        frame.lines().next().unwrap().contains("New name"),
+        "{frame}"
+    );
+    let saved = server
+        .list_saved_side_chats(parent, app.config.codex_home.as_path())
+        .await?;
+    assert_eq!(
+        saved
+            .iter()
+            .find(|chat| chat.id == child)
+            .and_then(|chat| chat.name.as_deref()),
+        Some("New name")
+    );
+    app.select_agent_thread(&mut tui, &mut server, child)
+        .await?;
+    drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+    let archive = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(archive))).await?;
+    let frame = side_frame(&mut app, &mut tui, size)?;
+    let prompt = frame
+        .lines()
+        .filter_map(|line| line.split_once('│'))
+        .map(|(_, pane)| pane.trim())
+        .find(|line| line.contains("remove it"))
+        .unwrap_or_else(|| panic!("expected the archive confirmation in {frame}"));
+    insta::assert_snapshot!(prompt, @"This will remove it from Side chats. Archive “New name”?");
+    let enter = TuiEvent::Key(KeyCode::Enter.into());
+    boxed_future!(app.handle_tui_event(&mut tui, &mut server, enter)).await?;
+    assert_eq!(app.current_displayed_thread_id(), Some(child));
+    let rollout = server
+        .thread_read(child, /*include_turns*/ false)
+        .await?
+        .path
+        .expect("saved child");
+    let destination = app
+        .config
+        .codex_home
+        .join("archived_sessions")
+        .join(rollout.file_name().unwrap());
+    std::fs::create_dir_all(&destination)?;
+    for blocked in [true, false] {
+        boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(archive))).await?;
+        side_frame(&mut app, &mut tui, size)?;
+        for key in [KeyCode::Right.into(), KeyCode::Enter.into()] {
+            boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key))).await?;
+        }
+        loop {
+            let event = time::timeout(Duration::from_secs(/*secs*/ 5), events.recv())
+                .await?
+                .expect("archive result");
+            let finished = matches!(&event, AppEvent::SideChatRemovalFinished { target, .. } if *target == child);
+            boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
+            if finished {
+                break;
+            }
+        }
+        assert_eq!(app.current_displayed_thread_id(), Some(parent));
+        if blocked {
+            assert_eq!(
+                app.thread_event_channels[&child].attachment(),
+                ThreadEventAttachment::ReplayOnly
+            );
+            std::fs::remove_dir(&destination)?;
+            app.select_agent_thread(&mut tui, &mut server, child)
+                .await?;
+            assert_eq!(
+                app.thread_event_channels[&child].attachment(),
+                ThreadEventAttachment::Live
+            );
+            side_chat_policy_tests::ask(&mut server, &model, child, "After failed archive").await?;
+        }
+    }
+    let saved = server
+        .request_view()
+        .list_saved_side_chats(parent, app.config.codex_home.as_path())
+        .await?;
+    for chats in [app.sidebar().unwrap().chat_tabs().choices, saved.as_slice()] {
+        assert_eq!(
+            chats.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+            [children[0]]
+        );
+    }
+    // An archive performed outside this TUI also removes a saved, closed tab from the chooser.
+    server.request_view().thread_archive(children[0]).await?;
+    loop {
+        let event = time::timeout(Duration::from_secs(/*secs*/ 5), server.next_event())
+            .await?
+            .expect("server event");
+        let archived = matches!(&event.event, AppServerEvent::ServerNotification(n)
+            if matches!(n.as_ref(), ServerNotification::ThreadArchived(a) if a.thread_id == children[0].to_string()));
+        app.handle_app_server_event(&server, event.event).await;
+        if archived {
+            break;
+        }
+    }
+    drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+    assert!(app.sidebar().unwrap().chat_tabs().choices.is_empty());
+
+    let other_attachment: codex_app_server_protocol::ThreadForkResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::ThreadFork {
+            request_id: server.next_request_id(),
+            params: codex_app_server_protocol::ThreadForkParams {
+                thread_id: parent.to_string(),
+                attach_to_source: true,
+                exclude_turns: true,
+                ..Default::default()
+            },
+        })
+        .await?;
+    app.delete_current_thread(&mut tui, &mut server).await?;
+    let errors = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 160)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("an attachment outside the TUI sidebar")),
+        "{errors:?}"
+    );
+    let ids = [parent, incomplete, children[0], children[1]];
+    for id in ids {
+        server.thread_read(id, /*include_turns*/ false).await?;
+    }
+
+    server
+        .thread_delete(ThreadId::from_string(&other_attachment.thread.id)?)
+        .await?;
+    app.delete_current_thread(&mut tui, &mut server).await?;
+    for id in ids {
+        let error = server
+            .thread_read(id, /*include_turns*/ false)
+            .await
+            .expect_err("parent deletion removes the saved side chat");
+        assert!(
+            format!("{error:#}").contains(&format!("thread not loaded: {id}")),
+            "{error:#}"
+        );
+    }
+    server.shutdown().await?;
     Ok(())
 }
 
@@ -4507,11 +4858,10 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
 
     // Open a sibling from the chooser, then revisit each retained conversation.
     let chooser_key = KeyEvent::from(KeyCode::Char('t'));
-    let [up, down, enter] =
-        [KeyCode::Char('k'), KeyCode::Char('j'), KeyCode::Enter].map(KeyEvent::from);
+    let [up, enter] = [KeyCode::Char('k'), KeyCode::Enter].map(KeyEvent::from);
     side_frame(&mut app, &mut tui, even)?;
     let sidebar_x = app.conversation_frame.chat_strip.unwrap().x;
-    keys!(prefix, chooser_key, down, enter);
+    keys!(prefix, chooser_key, up, enter);
     app.local_settings.tui.keymap = toml::from_str("[global]\nleader = 'f12'")?;
     enable_side_retention(&mut app)?;
     app.local_settings.tui.animations = false;
@@ -4526,6 +4876,32 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
     read_side_history(&mut app, &mut tui, "sibling")?;
     app.chat_widget.insert_str("sibling draft");
+    for (thread, prompt) in [
+        (side_thread_id, "Investigate rendering"),
+        (sibling, "Fix cache"),
+        (side_thread_id, "Later prompt"),
+    ] {
+        app.enqueue_thread_notification(
+            thread,
+            ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification::new(
+                    thread.to_string(),
+                    "side-turn".to_string(),
+                    ThreadItemPayload::UserMessage {
+                        id: prompt.to_string(),
+                        client_id: None,
+                        content: vec![UserInput::Text {
+                            text: prompt.to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    /*started_at_ms*/ None,
+                    /*completed_at_ms*/ 0,
+                ),
+            ),
+        )
+        .await?;
+    }
     let frame = side_frame(&mut app, &mut tui, even)?;
     let header = frame.lines().next().unwrap().split_once('│').unwrap().1;
     assert_app_snapshot!("side_chat_tabs", header.trim_end());
@@ -4649,6 +5025,120 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     side_frame(&mut app, &mut tui, even)?;
     assert!(app.conversation_frame.chooser_area().is_some());
     assert_eq!(divider_at(&tui, 4), target);
+
+    // Closing from the chooser must not switch to the tab before confirmation.
+    let chooser_focus = app.chooser_focus();
+    let chooser = app.conversation_frame.chooser_area().unwrap();
+    let close_x = (chooser.x..chooser.right())
+        .rfind(|&x| tui.terminal.previous_buffer()[(x, chooser.y)].symbol() == "×")
+        .expect("close button on the second tab");
+    let click_close = mouse(down, close_x, chooser.y);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, click_close)).await?;
+    let frame = side_frame(&mut app, &mut tui, even)?;
+    let dialog = frame
+        .lines()
+        .filter_map(|row| row.split_once('│').map(|(_, s)| s.trim_end()))
+        .take(7)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_app_snapshot!("close_side_chat_tab", dialog.trim_end());
+    keys!(KeyCode::Esc.into());
+    assert_eq!(app.current_displayed_thread_id(), Some(parent_thread_id));
+    assert_eq!(app.chooser_focus(), chooser_focus);
+    side_frame(&mut app, &mut tui, even)?;
+    boxed_future!(app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        mouse(down, close_x - 1, chooser.y)
+    ))
+    .await?;
+    drain_app_events(&mut app, &mut tui, &mut app_server, &mut app_event_rx).await?;
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "sibling draft"
+    );
+    // An idle, saved tab with only a queued follow-up still needs confirmation.
+    app.side_threads.get_mut(&sibling).unwrap().storage =
+        crate::app_server_session::SideChatStorage::Attached;
+    app.chat_widget.apply_external_edit(String::new());
+    app.chat_widget
+        .set_queue_autosend_suppressed(/*suppressed*/ true);
+    assert!(app.chat_widget.queue_user_message_with_options(
+        "queued follow-up".into(),
+        crate::bottom_pane::QueuedInputAction::Plain,
+        Vec::new(),
+    ));
+    keys!(prefix, chooser_key);
+    side_frame(&mut app, &mut tui, even)?;
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, mouse(down, close_x, chooser.y)))
+        .await?;
+    assert!(side_frame(&mut app, &mut tui, even)?.contains("discard unsent input"));
+    keys!(KeyCode::Esc.into());
+    app.select_agent_thread(&mut tui, &mut app_server, sibling)
+        .await?;
+    keys!(prefix, KeyCode::Char('w').into());
+    side_frame(&mut app, &mut tui, even)?;
+    keys!(KeyCode::Right.into(), enter);
+    while app.side_threads.contains_key(&sibling) {
+        let event = time::timeout(Duration::from_secs(/*secs*/ 5), app_event_rx.recv())
+            .await?
+            .expect("app event");
+        boxed_future!(app.handle_event(&mut tui, &mut app_server, event)).await?;
+    }
+    assert_eq!(app.current_displayed_thread_id(), Some(side_thread_id));
+
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn side_close_key_cannot_accept_a_replacing_approval() -> Result<()> {
+    let mut app = make_test_app().await;
+    enable_side_retention(&mut app)?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let parent = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+    app.primary_thread_id = Some(parent);
+    app.active_thread_id = Some(side_thread_id);
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(parent));
+    app.sidebar_mut().show(
+        sidebar::SidebarContent::Chat(side_thread_id),
+        sidebar::PaneFocus::Sidebar,
+    );
+    sidebar_close::request(
+        &mut app,
+        &mut tui,
+        &mut app_server,
+        side_thread_id,
+        sidebar_close::Action::CloseTab,
+    )
+    .await?;
+    let even = Size::new(/*width*/ 180, /*height*/ 24);
+    let enter = KeyEvent::from(KeyCode::Enter);
+    side_frame(&mut app, &mut tui, even)?;
+    assert!(app.sidebar().unwrap().close.is_some());
+    let request = exec_approval_request(side_thread_id, "turn", "call", /*approval_id*/ None);
+    let Some(ThreadInteractiveRequest::Approval(approval)) = app
+        .interactive_request_for_thread_request(side_thread_id, &request)
+        .await?
+    else {
+        panic!("command approval");
+    };
+    app.chat_widget.push_approval_request(approval);
+    assert!(
+        app.chat_widget.has_active_modal(),
+        "approval is visible to the input router"
+    );
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Key(enter))).await?;
+    assert!(app.chat_widget.has_active_modal());
+    side_frame(&mut app, &mut tui, even)?;
+    assert!(app.sidebar().unwrap().close.is_none());
+    let repeat = KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Key(repeat))).await?;
+    assert!(app.chat_widget.has_active_modal());
 
     app_server.shutdown().await?;
     Ok(())
@@ -6631,7 +7121,8 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
     let original_approval_policy = app.config.permissions.approval_policy.value();
     let original_sandbox_policy = app.config.legacy_sandbox_policy();
 
-    let fork_config = app.side_fork_config();
+    let mut fork_config = app.side_fork_config();
+    crate::app_server_session::SideChatStorage::Temporary.configure_fork(&mut fork_config);
 
     assert!(fork_config.ephemeral);
     assert_eq!(
@@ -7215,17 +7706,26 @@ async fn app_scoped_mcp_startup_notifications_do_not_render_in_active_thread() {
 async fn active_side_thread_renders_live_mcp_startup_notifications() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     while app_event_rx.try_recv().is_ok() {}
-    let sentry_config = toml::from_str::<toml::Value>("command = 'true'")
-        .expect("test MCP config should parse")
-        .try_into()
-        .expect("test MCP config should deserialize");
+    app.config
+        .features
+        .enable(Feature::McpLazyStdioStartup)
+        .unwrap();
     app.config
         .mcp_servers
-        .set(std::collections::HashMap::from([(
-            "sentry".to_string(),
-            sentry_config,
-        )]))
-        .expect("test MCP servers should accept any configuration");
+        .set(
+            toml::from_str(
+                r#"
+        [first]
+        command = "first"
+        required = true
+        [second]
+        command = "second"
+        required = true
+    "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
         .await
         .expect("embedded app server");
@@ -7252,16 +7752,21 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
     );
     app.sync_side_thread_ui();
 
-    for status in [
-        McpServerStartupState::Starting,
-        McpServerStartupState::Failed,
+    // The plugin contributes sentry, so it is absent from the explicit server list.
+    for (name, status, busy) in [
+        ("first", McpServerStartupState::Starting, true),
+        ("first", McpServerStartupState::Ready, true),
+        ("second", McpServerStartupState::Starting, true),
+        ("second", McpServerStartupState::Ready, false),
+        ("sentry", McpServerStartupState::Starting, true),
+        ("sentry", McpServerStartupState::Failed, false),
     ] {
         app.handle_app_server_event(
             &app_server,
             codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
                 ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
                     thread_id: Some(side_thread_id.to_string()),
-                    name: "sentry".to_string(),
+                    name: name.to_string(),
                     status,
                     error: matches!(status, McpServerStartupState::Failed)
                         .then(|| "sentry is not logged in".to_string()),
@@ -7270,18 +7775,18 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
             )),
         )
         .await;
-    }
-
-    let mut active_thread_events = Vec::new();
-    let active_thread_rx = app
-        .active_thread_rx
-        .as_mut()
-        .expect("side thread receiver should be active");
-    while let Ok(event) = active_thread_rx.try_recv() {
-        active_thread_events.push(event);
-    }
-    for event in active_thread_events {
+        let event = app
+            .active_thread_rx
+            .as_mut()
+            .expect("side thread receiver")
+            .try_recv()
+            .expect("startup notification");
         app.handle_thread_event_now(event);
+        assert_eq!(
+            app.chat_widget.is_task_running_for_test(),
+            busy,
+            "{name} {status:?}"
+        );
     }
 
     let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");

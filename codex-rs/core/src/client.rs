@@ -508,8 +508,9 @@ pub struct ModelClient {
 /// A turn-scoped streaming session created from a [`ModelClient`].
 ///
 /// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
-/// requests within the turn. It borrows continuation state from the conversation and owns routing
-/// state for this turn:
+/// requests within the turn. Runtime-authenticated requests reconnect between requests to
+/// revalidate the registered credential source. It borrows continuation state from the
+/// conversation and owns routing state for this turn, caching per-turn state:
 ///
 /// - The last full request, so subsequent calls can reuse incremental Responses request payloads
 ///   only when the current request is an incremental extension of the previous one.
@@ -1255,8 +1256,7 @@ impl ModelClient {
                 expected_auth,
                 &setup.api_provider.headers,
             )
-            .await
-            .map_err(|error| codex_api::map_api_error(error.into()))?;
+            .await?;
             setup.api_auth = provider
                 .compose_auth(codex_model_provider::ResolvedProviderAuth {
                     credential: Some(selected.auth().clone()),
@@ -2267,7 +2267,10 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        // Runtime admission belongs to the request that will use the connection.
+        if !self.client.responses_websocket_enabled()
+            || self.client.state.provider.runtime_auth().is_some()
+        {
             return Ok(());
         }
         let provider = Arc::clone(&self.client.state.provider);
@@ -2382,8 +2385,10 @@ impl ModelClientSession {
         };
         let connection_key = ResponsesConnectionKey::new(&api_provider, auth_revision);
         let reset_reason = match self.websocket_session.connection.as_ref() {
+            // Reauthenticate before each runtime request; an open socket cannot prove liveness.
             Some(_)
-                if self.websocket_session.responses_headers != *responses_headers
+                if runtime_id.is_some()
+                    || self.websocket_session.responses_headers != *responses_headers
                     || self.websocket_session.connection_key.as_ref() != Some(&connection_key)
                     || self.websocket_session.runtime_id != runtime_id
                     || self.websocket_session.parent_routing_affinity
@@ -2665,11 +2670,8 @@ impl ResponsesHttpExecutor<'_> {
             options.extra_headers.extend(responses_headers);
             let thread_id = self.client.state.thread_id.to_string();
             let kind = codex_extension_api::ModelRequestKind::Generation;
-            crate::model_request::check_budget(
-                &self.client.request_contributors,
-                &thread_id,
-                kind,
-            )?;
+            crate::model_request::check_budget(&self.client.request_contributors, &thread_id, kind)
+                .await?;
             let mut interceptors = crate::model_request::prepare(
                 &self.client.request_contributors,
                 &thread_id,
@@ -2905,11 +2907,8 @@ impl ModelClientSession {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            crate::model_request::check_budget(
-                &self.client.request_contributors,
-                &thread_id,
-                kind,
-            )?;
+            crate::model_request::check_budget(&self.client.request_contributors, &thread_id, kind)
+                .await?;
             let client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
@@ -3005,11 +3004,18 @@ impl ModelClientSession {
             }
 
             // The budget can be exhausted while the connection is being established.
-            crate::model_request::check_budget(
-                &self.client.request_contributors,
-                &thread_id,
-                kind,
-            )?;
+            if !warmup && !self.client.request_contributors.is_empty() {
+                crate::model_request::check_budget(
+                    &self.client.request_contributors,
+                    &thread_id,
+                    kind,
+                )
+                .await?;
+                // An account switch during the check requires fresh request setup and a new socket.
+                if self.websocket_session.auth_owner != self.client.auth_owner() {
+                    continue;
+                }
+            }
 
             let mut client_metadata = self.client.build_ws_client_metadata(
                 responses_metadata,

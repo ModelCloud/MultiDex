@@ -324,7 +324,6 @@ use crate::guardian::GuardianReviewSessionManager;
 use crate::mcp::McpEnvironmentScope;
 use crate::mcp::McpManager;
 use crate::mcp::McpThreadIdentity;
-use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
@@ -607,15 +606,14 @@ impl Session {
         session_source: &SessionSource,
         allow_provider_model_fallback: bool,
     ) -> CodexResult<(String, CatalogModel)> {
+        // Child catalogs are initialized by their selector. Reading only memory here
+        // preserves the loaded snapshot shared with the parent.
         let refresh_strategy = if session_source.is_non_root_agent() {
-            RefreshStrategy::Offline
+            RefreshStrategy::InMemory
         } else {
             RefreshStrategy::OnlineIfUncached
         };
-        if config.features.enabled(Feature::RuntimeAgentInstances)
-            || config.model.is_none()
-            || refresh_strategy != RefreshStrategy::Offline
-        {
+        if !session_source.is_non_root_agent() {
             let _ = models_manager
                 .list_models(refresh_strategy, config.http_client_factory())
                 .await;
@@ -2192,6 +2190,7 @@ impl Session {
     ) -> ConstraintResult<Option<SessionSettingsCommit>> {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let windows_sandbox_changed;
+        let mut tier_acceptance = None;
         let (
             commit,
             previous_config,
@@ -2274,7 +2273,7 @@ impl Session {
             }
             state.session_configuration = updated;
             if root_service_tier_changed && !state.shared_service_tier_pending {
-                crate::agent::host::propagate_config_update(
+                state.service_tier_acceptance = crate::agent::host::propagate_config_update(
                     self,
                     AgentConfigUpdate::ServiceTier(
                         state
@@ -2284,6 +2283,9 @@ impl Session {
                             .clone(),
                     ),
                 );
+            }
+            if root_service_tier_changed || updates.step_settings.service_tier.is_some() {
+                tier_acceptance = state.service_tier_acceptance.clone();
             }
             let new_config = notify_config_contributors
                 .then(|| self.build_effective_session_config(&state.session_configuration));
@@ -2326,6 +2328,9 @@ impl Session {
         }
         if mcp_inputs_changed {
             self.schedule_mcp_prewarm();
+        }
+        if let Some(accepted) = tier_acceptance {
+            accepted.await;
         }
         Ok(Some(commit))
     }
@@ -3232,49 +3237,19 @@ impl Session {
             .session_configuration
             .codex_home()
             .clone();
-        let execpolicy_amendment =
-            execpolicy_network_rule_amendment(amendment, network_approval_context, &host);
-        let mut on_policy_applied = Some(on_policy_applied);
-
-        if let Some(started_network_proxy) = self.services.network_proxy.load_full() {
-            let proxy = started_network_proxy.proxy();
-            match amendment.action {
-                NetworkPolicyRuleAction::Allow => proxy
-                    .add_allowed_domain(&host)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("failed to update runtime allowlist: {err}"))?,
-                NetworkPolicyRuleAction::Deny => proxy
-                    .add_denied_domain(&host)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("failed to update runtime denylist: {err}"))?,
-            }
-            // Active enforcement changed successfully. Notify the owner before
-            // the next fallible await so cancellation cannot contradict it.
-            if let Some(on_policy_applied) = on_policy_applied.take() {
-                on_policy_applied();
-            }
-        }
-
+        let started_proxy = self.services.network_proxy.load_full();
+        let proxy = started_proxy.as_deref().map(StartedNetworkProxy::proxy);
         self.services
             .exec_policy
-            .append_network_rule_and_update(
+            .apply_network_rule_and_persist(
                 &codex_home,
                 &host,
-                execpolicy_amendment.protocol,
-                execpolicy_amendment.decision,
-                Some(execpolicy_amendment.justification),
+                amendment,
+                network_approval_context,
+                proxy.as_ref(),
+                on_policy_applied,
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("failed to persist network policy amendment to execpolicy: {err}")
-            })?;
-
-        // Without a running proxy, persistence is the first effective policy change.
-        if let Some(on_policy_applied) = on_policy_applied {
-            on_policy_applied();
-        }
-
-        Ok(())
     }
 
     fn validated_network_policy_amendment_host(
@@ -4393,8 +4368,11 @@ impl Session {
             )
         };
         if self.inherits_root_service_tier(&turn_context.session_source) {
-            let root_service_tier =
-                crate::agent::host::service_tier(self, settings.selected().service_tier.clone());
+            let root_service_tier = tokio::select! {
+                biased;
+                tier = crate::agent::host::service_tier(self, settings.selected().service_tier.clone()) => tier,
+                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+            };
             if settings.selected().service_tier != root_service_tier {
                 let mut selected = settings.selected().clone();
                 selected.service_tier = root_service_tier;

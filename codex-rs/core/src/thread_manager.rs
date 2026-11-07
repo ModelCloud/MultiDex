@@ -19,6 +19,7 @@ use crate::agent::LocalAgentControl;
 use crate::agent::api::AgentControl;
 use crate::agent::control::AgentControlInit;
 use crate::agent::host::InheritedSessionId;
+use crate::agent::host::ServiceTierAcceptance;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
@@ -1130,12 +1131,16 @@ impl ThreadManager {
                 /*parent_originator*/ None,
             )
             .await;
-        let manager = self.state.models_for_thread(
-            &options.config,
-            &self.state.auth_manager,
-            &self.state.runtime_auth,
-            &originator,
-        );
+        let manager = self
+            .state
+            .models_for_thread(
+                &options.config,
+                &self.state.auth_manager,
+                &self.state.runtime_auth,
+                &originator,
+                &source,
+            )
+            .await;
         let (_, info) = Session::resolve_startup_model(
             manager.as_ref(),
             &options.config,
@@ -1933,12 +1938,13 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
-    fn models_for_thread(
+    async fn models_for_thread(
         &self,
         config: &Config,
         auth_manager: &Arc<AuthManager>,
         runtime_auth: &crate::runtime_auth::RuntimeAuthSlot,
         originator: &str,
+        session_source: &SessionSource,
     ) -> SharedModelsManager {
         let runtime = crate::runtime_auth::runtime_for_config(
             runtime_auth,
@@ -1946,13 +1952,16 @@ impl ThreadManagerState {
             Arc::clone(auth_manager),
             &self.installation_id,
         );
-        let manager = self.model_catalog.for_thread(
-            config,
-            Arc::clone(auth_manager),
-            runtime,
-            Arc::ptr_eq(auth_manager, &self.auth_manager),
-        );
-        manager.for_originator(originator).unwrap_or(manager)
+        self.model_catalog
+            .for_thread(
+                config,
+                Arc::clone(auth_manager),
+                runtime,
+                Arc::ptr_eq(auth_manager, &self.auth_manager),
+                originator,
+                session_source,
+            )
+            .await
     }
 
     pub(crate) fn shared_thread_instructions_provider(
@@ -2822,12 +2831,22 @@ impl ThreadManagerState {
         } else {
             Arc::new(mcp_manager.for_plugins_manager(Arc::clone(&plugins_manager)))
         };
-        let models_manager = self.models_for_thread(
-            &config,
-            &auth_manager,
-            &runtime_auth,
-            &startup_context.originator,
-        );
+        let models_manager = tokio::select! {
+            biased;
+            _ = agent_control.runtime().shutdown.cancelled() => {
+                if let Some(startup_guard) = startup_guard {
+                    startup_guard.cleanup().await;
+                }
+                return Err(CodexErr::TurnAborted);
+            }
+            manager = self.models_for_thread(
+                &config,
+                &auth_manager,
+                &runtime_auth,
+                &startup_context.originator,
+                &session_source,
+            ) => manager,
+        };
         let spawn_result = Session::spawn(SessionSpawnArgs {
             attached_thread,
             startup,
@@ -2923,8 +2942,8 @@ impl ThreadManagerState {
         let finalize_result = self
             .finalize_thread_spawn(session, io, tracked_session_source)
             .await;
-        let new_thread = match finalize_result {
-            Ok(new_thread) => new_thread,
+        let (new_thread, tier_acceptance) = match finalize_result {
+            Ok(registered) => registered,
             Err(error) => {
                 if let Some(startup_guard) = startup_guard {
                     startup_guard.cleanup().await;
@@ -2945,6 +2964,10 @@ impl ThreadManagerState {
         if let Some(startup_guard) = startup_guard {
             startup_guard.disarm();
         }
+        // Cancelling this wait must leave the registered runtime and the host handoff intact.
+        if let Some(accepted) = tier_acceptance {
+            accepted.await;
+        }
         Ok(new_thread)
     }
 
@@ -2953,7 +2976,7 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
-    ) -> CodexResult<NewThread> {
+    ) -> CodexResult<(NewThread, Option<ServiceTierAcceptance>)> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
         let session_configured = match event {
@@ -2994,15 +3017,18 @@ impl ThreadManagerState {
                     session_source,
                 ));
                 e.insert(thread.clone());
-                if let Some((mut state, update)) = pending_service_tier {
-                    crate::agent::host::propagate_config_update(&session, update);
+                let tier_acceptance = pending_service_tier.and_then(|(mut state, update)| {
+                    state.service_tier_acceptance =
+                        crate::agent::host::propagate_config_update(&session, update);
                     state.shared_service_tier_pending = false;
-                }
-                return Ok(NewThread {
+                    state.service_tier_acceptance.clone()
+                });
+                let new_thread = NewThread {
                     thread_id,
                     thread,
                     session_configured,
-                });
+                };
+                return Ok((new_thread, tier_acceptance));
             }
         }
 

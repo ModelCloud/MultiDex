@@ -38,6 +38,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
+use crate::chatwidget::ClipboardPasteContext;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::ThreadInputState;
@@ -220,6 +221,9 @@ mod backend_events;
 pub(crate) mod backend_selection;
 pub(crate) mod backend_sessions;
 mod background_requests;
+mod cloud_switch_wait;
+#[cfg(test)]
+pub(crate) use cloud_switch_wait::wait_for_cloud_switch;
 mod composer_hints;
 mod config_panel;
 mod config_persistence;
@@ -278,6 +282,7 @@ mod side_companion;
 mod side_focus;
 mod side_pane;
 mod sidebar;
+mod sidebar_close;
 mod startup;
 pub(crate) mod startup_bootstrap;
 mod startup_prompts;
@@ -852,13 +857,23 @@ impl App {
         self.transcript_view
             .sync_patch_approval(self.chat_widget.current_patch_approval());
         // A chooser action must never decide a modal that has not been painted yet.
-        if self.conversation_frame.chooser_area().is_some()
+        if (self.conversation_frame.chooser_area().is_some()
+            || self.sidebar().is_some_and(|pane| pane.close.is_some()))
             && self.chat_widget.has_active_modal()
             && matches!(
                 &event,
                 TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_)
             )
         {
+            if let TuiEvent::Key(key) = &event
+                && key.kind != KeyEventKind::Release
+            {
+                self.chat_widget.suppress_current_view_key_until_release(
+                    KeyBinding::from_event(*key),
+                    Instant::now(),
+                    crate::activation_key_guard::ActivationKeySuppression::ViewTransition,
+                );
+            }
             tui.frame_requester().schedule_frame();
             return Ok(AppRunControl::Continue);
         }
@@ -869,6 +884,9 @@ impl App {
             && self.hovered_sidebar_tab(previous) != self.hovered_sidebar_tab(current)
         {
             tui.frame_requester().schedule_frame();
+        }
+        if Box::pin(sidebar_close::handle(self, tui, app_server, &event)).await {
+            return Ok(AppRunControl::Continue);
         }
         if self.handle_pane_resize(tui, &event).await {
             return Ok(AppRunControl::Continue);
@@ -1316,7 +1334,9 @@ impl App {
                         self.app_event_tx.send(AppEvent::LaunchExternalEditor);
                     }
                 }
-                TuiEvent::Mouse(mouse) => self.start_right_click_paste(tui, mouse),
+                TuiEvent::Mouse(mouse) => {
+                    self.start_right_click_paste(tui, mouse, ClipboardPasteContext::Composer);
+                }
                 TuiEvent::FocusLost => {}
             }
         }
