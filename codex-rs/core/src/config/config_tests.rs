@@ -14483,3 +14483,67 @@ fn sqlite_home_env_conflict_reports_an_override() -> std::io::Result<()> {
 
     Ok(())
 }
+
+/// The app-server host advertises `build_startup_models`, so that catalog must
+/// carry the same endpoint models as the CLI path. Regression test for
+/// `model/list` returning only the bundled OpenAI set.
+#[tokio::test]
+async fn startup_catalog_exposes_multidex_endpoint_models() -> std::io::Result<()> {
+    let cfg = toml::from_str::<ConfigToml>(
+        r#"
+model = "DS v4.1 Flash 1017"
+model_provider = "multidex"
+
+[model_providers.multidex]
+name = "MultiDex"
+base_url = "http://127.0.0.1:2120/v1"
+"#,
+    )
+    .expect("valid MultiDex config");
+    let config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        cfg,
+        ConfigOverrides::default(),
+        tempdir()?.abs(),
+        ConfigLayerStack::new(
+            Vec::new(),
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )?,
+    )
+    .await?;
+
+    let auth = codex_login::AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::from_api_key("dummy"),
+    );
+    let models = crate::build_startup_models(
+        &config,
+        auth,
+        "00000000-0000-0000-0000-000000000000".to_string(),
+        std::sync::Arc::new(
+            codex_models_manager::manager::ModelCatalogSettings::disk(
+                config.codex_home.to_path_buf(),
+            ),
+        ),
+    )
+    .models_manager();
+
+    let presets = models
+        .list_models(
+            codex_models_manager::manager::RefreshStrategy::Offline,
+            config.http_client_factory(),
+        )
+        .await;
+    let slugs: Vec<String> = presets.into_iter().map(|preset| preset.model).collect();
+    assert!(
+        slugs.iter().any(|slug| slug == "DS v4.1 Flash 1017"),
+        "startup catalog is missing the local DeepSeek model: {slugs:?}"
+    );
+    assert!(
+        slugs
+            .iter()
+            .any(|slug| slug == "deepseek-ai/DeepSeek-V4.1-Flash"),
+        "startup catalog is missing the Lithos DeepSeek model: {slugs:?}"
+    );
+    Ok(())
+}
