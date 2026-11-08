@@ -47,7 +47,7 @@ pub fn build_startup_models(
         Arc::clone(&credentials),
         &installation_id,
     );
-    let catalog = ThreadModelCatalog::new(
+    let mut catalog = ThreadModelCatalog::new(
         config.model_provider.clone(),
         config.model_catalog.clone(),
         factory,
@@ -57,6 +57,9 @@ pub fn build_startup_models(
             runtime_auth: runtime.map(|runtime| (runtime, config.runtime_auth_mode)),
         },
     );
+    // The host advertises this catalog to pickers, so it needs the endpoint
+    // models for exactly the same reason the CLI path does.
+    catalog.manager = with_endpoint_catalog(config, Arc::clone(&catalog.manager));
     StartupModels {
         credentials,
         runtime_auth,
@@ -85,47 +88,59 @@ pub fn build_models_manager(
             .filter(|_| config.features.enabled(Feature::RuntimeAgentInstances))
             .map(|runtime| (runtime, config.runtime_auth_mode)),
     };
-    let mut manager = ModelCatalogSettings::disk(config.codex_home.to_path_buf()).build(
+    let manager = ModelCatalogSettings::disk(config.codex_home.to_path_buf()).build(
         auth.model_provider(config.model_provider.clone()),
         config.model_catalog.clone(),
         config.features.enabled(Feature::ApiKeyModelDiscovery),
     );
-    // Built-in endpoint entries augment discovery; only a user catalog replaces it.
-    if config.model_catalog.is_none()
-        && let Some(catalog) = multidex_model_catalog_for_config(config)
-    {
-        let additional_models = catalog
-            .models
-            .into_iter()
-            .filter(|model| {
-                codex_model_provider_info::is_multidex_model(&model.slug)
-                    || codex_model_provider_info::is_openrouter_model(&model.slug)
-                    || codex_model_provider_info::is_lithos_model(&model.slug)
-            })
-            .collect();
-        let default_model =
-            if codex_model_provider_info::is_multidex_provider_id(&config.model_provider_id) {
-                Some(MULTIDEX_DEFAULT_MODEL.to_string())
-            } else if config.model_provider_id == codex_model_provider_info::OPENROUTER_PROVIDER_ID
-            {
-                Some(codex_model_provider_info::OPENROUTER_DSV41_FLASH_MODEL_ID.to_string())
-            } else if config.model_provider_id == codex_model_provider_info::LITHOS_PROVIDER_ID {
-                Some(codex_model_provider_info::LITHOS_MODEL_IDS[0].to_string())
-            } else {
-                None
-            };
-        manager = Arc::new(
-            codex_models_manager::manager::ModelsManagerOverlay::new(
-                manager,
-                additional_models,
-                default_model,
-            ),
-        );
-    }
+    let manager = with_endpoint_catalog(config, manager);
     manager.set_api_key_model_discovery_enabled(
         config.features.enabled(Feature::ApiKeyModelDiscovery),
     );
     manager
+}
+
+
+/// Add the fork's endpoint models (MultiDex / OpenRouter / Lithos) on top of a
+/// provider-scoped manager.
+///
+/// Both manager-construction paths need this. The CLI builds through
+/// [`build_models_manager`]; the app-server host builds through
+/// [`build_startup_models`] and [`ThreadModelCatalog::for_config`]. Applying it
+/// in only the CLI path makes the `model/list` RPC disagree with
+/// `codex debug models` and hides the DeepSeek entries from every picker that
+/// is built on the RPC.
+fn with_endpoint_catalog(config: &Config, manager: SharedModelsManager) -> SharedModelsManager {
+    if config.model_catalog.is_some() {
+        return manager;
+    }
+    let Some(catalog) = multidex_model_catalog_for_config(config) else {
+        return manager;
+    };
+    let additional_models = catalog
+        .models
+        .into_iter()
+        .filter(|model| {
+            codex_model_provider_info::is_multidex_model(&model.slug)
+                || codex_model_provider_info::is_openrouter_model(&model.slug)
+                || codex_model_provider_info::is_lithos_model(&model.slug)
+        })
+        .collect();
+    let default_model =
+        if codex_model_provider_info::is_multidex_provider_id(&config.model_provider_id) {
+            Some(MULTIDEX_DEFAULT_MODEL.to_string())
+        } else if config.model_provider_id == codex_model_provider_info::OPENROUTER_PROVIDER_ID {
+            Some(codex_model_provider_info::OPENROUTER_DSV41_FLASH_MODEL_ID.to_string())
+        } else if config.model_provider_id == codex_model_provider_info::LITHOS_PROVIDER_ID {
+            Some(codex_model_provider_info::LITHOS_MODEL_IDS[0].to_string())
+        } else {
+            None
+        };
+    Arc::new(codex_models_manager::manager::ModelsManagerOverlay::new(
+        manager,
+        additional_models,
+        default_model,
+    ))
 }
 
 /// Default model advertised for a built-in MultiDex endpoint provider.
@@ -233,10 +248,13 @@ impl ThreadModelCatalog {
         {
             return Arc::clone(&self.manager);
         }
-        self.factory.build(
-            auth.model_provider(config.model_provider.clone()),
-            models.cloned(),
-            api_key_model_discovery_default,
+        with_endpoint_catalog(
+            config,
+            self.factory.build(
+                auth.model_provider(config.model_provider.clone()),
+                models.cloned(),
+                api_key_model_discovery_default,
+            ),
         )
     }
 
