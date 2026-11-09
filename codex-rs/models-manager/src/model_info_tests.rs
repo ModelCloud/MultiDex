@@ -262,7 +262,7 @@ fn multidex_dsv41_flash_uses_native_metadata() {
     assert_eq!(model.max_context_window, None);
     assert_eq!(model.auto_compact_token_limit(), Some(257_948));
     assert_eq!(model.usable_context_window(), Some(262_144));
-    assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::Max));
+    assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
     assert_eq!(
         model
             .supported_reasoning_levels

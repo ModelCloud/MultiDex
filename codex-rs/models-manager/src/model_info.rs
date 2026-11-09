@@ -259,7 +259,7 @@ fn multidex_dsv41_flash_model_info() -> ModelInfo {
         MULTIDEX_DSV41_FLASH,
         "DeepSeek v4.1 Flash (Local)",
         "DeepSeek v4.1 Flash 1017 served by the local endpoint.",
-        /*default_reasoning_level*/ ReasoningEffort::Max,
+        /*default_reasoning_level*/ ReasoningEffort::High,
         /*supports_reasoning_summary_parameter*/ false,
         /*default_reasoning_summary*/ ReasoningSummary::None,
         /*priority*/ 0,
@@ -322,7 +322,7 @@ fn dsv41_flash_model_info(
         description: Some(description.to_string()),
         // DSV4.1 accepts `off`, `low`, `high`, `max`, or a numeric budget. Its
         // OpenAI-compatible endpoint explicitly rejects Codex's generic
-        // `medium` default, and the local model defaults to maximum depth.
+        // `medium` default; the local model defaults to high reasoning.
         default_reasoning_level: Some(default_reasoning_level),
         supported_reasoning_levels: vec![
             ReasoningEffortPreset {
