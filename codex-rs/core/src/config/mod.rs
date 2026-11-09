@@ -4121,7 +4121,13 @@ impl Config {
         let requested_model_provider_id = required_model_provider.map(str::to_string)
             .or(model_provider)
             .or(cfg.model_provider)
-            .unwrap_or_else(|| "openai".to_string());
+            .unwrap_or_else(|| {
+                if model_providers.contains_key(MULTIDEX_PROVIDER_ID) {
+                    MULTIDEX_PROVIDER_ID.to_string()
+                } else {
+                    codex_model_provider_info::OPENAI_PROVIDER_ID.to_string()
+                }
+            });
         // The MultiDex model must never be sent to the OpenAI/ChatGPT provider. CLI
         // --model and app-server launches both pass through this config load.
         let selected_model = model.as_deref().or(cfg.model.as_deref());

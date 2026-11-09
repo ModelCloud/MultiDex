@@ -1202,6 +1202,46 @@ requires_openai_auth = false
     Ok(())
 }
 
+#[tokio::test]
+async fn configured_local_endpoint_is_the_default_provider() -> std::io::Result<()> {
+    let local = toml::from_str::<ConfigToml>(
+        r#"
+[model_providers.multidex]
+name = "MultiDex"
+base_url = "http://127.0.0.1:2120/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+    )
+    .expect("valid local provider config");
+    let load = |cfg| async move {
+        Config::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
+            cfg,
+            ConfigOverrides::default(),
+            tempdir()?.abs(),
+            ConfigLayerStack::new(
+                Vec::new(),
+                ConfigRequirements::default(),
+                ConfigRequirementsToml::default(),
+            )?,
+        )
+        .await
+    };
+    assert_eq!(load(local.clone()).await?.model_provider_id, "multidex");
+    let mut explicit_provider = local.clone();
+    explicit_provider.model_provider = Some("openai".to_string());
+    assert_eq!(load(explicit_provider).await?.model_provider_id, "openai");
+    let mut explicit_model = local;
+    explicit_model.model = Some("gpt-5.6-sol".to_string());
+    assert_eq!(load(explicit_model).await?.model_provider_id, "openai");
+    assert_eq!(
+        load(ConfigToml::default()).await?.model_provider_id,
+        "openai"
+    );
+    Ok(())
+}
+
 #[test]
 fn accepts_amazon_bedrock_aws_profile_override() {
     let cfg = toml::from_str::<ConfigToml>(
