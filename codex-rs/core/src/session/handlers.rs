@@ -1,4 +1,5 @@
 use super::Submission;
+use crate::McpRefreshReason;
 use crate::WithTurnExtensionData;
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
@@ -224,13 +225,17 @@ impl Session {
     }
 }
 
-pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision) {
-    match decision {
-        ReviewDecision::Abort => {
-            sess.interrupt_task().await;
-        }
-        other => sess.notify_approval(&id, other).await,
-    }
+async fn cancel_patch_approval(sess: &Arc<Session>, id: &str, expected_turn_id: Option<&str>) {
+    let Some((pending, _)) = sess.take_pending_approval(id, expected_turn_id).await else {
+        return;
+    };
+    sess.abort_turn_if_active(
+        &pending.turn_id,
+        TurnAbortReason::Interrupted,
+        /*error*/ None,
+    )
+    .await;
+    let _ = pending.sender.send(ReviewDecision::Abort);
 }
 
 pub async fn request_user_input_response(
@@ -256,7 +261,7 @@ pub async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: Dy
 
 pub fn refresh_mcp_servers(sess: &Session) {
     sess.services.mcp_runtime.reconnect_on_next_refresh();
-    sess.request_mcp_runtime_refresh();
+    sess.request_mcp_runtime_refresh(McpRefreshReason::ExplicitServerReconnect);
 }
 
 pub async fn reload_user_config(sess: &Arc<Session>) {
@@ -568,9 +573,14 @@ pub(super) async fn submission_loop(
                     }
                     false
                 }
-                Op::RealtimeConversationAttach { params, reply } => {
+                Op::RealtimeConversationAttach {
+                    params,
+                    options,
+                    reply,
+                } => {
                     let result =
-                        crate::realtime_conversation::handle_attach(&sess, sub.id, params).await;
+                        crate::realtime_conversation::handle_attach(&sess, sub.id, params, options)
+                            .await;
                     let _ = reply.send(result);
                     false
                 }
@@ -732,8 +742,19 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
+                Op::CancelPatchApproval { id, turn_id } => {
+                    cancel_patch_approval(&sess, &id, Some(&turn_id)).await;
+                    false
+                }
+                Op::PatchApproval {
+                    id,
+                    decision: ReviewDecision::Abort,
+                } => {
+                    cancel_patch_approval(&sess, &id, /*expected_turn_id*/ None).await;
+                    false
+                }
                 Op::PatchApproval { id, decision } => {
-                    patch_approval(&sess, id, decision).await;
+                    sess.notify_approval(&id, decision).await;
                     false
                 }
                 Op::UserInputAnswer { id, response } => {

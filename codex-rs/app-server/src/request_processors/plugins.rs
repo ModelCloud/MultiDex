@@ -9,6 +9,7 @@ use codex_app_server_protocol::PluginSharePrincipalRole;
 use codex_app_server_protocol::PluginShareTargetRole;
 use codex_config::types::McpServerConfig;
 use codex_config::types::PluginsConfigToml;
+use codex_core::McpRefreshReason;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginListBackgroundTaskOptions;
 use codex_core_plugins::PluginMarketplaceContext;
@@ -533,9 +534,11 @@ impl PluginRequestProcessor {
         Arc::clone(&self.on_effective_plugins_changed)
     }
 
-    async fn on_effective_plugins_changed(&self) {
+    async fn on_effective_plugins_changed(&self, reason: McpRefreshReason) {
         self.clear_plugin_related_caches();
-        self.thread_manager.invalidate_mcp_runtimes().await;
+        self.thread_manager
+            .invalidate_mcp_runtimes_for(reason)
+            .await;
         self.thread_manager.refresh_hook_runtimes().await;
     }
 
@@ -596,7 +599,8 @@ impl PluginRequestProcessor {
                 .refresh_non_curated_plugin_cache_for_context(&context)
                 .await
         {
-            self.on_effective_plugins_changed().await;
+            self.on_effective_plugins_changed(McpRefreshReason::NonCuratedPluginCacheRefreshed)
+                .await;
         }
         let include_vertical = context.global_config.plugins_enabled
             && marketplace_kinds.contains(&PluginListMarketplaceKind::Vertical);
@@ -736,16 +740,27 @@ impl PluginRequestProcessor {
         if include_shared_with_me && config.features.enabled(Feature::PluginSharing) {
             remote_sources.push(RemoteMarketplaceSource::SharedWithMe);
         }
+        let featured =
+            plugins_manager.featured_plugin_ids_for_config(&context.global_config, auth.as_ref());
+        tokio::pin!(featured);
+        let mut featured_result = None;
         if !remote_sources.is_empty() {
-            match codex_core_plugins::remote::fetch_remote_marketplaces(
+            let marketplaces = codex_core_plugins::remote::fetch_remote_marketplaces(
                 &remote_plugin_service_config,
                 auth.as_ref(),
                 &remote_sources,
                 /*catalog_cache_root*/ Some(config.codex_home.as_path()),
                 remote_catalog_cache_mode,
-            )
-            .await
-            {
+            );
+            tokio::pin!(marketplaces);
+            let outcome = tokio::select! {
+                outcome = &mut marketplaces => outcome,
+                ids = &mut featured, if use_remote_global_catalog => {
+                    featured_result = Some(ids);
+                    marketplaces.await
+                }
+            };
+            match outcome {
                 Ok(outcome) => {
                     remote_catalog_cache_refresh_scopes = outcome.catalog_cache_refresh_scopes;
                     for remote_marketplace in outcome
@@ -804,10 +819,11 @@ impl PluginRequestProcessor {
             marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME
                 || marketplace.name == REMOTE_GLOBAL_MARKETPLACE_NAME
         }) {
-            match plugins_manager
-                .featured_plugin_ids_for_config(&context.global_config, auth.as_ref())
-                .await
-            {
+            let result = match featured_result {
+                Some(result) => result,
+                None => featured.await,
+            };
+            match result {
                 Ok(featured_plugin_ids) => featured_plugin_ids,
                 Err(err) => {
                     warn!(
@@ -863,6 +879,7 @@ impl PluginRequestProcessor {
             &context.global_config,
             auth.clone(),
             Some(self.effective_plugins_changed_callback()),
+            codex_core_plugins::InstalledPluginSyncSource::PluginInstalled,
         );
 
         let (mut data, marketplace_load_errors) = self
@@ -1572,7 +1589,9 @@ impl PluginRequestProcessor {
 
         self.clear_plugin_related_caches();
         reload_user_config(&self.config_manager, &self.thread_manager).await;
-        self.thread_manager.invalidate_mcp_runtimes().await;
+        self.thread_manager
+            .invalidate_mcp_runtimes_for(McpRefreshReason::PluginInstalled)
+            .await;
         self.thread_manager.refresh_hook_runtimes().await;
 
         let plugin_mcp_servers = load_configured_plugin_mcp_servers(
@@ -2025,7 +2044,9 @@ impl PluginRequestProcessor {
                     Err(err) => (false, Some(err.to_string())),
                 };
                 if success {
-                    thread_manager.invalidate_mcp_runtimes().await;
+                    thread_manager
+                        .invalidate_mcp_runtimes_for(McpRefreshReason::PluginOAuthLoginCompleted)
+                        .await;
                 }
 
                 let notification = ServerNotification::McpServerOauthLoginCompleted(
@@ -2062,7 +2083,10 @@ impl PluginRequestProcessor {
             .await
             .map_err(Self::plugin_uninstall_error)?;
         match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => self.on_effective_plugins_changed().await,
+            Ok(_) => {
+                self.on_effective_plugins_changed(McpRefreshReason::PluginUninstalled)
+                    .await
+            }
             Err(err) => {
                 warn!(
                     "failed to reload config after plugin uninstall, clearing plugin-related caches only: {err:?}"
@@ -2157,7 +2181,8 @@ impl PluginRequestProcessor {
         self.analytics_events_client
             .track_plugin_uninstalled(outcome.telemetry);
         if outcome.effective_plugins_changed {
-            self.on_effective_plugins_changed().await;
+            self.on_effective_plugins_changed(McpRefreshReason::RemotePluginUninstalled)
+                .await;
         }
         if let Some(err) = outcome.cache_removal_error {
             return Err(remote_plugin_catalog_error_to_jsonrpc(

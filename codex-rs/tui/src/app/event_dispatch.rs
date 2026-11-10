@@ -90,6 +90,10 @@ impl App {
                     | AppEvent::InsertHistoryCell(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ParkSideCompanion { .. }
+                    | AppEvent::SideCreated { .. }
+                    | AppEvent::SideChatRemovalFinished { .. }
+                    | AppEvent::SideChatArchived { .. }
+                    | AppEvent::SavedSideChatsLoaded { .. }
                     | AppEvent::SideReplayFinished(_)
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
@@ -222,7 +226,8 @@ impl App {
             }
             AppEvent::CloseMisalignmentReview => self.chat_widget.show_misalignment_policy_precaution(),
             AppEvent::SkillsListLoaded { ref cwd, .. }
-                if cwds_differ(cwd, self.config.cwd.as_path()) =>
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud
+                    || cwds_differ(cwd, self.config.cwd.as_path()) =>
             {
                 self.skill_load_warnings.startup_complete = true;
             }
@@ -412,6 +417,7 @@ impl App {
                 if !thread.ephemeral
                     && !self.agents_overview.removed_threads.contains(&thread_id)
                     && !self.agents_overview.threads.get(&thread_id).is_some_and(Option::is_some) {
+                    self.agents_overview.search_matches.remove(&thread_id);
                     self.agents_overview.threads.insert(thread_id, Some(thread));
                     self.agents_overview.refresh_thread_ids.insert(thread_id);
                 }
@@ -1053,7 +1059,17 @@ impl App {
             AppEvent::ResetTranscriptForThreadSwitchPreservingScreen => {
                 self.reset_transcript_state_after_clear();
                 tui.clear_pending_history_lines();
-                tui.defer_thread_switch_clear();
+                let switched_tab = self.conversation_frame.chat_strip.is_some()
+                    && self.active_side_parent_thread_id().is_some()
+                    && self.conversation_frame.sidebar_input.is_some_and(|painted| {
+                        painted.selected_chat != self.current_displayed_thread_id()
+                    });
+                if self.conversation_frame.chooser_area().is_none()
+                    && self.chooser_focus().is_none()
+                    && !switched_tab
+                {
+                    tui.defer_thread_switch_clear();
+                }
                 self.pending_thread_switch_resets -= 1;
             }
             AppEvent::CommitRealtimeTranscriptHistory => {
@@ -1282,6 +1298,9 @@ impl App {
             AppEvent::ImagesPrepared(id) => {
                 self.chat_widget.on_images_prepared(id);
             }
+            // The Cloud preview does not have a skills catalog.
+            AppEvent::CodexOp(AppCommand::ListSkills { .. })
+                if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud => {}
             AppEvent::CodexOp(AppCommand::ListSkills { cwds, force_reload: true })
                 if self.awaiting_side_replay(tui)
                     && let Some(thread_id) = self.active_thread_id
@@ -3182,6 +3201,10 @@ impl App {
                 }
             }
             AppEvent::OpenAgentsOverview => self.open_agents_overview(app_server),
+            AppEvent::SearchAgentsOverview(id, limit) => self.search_agents_overview(app_server.request_handle(), id, limit),
+            AppEvent::AgentsOverviewSearchPage { id, rows, cursor, ok } => {
+                self.apply_agents_overview_search_page(id, rows, cursor, ok);
+            }
             AppEvent::ShowMoreAgentsOverview => self.show_more_agents_overview(app_server),
             AppEvent::RefreshViewedThread { backend_id, thread_id, revision } => {
                 if app_server.backend_id() == backend_id {
@@ -3382,10 +3405,71 @@ impl App {
             AppEvent::StartSide {
                 parent_thread_id,
                 user_message,
+                mode,
             } => {
-                return self
-                    .handle_start_side(tui, app_server, parent_thread_id, user_message)
-                    .await;
+                return Box::pin(self.handle_start_side(tui, app_server, parent_thread_id, user_message, mode)).await;
+            }
+            AppEvent::SideCreated {
+                backend_id: _,
+                parent,
+                request,
+                result,
+            } => {
+                Box::pin(self.finish_side_creation(tui, app_server, parent, request, result)).await;
+            }
+            AppEvent::SideChatRemovalFinished { backend_id, target, request, action, result } => {
+                if backend_id == app_server.backend_id()
+                    && let Some(side) = self.side_threads.get_mut(&target)
+                    && side.close_request == Some(request)
+                {
+                    side.close_request = None;
+                    match (action, result) {
+                        (sidebar_close::Action::Archive, Ok(())) => {
+                            sidebar_close::forget_archived(self, tui, app_server, target).await?;
+                        }
+                        (sidebar_close::Action::CloseTab, Ok(())) => {
+                            self.abandoned_side_threads.insert(target);
+                            self.discard_thread_local_state(target).await;
+                        }
+                        (_, Err(message)) => {
+                            if action == sidebar_close::Action::Archive {
+                                // The server may have stopped the writer before the file move failed.
+                                if let Some(channel) = self.thread_event_channels.get_mut(&target) {
+                                    channel.mark_replay_only();
+                                }
+                                self.mark_agent_picker_thread_closed(target);
+                            }
+                            self.add_agents_overview_error(message);
+                        }
+                    }
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            AppEvent::SideChatArchived { backend_id, target } => {
+                if backend_id == app_server.backend_id() {
+                    sidebar_close::forget_archived(self, tui, app_server, target).await?;
+                }
+            }
+            AppEvent::SavedSideChatsLoaded { backend_id, parent, request, result } => {
+                use crate::app_event::SavedSideChatData;
+                use crate::sidebar_chooser::Discovery;
+                if let Some(pane) = self.sidebars.get_mut(&Some(parent))
+                    && pane.discovery.request() == Some(request)
+                {
+                    match result {
+                        _ if backend_id != app_server.backend_id() => pane.set_discovery(Discovery::Idle),
+                        Err(error) => pane.set_discovery(Discovery::Failed(error)),
+                        Ok(SavedSideChatData::LatestPrompts(prompts)) => {
+                            pane.latest_prompts = prompts;
+                            pane.set_discovery(Discovery::Idle);
+                        }
+                        Ok(SavedSideChatData::Choices(chats)) => {
+                            pane.update_saved_chats(chats);
+                            self.refresh_visible_side_chat_prompts(tui, app_server, parent, request);
+                        }
+                    }
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
@@ -4231,7 +4315,9 @@ impl App {
         let result = async {
             self.stop_voice_for_removed_thread(app_server, thread_id)
                 .await?;
-            app_server.thread_delete(thread_id).await
+            app_server
+                .delete_thread_with_saved_side_chats(thread_id)
+                .await
         }
         .await;
         Ok(match result {

@@ -114,8 +114,16 @@ impl App {
         } else {
             None
         };
-        if let Some(startup_pane) = self.sidebars.remove(&None) {
-            self.sidebars.entry(Some(thread_id)).or_insert(startup_pane);
+        if let Some(startup_pane) = self.sidebars.remove(&None)
+            && let std::collections::hash_map::Entry::Vacant(entry) =
+                self.sidebars.entry(Some(thread_id))
+        {
+            entry.insert(startup_pane);
+            if let Some(mode) = &mut self.pane_resize
+                && mode.parent.is_none()
+            {
+                mode.parent = Some(thread_id);
+            }
         }
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = receiver;
@@ -1066,6 +1074,7 @@ impl App {
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
+        self.track_side_chat_title(thread_id, &notification);
         if self.current_displayed_thread_id() == Some(thread_id)
             && let ServerNotification::TurnCompleted(notification) = &notification
         {
@@ -1564,8 +1573,11 @@ impl App {
         self.recap.seed_from_turns(&turns, now);
         self.schedule_recap_check(thread_id, now);
 
-        self.chat_widget
-            .replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
+        self.chat_widget.replay_backend_thread_turns(
+            turns,
+            ReplayKind::ResumeInitialMessages,
+            &self.app_server_target,
+        );
         if should_buffer_initial_replay {
             self.app_event_tx
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
@@ -1845,32 +1857,10 @@ impl App {
             self.chat_widget
                 .remember_realtime_delegated_reasoning_turn(turn_id);
         }
-        let confirmed_message_ids = snapshot
-            .turns
-            .iter()
-            .flat_map(Turn::item_payloads)
-            .chain(snapshot.events.iter().filter_map(|event| {
-                let ThreadBufferedEvent::Notification(notification) = event else {
-                    return None;
-                };
-                if let ServerNotification::ItemStarted(notification) = notification.as_ref() {
-                    Some(&notification.item.payload)
-                } else if let ServerNotification::ItemCompleted(notification) =
-                    notification.as_ref()
-                {
-                    Some(&notification.item.payload)
-                } else {
-                    None
-                }
-            }))
-            .filter_map(|item| {
-                if let ThreadItemPayload::UserMessage { client_id, .. } = item {
-                    client_id.clone()
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let confirmed_message_ids = super::thread_events::confirmed_user_message_ids(
+            &snapshot.turns,
+            snapshot.events.iter(),
+        );
         let recovered_input = snapshot
             .input_state
             .as_ref()
@@ -1886,8 +1876,11 @@ impl App {
             },
         );
         if !snapshot.turns.is_empty() {
-            self.chat_widget
-                .replay_thread_turns(snapshot.turns, ReplayKind::ThreadSnapshot);
+            self.chat_widget.replay_backend_thread_turns(
+                snapshot.turns,
+                ReplayKind::ThreadSnapshot,
+                &self.app_server_target,
+            );
         }
         for (event, changes) in snapshot.events.into_iter().zip(request_changes) {
             reasoning_replay.before_event(&event, &mut self.chat_widget);
@@ -2160,7 +2153,9 @@ impl App {
             // thread, so unrelated shutdowns cannot consume this marker.
             self.pending_shutdown_exit_thread_id = None;
         }
+        // Sidebar chats use their first prompt until they receive an explicit name.
         let automatic_title_user_message = if self.chat_widget.thread_name().is_none()
+            && !(self.side_retention_enabled(tui) && self.active_side_parent_thread_id().is_some())
             && let ThreadBufferedEvent::Notification(notification) = &event
             && let ServerNotification::ItemCompleted(notification) = notification.as_ref()
             && let ThreadItemPayload::UserMessage { content, .. } = &notification.item.payload

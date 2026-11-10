@@ -181,13 +181,7 @@ impl McpConnectionSet {
     }
 
     fn shares_test_connection_with(&self, other: &Self, name: &str) -> bool {
-        let Some(left) = self.servers.get(name) else {
-            return false;
-        };
-        let Some(right) = other.servers.get(name) else {
-            return false;
-        };
-        Arc::ptr_eq(&left.connection, &right.connection)
+        self.shares_server_connection(other, name)
     }
 }
 
@@ -1203,13 +1197,12 @@ async fn assert_elicitation_declined_with_reviewer_calls(
 async fn assert_requested_user_input_is_declined(
     approval_policy: AskForApproval,
     permission_profile: PermissionProfile,
-    router: ElicitationRequestRouter,
 ) {
     let manager = ElicitationRequestManager::new(
         test_elicitation_config("server", approval_policy, permission_profile),
         /*reviewer*/ None,
         /*lifecycle*/ None,
-        router,
+        full_access_form_input_enabled_router(),
     );
     let (tx_event, rx_event) = async_channel::bounded(1);
     let sender = manager.make_sender(
@@ -1244,18 +1237,6 @@ async fn assert_requested_user_input_is_declined(
         },
     );
     assert!(rx_event.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn disabled_permissions_do_not_surface_user_input_when_auto_denied() {
-    let router = full_access_form_input_enabled_router();
-    router.set_auto_deny(/*auto_deny*/ true);
-    assert_requested_user_input_is_declined(
-        AskForApproval::Never,
-        PermissionProfile::Disabled,
-        router,
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -1399,12 +1380,8 @@ async fn disabled_permissions_decline_requested_user_input_with_approval_metadat
 
 #[tokio::test]
 async fn restricted_never_policy_does_not_surface_requested_user_input() {
-    assert_requested_user_input_is_declined(
-        AskForApproval::Never,
-        PermissionProfile::default(),
-        full_access_form_input_enabled_router(),
-    )
-    .await;
+    assert_requested_user_input_is_declined(AskForApproval::Never, PermissionProfile::default())
+        .await;
 }
 
 #[tokio::test]
@@ -1418,7 +1395,6 @@ async fn granular_policy_does_not_surface_requested_user_input() {
             mcp_elicitations: false,
         }),
         PermissionProfile::Disabled,
-        full_access_form_input_enabled_router(),
     )
     .await;
 }
@@ -2347,7 +2323,10 @@ async fn resource_template_listings_skip_only_hosted_apps() -> anyhow::Result<()
             expected
         );
         let all = binding.list_all_resource_templates(|_| true).await;
-        assert_eq!(all.get(name), (!expected.is_empty()).then_some(&expected));
+        assert_eq!(
+            all.by_server.get(name),
+            (!expected.is_empty()).then_some(&expected)
+        );
     }
     Ok(())
 }
@@ -2849,6 +2828,9 @@ async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() 
 
     let older = first_context.begin_fetch();
     let newer = first_context.begin_fetch();
+    let mut discovery = first_context.clone();
+    discovery.before_stdio_discovery = true;
+    discovery.record_modern_stdio_discovery(&discovery.begin_fetch());
     first_context.publish_if_newest(
         newer,
         &[create_test_tool("docs", "new")],
@@ -2862,6 +2844,10 @@ async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() 
     assert_eq!(
         first_context.current_tools().expect("cached tools")[0].callable_name,
         "new"
+    );
+    assert!(
+        !discovery.has_tools(),
+        "older legacy fetches cannot undo modern discovery"
     );
 
     tokio::time::advance(Duration::from_secs(30 * 60 + 1)).await;
@@ -4511,7 +4497,7 @@ async fn later_tool_list_retries_after_failed_reconnect_and_keeps_cached_tools()
                 &failed_binding.tools()[0],
             )
             .await
-            .is_none()
+            .is_err()
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
@@ -4654,7 +4640,7 @@ async fn tool_lists_do_not_block_and_share_codex_apps_startup_reconnect() {
         manager
             .prepare_call_for_tool(Arc::clone(pending_step.config()), &pending_step.tools()[0])
             .await
-            .is_some()
+            .is_ok()
     );
     let tools = manager.list_all_tools().await;
     assert_eq!(
@@ -6138,11 +6124,11 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
         .expect("refresh must use the reconciled timeout");
     assert_eq!(failed.tools(), old_step.tools());
     assert_eq!(
-        failed.list_all_resources(|_| true).await,
+        failed.list_all_resources(|_| true).await.by_server,
         HashMap::from([("docs".to_string(), vec![])])
     );
     assert_eq!(
-        failed.list_all_resource_templates(|_| true).await,
+        failed.list_all_resource_templates(|_| true).await.by_server,
         HashMap::from([("docs".to_string(), vec![])])
     );
     let retry_started = tokio::time::Instant::now();
@@ -6172,7 +6158,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
         reconciled
             .prepare_call_for_tool(Arc::clone(old_step.config()), &old_step.tools()[0],)
             .await
-            .is_none()
+            .is_err()
     );
     let refreshed = previous.test_client("docs").client().await?;
     assert_eq!(

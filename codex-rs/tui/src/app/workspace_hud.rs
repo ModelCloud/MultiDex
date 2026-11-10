@@ -24,8 +24,7 @@ impl App {
             tui.frame_requester().schedule_frame_in(wait);
             return None;
         }
-        let side = self.active_side_parent_thread_id().is_some()
-            || self.chooser_focus() == Some(super::sidebar::PaneFocus::Sidebar);
+        let side = self.sidebar_has_focus();
         let can_switch = self.chooser_focus().is_some() || self.switchable_side_child().is_some();
         let can_size = super::side_pane::split_layout(self, tui, area).is_some();
         let can_resize = can_size && side && self.zoomed_thread.is_none();
@@ -48,6 +47,7 @@ impl App {
             let (group, label) = match action {
                 "focus_command_center" => (0, "Command Center"),
                 "focus_main_composer" => (0, "Main composer"),
+                "focus_sidebar_tabs" => (0, "Open in sidebar"),
                 "focus_sidebar_content" if side => (0, "Hide sidebar"),
                 "focus_sidebar_content" => (0, "Sidebar content"),
                 "resize_panes" if can_size => (2, "Resize panes"),
@@ -61,6 +61,12 @@ impl App {
                 "toggle_pane_zoom" if self.zoomed_thread.is_some() => (2, "Restore layout"),
                 "toggle_pane_zoom" => (2, "Zoom pane"),
                 "move_divider_left" | "move_divider_right" => continue,
+                "close_sidebar_tab" if self.active_side_parent_thread_id().is_some() => {
+                    (2, "Close tab")
+                }
+                "close_sidebar_tab" => continue,
+                "sidebar_up" => (1, "Previous tab"),
+                "sidebar_down" => (1, "Next tab"),
                 "hide_pane" if side => (2, "Hide pane"),
                 "focus_pane_left" if side && can_switch => (1, "Pane left"),
                 "focus_pane_right" if !side && can_switch && self.open_pane_focus().is_some() => {
@@ -73,21 +79,25 @@ impl App {
                 "focus_conversation_composer" => (2, "Composer"),
                 other => (2, other),
             };
-            let key = keys.join(" / ");
-            groups[group].1.push(
-                vec![
-                    format!("{key:<7} ").fg(crate::style::accent_color()),
-                    label.replace('_', " ").into(),
-                ]
-                .into(),
-            );
+            let key = keys.join(" / ").fg(crate::style::accent_color());
+            groups[group].1.push((key, label.replace('_', " ")));
         }
         let origin = if side { "Sidebar" } else { "Conversation" };
         Some(ShortcutHud::leader(
             format!("{} · {origin}", leader.prefix.display_label()),
             groups
                 .into_iter()
-                .filter(|(_, items)| !items.is_empty())
+                .filter_map(|(title, items)| {
+                    let width = items.iter().map(|(key, _)| key.width()).max()?.max(7);
+                    let lines = items
+                        .into_iter()
+                        .map(|(key, label)| {
+                            let gap = " ".repeat(width - key.width() + 1);
+                            vec![key, gap.into(), label.into()].into()
+                        })
+                        .collect();
+                    Some((title, lines))
+                })
                 .collect(),
         ))
     }

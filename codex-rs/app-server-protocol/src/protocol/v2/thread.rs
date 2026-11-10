@@ -944,6 +944,8 @@ pub struct QueuedSubmission {
     pub id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// Metadata retained with this input, including across reconnect and restoration.
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -953,6 +955,9 @@ pub struct ThreadQueueAddParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// ResponsesAPI metadata captured from the client submitting this input.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -991,6 +996,9 @@ pub struct ThreadQueueUpdateParams {
     pub thread_id: String,
     pub queued_submission_id: String,
     pub input: Vec<UserInput>,
+    /// Non-empty metadata replaces the input's metadata; omission or an empty map preserves it.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1876,6 +1884,10 @@ pub struct ThreadItemOutputDeferral {
     #[experimental("thread/items/list.deferOutput.commandExecution")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub command_execution: bool,
+    /// Defer nonempty plain-text results from successful MCP tool calls.
+    #[experimental("thread/items/list.deferOutput.mcpToolCall")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_tool_call: bool,
 }
 
 /// Starting position for an item-history page.
@@ -1906,7 +1918,7 @@ pub struct ThreadItemEntry {
     /// Turn containing this item.
     pub turn_id: String,
     pub item: ThreadItem,
-    /// The saved command output was omitted. Fetch the complete item with `thread/items/read`.
+    /// The saved output was omitted. Fetch the complete item with `thread/items/read`.
     #[experimental("thread/items/list.outputDeferred")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_deferred: bool,

@@ -150,6 +150,14 @@ impl fmt::Debug for SwappableModelsManager {
 }
 
 impl ModelsManager for SwappableModelsManager {
+    fn ensure_initialized(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.ensure_initialized(http_client_factory).await })
+    }
+
     fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
         self.inner.load().for_originator(originator)
     }
@@ -222,6 +230,21 @@ impl ModelsManager for SwappableModelsManager {
 }
 
 impl SessionServices {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned grants must not authorize discovery"
+    )]
+    pub(crate) fn granted_permissions(
+        &self,
+        environment_id: &str,
+    ) -> Option<AdditionalPermissionProfile> {
+        self.granted_permissions_by_environment_id
+            .lock()
+            .expect("session permission grants lock poisoned")
+            .get(environment_id)
+            .cloned()
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "poisoned grant state must not authorize further operations"
