@@ -132,6 +132,11 @@ impl ChatWidget {
         self.request_redraw();
         self.app_event_tx.send(AppEvent::StartSide {
             parent_thread_id,
+            mode: if user_message.is_some() {
+                crate::app_event::SideStartMode::New
+            } else {
+                crate::app_event::SideStartMode::Reuse
+            },
             user_message,
         });
     }
@@ -305,7 +310,8 @@ impl ChatWidget {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
                     title: Some("Delete this session?".to_string()),
                     subtitle: Some(
-                        "Cannot be undone. Subagent threads will also be deleted.".to_string(),
+                        "Also deletes subagents and saved side chats. Cannot be undone."
+                            .to_string(),
                     ),
                     footer_hint: Some(standard_popup_hint_line()),
                     items: vec![

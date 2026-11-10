@@ -41,6 +41,7 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ProfileWorkspaceRoot;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
@@ -87,6 +88,7 @@ use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use codex_rollout::state_db::StateDbHandle;
 
@@ -242,6 +244,12 @@ impl CodexThread {
             out_of_band_elicitations: Mutex::new(OutOfBandElicitations::default()),
             _diagnostics_guard: LIVE_THREADS.track(),
         }
+    }
+
+    /// Identifies this loaded agent tree, shared by its root and native children.
+    /// Loading a new tree gives it a new ID, even when reusing a persisted thread ID.
+    pub fn agent_tree_id(&self) -> Uuid {
+        self.session.services.local_agent_runtime.tree_id()
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
@@ -1147,6 +1155,11 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.session.state_db()
+    }
+
+    /// Resolves the model selected for future turns using this thread's catalog and settings.
+    pub async fn selected_model_info(&self) -> Arc<ModelInfo> {
+        self.session.selected_model_info().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

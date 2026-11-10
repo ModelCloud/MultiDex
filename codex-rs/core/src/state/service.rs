@@ -154,6 +154,14 @@ impl ModelsManager for SwappableModelsManager {
         self.inner.load().for_originator(originator)
     }
 
+    fn ensure_initialized(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.ensure_initialized(http_client_factory).await })
+    }
+
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.inner
             .load()

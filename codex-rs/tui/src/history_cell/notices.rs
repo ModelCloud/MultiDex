@@ -109,7 +109,7 @@ pub(crate) fn new_warning_event(message: String) -> WarningHistoryCell {
     }
 }
 
-pub(crate) fn new_usage_warning_event(message: String) -> WarningHistoryCell {
+pub(crate) fn new_visible_warning_event(message: String) -> WarningHistoryCell {
     WarningHistoryCell {
         visible_in_transcript: true,
         ..new_warning_event(message)

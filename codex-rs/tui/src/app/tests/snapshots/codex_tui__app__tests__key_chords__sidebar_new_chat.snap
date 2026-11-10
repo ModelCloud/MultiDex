@@ -1,10 +1,16 @@
 ---
 source: tui/src/app/tests/key_chords.rs
-assertion_line: 1131
-expression: "panel.join(\"\\n\")"
+expression: frame
 ---
-                                     +
- Open in sidebar
- › + New side chat
-     Start from this conversation
- Enter open · Esc back · ↑/↓ move …
+                                                                               │                                     +
+                                                                               │
+                                                                               │ Open in sidebar
+                                                                               │
+                                                                               │ › + New side chat
+                                                                               │     Start from the main chat
+                                                                               │
+                                                                               │
+› parent draft                                                                 │
+                                                                               │
+  gpt-test default                                                             │
+                                                                               │ f5 g open · esc back · ↑/↓ move …

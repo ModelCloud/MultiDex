@@ -4,6 +4,8 @@ use super::Prompt;
 use super::test_model_client;
 use super::test_model_info;
 use super::test_responses_metadata_for_client;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -101,7 +103,10 @@ fn http_continuation_retains_pending_completion_and_checks_reuse_boundaries(
         turn.http_session.last_response_rx = Some(receiver);
         assert!(turn.get_last_http_response().is_none());
         if scenario == "other_owner" {
-            turn.http_session.auth_owner_generation = Some(1);
+            let manager = AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            );
+            turn.http_session.auth_owner = Some(manager.auth_owner());
         }
         drop(turn);
         sender
