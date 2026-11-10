@@ -358,8 +358,9 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     {
         let _refresh = sess.mcp_refresh.acquire().await;
         sess.mcp_refresh.close();
-        sess.services.mcp_runtime.shutdown().await;
     }
+    sess.wait_for_apps_tool_refresh().await;
+    sess.services.mcp_runtime.shutdown().await;
 
     sess.drain_code_mode_messages().await;
 
@@ -682,13 +683,33 @@ pub(super) async fn submission_loop(
                         request: thread_settings,
                         turn_extension_init: sub.turn_extension_init,
                     };
-                    match thread_settings::update(&sess, thread_settings).await {
-                        Ok(snapshot) => {
-                            // Reply first: the caller may hold a lock its event consumer needs.
-                            if let Some(reply) = reply {
-                                let _ = reply.send(Ok(()));
+                    match thread_settings::update(&sess, thread_settings, reply.is_some()).await {
+                        Ok(commit) => {
+                            match (reply, commit.host_acceptance) {
+                                (Some(mut reply), Some(acceptance)) => {
+                                    // Leave the submission loop free to process interrupts.
+                                    tokio::spawn(async move {
+                                        tokio::select! {
+                                            _ = reply.closed() => {}
+                                            result = acceptance => {
+                                                let result = result.map_err(|error| {
+                                                    CodexErr::from(std::io::Error::other(format!(
+                                                        "service tier committed locally; host acceptance unconfirmed: {error}"
+                                                    )))
+                                                });
+                                                let _ = reply.send(result);
+                                            }
+                                        }
+                                    });
+                                }
+                                (Some(reply), None) => {
+                                    // The caller may hold a lock its event consumer needs.
+                                    let _ = reply.send(Ok(()));
+                                }
+                                (None, _) => {}
                             }
-                            thread_settings::emit_applied(&sess, sub.id.clone(), snapshot).await;
+                            thread_settings::emit_applied(&sess, sub.id.clone(), commit.snapshot)
+                                .await;
                         }
                         Err(error) => {
                             let message = format!("invalid thread settings override: {error}");

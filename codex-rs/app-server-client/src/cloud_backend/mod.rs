@@ -1,5 +1,6 @@
 //! Adapts native Cloud requests and the currently open conversation’s reply stream.
 //! A replacement becomes active only after its native attachment opens successfully.
+//! Loaded-thread queries report reply attachments, not retained resume metadata.
 
 mod auth;
 mod events;
@@ -150,7 +151,8 @@ impl Replies {
 
 /// Opens an app-server client backed by the authenticated native Cloud client.
 fn start_worker(client: cloud::Client, account: protocol::GetAccountResponse) -> AppServerClient {
-    let (app_client, commands, output) = CloudClient::channel(/*capacity*/ 32);
+    let (app_client, commands, output) =
+        CloudClient::channel_with_catalog(/*capacity*/ 32, Some(client.clone()));
     let mut requests = requests::Requests {
         client,
         account,
@@ -252,6 +254,15 @@ async fn handle_request(
     replies: &mut Replies,
     output: &mpsc::UnboundedSender<AppServerEvent>,
 ) -> Result<Value> {
+    if let protocol::ClientRequest::ThreadLoadedList { .. } = &request {
+        // The archive RPC can fail after closing Attach. Observe a ready EOF even
+        // when the RPC result won the worker's select before the stream did.
+        let _ = tokio::task::unconstrained(replies.forward_next(output)).now_or_never();
+        return Ok(serde_json::json!({
+            "data": replies.active.iter().map(|active| &active.thread_id).collect::<Vec<_>>(),
+            "nextCursor": null,
+        }));
+    }
     if let protocol::ClientRequest::ThreadRead { params, .. } = &request {
         return requests.read_thread(params, replies.thread_status(&params.thread_id));
     }
@@ -277,6 +288,24 @@ async fn handle_request(
         .await?
     {
         requests::Response::Value(value) => Ok(value),
+        requests::Response::Archived(thread_id) => {
+            replies.detach(&thread_id);
+            replies.stream_losses.supersede(&thread_id);
+            if requests
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| loaded.thread.id == thread_id)
+            {
+                requests.loaded = None;
+            }
+            send_notification(
+                output,
+                protocol::ServerNotification::ThreadArchived(
+                    protocol::ThreadArchivedNotification { thread_id },
+                ),
+            );
+            Ok(serde_json::to_value(protocol::ThreadArchiveResponse {})?)
+        }
         requests::Response::Attach(settings) => {
             let id = &settings.thread.id;
             let result = serde_json::to_value(&settings)?;

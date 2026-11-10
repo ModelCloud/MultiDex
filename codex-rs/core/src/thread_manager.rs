@@ -308,6 +308,7 @@ pub enum McpRefreshReason {
     RuntimeAuthChanged,
     SelectedCapabilityRootsChanged,
     SessionMcpInputsChanged,
+    SessionPermissionsGranted,
     SkillMcpDependenciesAdded,
     TaskStartedExecutorDiscovery,
     TurnStartContributorPreparedMcp,
@@ -3026,7 +3027,7 @@ impl ThreadManagerState {
         }
         // Cancelling this wait must leave the registered runtime and the host handoff intact.
         if let Some(accepted) = tier_acceptance {
-            accepted.await;
+            let _ = accepted.await;
         }
         Ok(new_thread)
     }

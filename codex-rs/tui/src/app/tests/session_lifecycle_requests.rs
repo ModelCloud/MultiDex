@@ -914,7 +914,7 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     };
     *model = "standard-only".into();
     while events.try_recv().is_ok() {}
-    app.submit_thread_op(&mut server, thread_id, unsupported_turn)
+    app.submit_thread_op(&mut server, thread_id, unsupported_turn.clone())
         .await?;
     assert!(recorded_params(&requests, "turn/start").is_empty());
     assert!(next_history_message(&mut events).contains("Daybreak support for model standard-only"));
@@ -953,7 +953,17 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
     app.chat_widget
         .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
-    let models = app.chat_widget.model_catalog().models.clone();
+    let mut models = app.chat_widget.model_catalog().models.clone();
+    for (name, cyber) in [
+        ("red", vec![CyberAccessProgram::DaybreakRed]),
+        ("empty", vec![]),
+    ] {
+        models.push(ModelPreset {
+            model: name.into(),
+            available_access_programs: Some(ModelAccessPrograms { cyber }),
+            ..models[0].clone()
+        });
+    }
     app.chat_widget.update_account_state(
         Some(crate::status::StatusAccountDisplay::ApiKey),
         /*plan_type*/ None,
@@ -968,7 +978,26 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
         })
         .last()
         .expect("account model refresh");
+    let next_disable = |events: &mut tokio::sync::mpsc::UnboundedReceiver<_>| {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .find(|event| matches!(event, AppEvent::DisableUnavailableDaybreak { .. }))
+    };
+    // A switch during discovery must wait for the current account's catalog.
+    app.chat_widget
+        .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ true);
+    app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
+    let original_model = app.chat_widget.current_model().to_owned();
+    app.chat_widget.set_model("standard-only");
+    assert!(next_disable(&mut events).is_none());
     assert!(app.chat_widget.on_models_loaded(request_id, Ok(models)));
+    assert!(matches!(next_disable(&mut events),
+        Some(AppEvent::DisableUnavailableDaybreak { thread_id: id, model })
+            if id == thread_id && model == "standard-only"
+    ));
+    for model in ["red", "empty", "unlisted", &original_model] {
+        app.chat_widget.set_model(model);
+    }
+    assert!(next_disable(&mut events).is_none());
     for (cli_daybreak, api_key_cyber_access_programs, enabled) in [
         (false, false, true),
         (false, true, true),
@@ -998,11 +1027,41 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
 
     let missing_thread_id = ThreadId::new();
     app.active_thread_id = Some(missing_thread_id);
-    app.persist_daybreak_selection(&mut server, missing_thread_id, /*enabled*/ true)
-        .await;
+    assert!(
+        !app.persist_daybreak_selection(&mut server, missing_thread_id, /*enabled*/ true)
+            .await
+    );
     assert!(next_history_message(&mut events).contains("Failed to read the thread"));
     assert!(!app.chat_widget.daybreak_enabled);
     assert!(!app.config.daybreak_enabled);
+
+    app.active_thread_id = Some(thread_id);
+    app.persist_daybreak_selection(&mut server, thread_id, /*enabled*/ true)
+        .await;
+    assert!(next_history_message(&mut events).contains("Daybreak on"));
+    app.chat_widget.set_model("standard-only");
+    let disable = next_disable(&mut events).expect("model switch disables Daybreak");
+    assert!(app.chat_widget.daybreak_enabled);
+    app.handle_event(&mut tui, &mut server, disable).await?;
+    assert!(next_history_message(&mut events).contains("Daybreak off"));
+    let warning = next_history_message(&mut events);
+    insta::assert_snapshot!("daybreak_model_switch_warning", warning);
+    assert_eq!(
+        server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await?
+            .daybreak_enabled,
+        Some(false)
+    );
+    assert!(!app.config.daybreak_enabled);
+    app.submit_thread_op(&mut server, thread_id, unsupported_turn)
+        .await?;
+    assert_eq!(
+        recorded_params(&requests, "turn/start")[turns.len()]["cyberAccessProgram"],
+        "standard"
+    );
+    app.chat_widget.set_model(&original_model);
+    assert!(!app.chat_widget.daybreak_enabled);
     server.shutdown().await?;
     proxy.await??;
     Ok(())
@@ -1043,6 +1102,54 @@ async fn complete_managed_worktree_creation(
             return Ok(());
         }
     }
+}
+
+#[tokio::test]
+async fn returning_from_side_chat_reads_parent_only_when_reattaching() -> Result<()> {
+    let (mut app, _home) = make_history_test_app().await?;
+    enable_side_retention(&mut app)?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let (mut server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let started = server.start_thread(&app.config).await?;
+    let parent = started.session.thread_id;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    let side = server.start_thread(&app.config).await?;
+    let child = side.session.thread_id;
+    app.side_threads.insert(child, SideThreadState::new(parent));
+    app.ensure_thread_channel(child)
+        .store
+        .lock()
+        .await
+        .set_session(side.session, side.turns);
+
+    for needs_reattach in [false, true] {
+        app.select_agent_thread(&mut tui, &mut server, child)
+            .await?;
+        assert_eq!(app.current_displayed_thread_id(), Some(child));
+        if needs_reattach {
+            app.ensure_thread_channel(parent).mark_replay_only();
+        }
+        app.select_agent_thread(&mut tui, &mut server, parent)
+            .await?;
+        assert_eq!(app.current_displayed_thread_id(), Some(parent));
+        let reads = recorded_params(&requests, "thread/read");
+        assert_eq!(
+            reads
+                .iter()
+                .any(|params| params["threadId"] == parent.to_string()),
+            needs_reattach
+        );
+    }
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -2363,7 +2470,8 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         resumed["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
-    Box::pin(app_server.resume_thread(
+    let mut attachment = app_server.attachment_view(delegation_source);
+    Box::pin(attachment.resume_thread(
         &app.local_settings,
         app.config.clone(),
         delegation_source,
@@ -2551,54 +2659,26 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
 
 #[tokio::test]
 async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Result<()> {
-    for scenario in ["conflicting", "blocked", "mismatched", "allowed"] {
-        let (mut app, _codex_home) = make_history_test_app().await?;
-        if scenario == "conflicting" {
-            let raw = serde_json::from_value::<codex_config::RawMcpServerConfig>(
-                serde_json::json!({"url": "http://127.0.0.1:1/mcp", "enabled": false}),
-            )?;
-            let mut servers = app.config.mcp_servers.get().clone();
-            servers.insert(
-                crate::dynamic_tools::NAMESPACE.to_string(),
-                codex_config::McpServerConfig::try_from(raw)
-                    .map_err(color_eyre::eyre::Report::msg)?,
-            );
-            app.config.mcp_servers.set(servers)?;
-        } else {
-            let mut allowed_servers = std::collections::BTreeMap::new();
-            if matches!(scenario, "mismatched" | "allowed") {
-                let requirement = if scenario == "allowed" {
-                    codex_config::McpServerRequirement::Url(
-                        codex_protocol::mcp_policy::McpServerValueMatcher::Prefix {
-                            value: "http://127.0.0.1:".to_string(),
-                        },
-                    )
-                } else {
-                    codex_config::McpServerRequirement::Identity {
-                        identity: codex_config::McpServerIdentity::Url {
-                            url: "http://127.0.0.1:1/mcp".to_string(),
-                        },
-                    }
-                };
-                allowed_servers.insert(crate::dynamic_tools::NAMESPACE.to_string(), requirement);
-            }
-            let requirements = codex_config::ConfigRequirements {
-                mcp_servers: Some(codex_config::Sourced::new(
-                    allowed_servers,
-                    codex_config::RequirementSource::Unknown,
-                )),
-                ..Default::default()
-            };
-            app.config.config_layer_stack = codex_config::ConfigLayerStack::new(
-                Vec::new(),
-                requirements,
-                codex_config::ConfigRequirementsToml::default(),
+    for name_taken in [false, true] {
+        let (app, codex_home) = make_history_test_app().await?;
+        if name_taken {
+            std::fs::write(
+                codex_home.path().join("config.toml"),
+                "[mcp_servers.codex_tui]\ncommand = 'user-helper'\nenabled = false",
             )?;
         }
-        let (mut app_server, requests, proxy) = start_recording_app_server(
+        let requirements_path = codex_home.path().join("requirements.toml");
+        std::fs::write(&requirements_path, "[mcp_servers]")?;
+        let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
             &app.config,
+            HistoryCapabilities::Current,
             /*blocked_thread_list*/ None,
             /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides {
+                system_requirements_path: Some(requirements_path),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            },
         )
         .await?;
         let result = app_server
@@ -2608,24 +2688,15 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
                 app.dynamic_tool_status_updates.clone(),
             )
             .await;
-        if scenario == "allowed" {
-            result?;
-        } else {
-            let error = result.expect_err("unavailable internal MCP must fail closed");
-            assert_eq!(
-                error.kind(),
-                if scenario == "conflicting" {
-                    std::io::ErrorKind::AlreadyExists
-                } else {
-                    std::io::ErrorKind::PermissionDenied
-                }
-            );
-        }
-        app_server.start_thread(&app.config).await?;
+        assert_eq!(
+            result.err().map(|err| err.kind()),
+            name_taken.then_some(std::io::ErrorKind::AlreadyExists)
+        );
+        let started = app_server.start_thread(&app.config).await?;
         let start = recorded_params(&requests, "thread/start")
             .pop()
-            .expect("fallback task start");
-        if scenario == "allowed" {
+            .expect("task start");
+        if !name_taken {
             assert!(start["dynamicTools"].is_null());
             assert!(start["config"]["mcp_servers.codex_tui"].is_object());
         } else {
@@ -2635,6 +2706,17 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
             );
             assert!(start["config"]["mcp_servers.codex_tui"].is_null());
         }
+        let inventory = crate::app::background_requests::fetch_all_mcp_server_statuses(
+            app_server.request_handle(),
+            codex_app_server_protocol::McpServerStatusDetail::ToolsAndAuthOnly,
+            Some(started.session.thread_id),
+        )
+        .await?;
+        assert!(
+            !inventory
+                .iter()
+                .any(|server| server.name == "codex_tui" && !server.tools.is_empty())
+        );
         app_server.shutdown().await?;
         proxy.await??;
     }

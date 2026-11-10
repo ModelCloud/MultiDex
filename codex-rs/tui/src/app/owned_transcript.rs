@@ -14,6 +14,7 @@ use crate::bottom_pane::CommandPopupPlacement;
 use crate::bottom_pane::ComposerRenderOptions;
 use crate::custom_terminal::Frame;
 use crate::empty_state_animation::ComposerState;
+#[cfg(test)]
 use crate::history_cell::HistoryRenderMode;
 use crate::keymap::KeymapContext;
 use crate::keymap::bindings_for_action;
@@ -37,7 +38,6 @@ pub(super) struct ConversationFrame {
     pub(super) sidebar: Option<sidebar::SidebarLayout>,
     pub(super) chat_strip: Option<Rect>,
     pub(super) sidebar_input: Option<sidebar::SidebarInputState>,
-    pub(super) leader_hud: Option<Rect>,
     pub(super) close_buttons: [Rect; 2],
     /// A dialog can obscure neighboring content in the terminal's completed buffer.
     behind_dialog: Option<ratatui::buffer::Buffer>,
@@ -45,11 +45,6 @@ pub(super) struct ConversationFrame {
 }
 
 impl ConversationFrame {
-    pub(super) fn hud_contains(&self, mouse: crossterm::event::MouseEvent) -> bool {
-        self.leader_hud
-            .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
-    }
-
     pub(super) fn has_caller_inset(&self) -> bool {
         self.inset.is_some() && self.sidebar.is_none() && self.chat_strip.is_none()
     }
@@ -217,17 +212,24 @@ impl App {
             self.local_settings.tui.copy_on_select_clear_selection;
         view.set_keymap_bindings(&self.keymap);
         view.set_presentation(view.is_detailed(), chat_widget.history_render_mode());
+        let active = chat_widget.active_activity_cell();
+        let (live_summary, expanded) = view.sync_live_tool_summary(
+            &self.transcript_cells,
+            self.local_settings.tui.collapse_turn_details,
+            active,
+        );
         let active_key = chat_widget.active_cell_transcript_key();
         let detailed = view.is_detailed();
-        let active_ids = chat_widget.active_activity_ids();
-        let expanded = view.sync_live_activity(&self.transcript_cells, active_ids)
-            && chat_widget.history_render_mode() == HistoryRenderMode::Rich;
         let search_changed = view.sync_search_live_tail(transcript_width, active_key, |width| {
             chat_widget.active_cell_transcript_hyperlink_lines(width)
         });
         let changed = if detailed {
             view.sync_live_tail(transcript_width, active_key, |width| {
                 chat_widget.active_cell_transcript_hyperlink_lines(width)
+            })
+        } else if let Some(row) = live_summary {
+            view.sync_live_layout(transcript_width, active_key, |width| {
+                Some(row.layout(width, expanded, chat_widget.active_auxiliary_lines(width)))
             })
         } else {
             view.sync_live_activity_tail(transcript_width, active_key, expanded, |width| {
@@ -304,10 +306,13 @@ impl App {
                 .take()
                 .unwrap_or_else(|| tui.terminal.previous_buffer().clone())
         });
-        let hud = self.workspace_hud(tui, screen_size.into());
+        let mut hud = self.workspace_hud(tui, screen_size.into());
+        if let Some(hud) = &mut hud {
+            hud.viewport = caller_inset;
+        }
         prepared.floating_shortcuts = hud.is_some();
         let mut painted = PaintedConversation::default();
-        tui.draw(screen_size.height, |frame| {
+        tui.draw_with_shortcut_hud(screen_size.height, hud, |frame| {
             if let Some(backdrop) = backdrop {
                 let viewport = frame.area();
                 frame.image_placements.extend(
@@ -329,7 +334,12 @@ impl App {
                 Some(sidebar::SidebarLayout::Chat(panes)) => {
                     if let Some(companion) = self.side_companions.get_mut(&panes.passive_thread) {
                         companion.view.image_protocol = self.transcript_view.image_protocol;
-                        panes.paint_companion(companion, frame, &frames);
+                        panes.paint_companion(
+                            companion,
+                            frame,
+                            self.local_settings.tui.collapse_turn_details,
+                            &frames,
+                        );
                     }
                 }
                 Some(sidebar::SidebarLayout::Chooser { sidebar, focus, .. }) => {
@@ -463,16 +473,6 @@ impl App {
                 self.conversation_frame.close_buttons = buttons;
             }
             self.paint_centered_dialog(frame);
-            self.conversation_frame.leader_hud = hud.map(|hud| {
-                let area = hud.render_overlay(frame.area(), frame.buffer);
-                if frame.cursor_position.is_some_and(|pos| area.contains(pos)) {
-                    frame.cursor_position = None;
-                }
-                frame
-                    .image_placements
-                    .retain(|image| !area.intersects(image.area));
-                area
-            });
         })?;
         self.finish_conversation(tui, painted)
     }
@@ -651,17 +651,8 @@ impl App {
                 && view.composer_gap_has_content(transcript_width, prepared.composer_hint.as_ref(), now);
         }
         // Refresh the hint using the rows just painted.
-        let mut footer = prompt_footer
+        let footer = prompt_footer
             .or_else(|| view.footer_with_navigation(footer_width, motion, latest_navigation));
-        if let Some(footer) = footer.as_mut().filter(|footer| footer.is_interactive)
-            && self.key_chord_matcher.workspace_leader().is_none()
-            && let Some(items) = self
-                .key_chord_matcher
-                .pending_hint_items(&self.keymap.chords, footer_width)
-            && let Some(progress) = footer.text.lines.last_mut()
-        {
-            *progress = crate::bottom_pane::footer_hint_items_line(&items);
-        }
         let bottom = chat_widget.bottom_pane_renderable(ComposerRenderOptions {
             footer: footer.as_ref(),
             composer_gap: composer_gap.as_ref(),
