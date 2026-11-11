@@ -463,6 +463,8 @@ impl SessionConfiguration {
                 Some(codex_model_provider_info::LITHOS_PROVIDER_ID)
             } else if next_model.is_some_and(codex_model_provider_info::is_openrouter_model) {
                 Some(codex_model_provider_info::OPENROUTER_PROVIDER_ID)
+            } else if next_model.is_some_and(codex_model_provider_info::is_wafer_model) {
+                Some(codex_model_provider_info::WAFER_PROVIDER_ID)
             } else if openrouter_to_openai {
                 Some(codex_model_provider_info::OPENAI_PROVIDER_ID)
             } else if let Some(model_provider) = updates.model_provider.as_deref()

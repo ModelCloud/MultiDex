@@ -1786,6 +1786,7 @@ async fn maybe_run_previous_model_inline_compact(
         || turn_context.provider.info().is_openrouter()
         || codex_model_provider_info::is_openrouter_model(&previous_model)
         || codex_model_provider_info::is_lithos_model(&previous_model)
+        || codex_model_provider_info::is_wafer_model(&previous_model)
     {
         // An endpoint transition can cross providers. Without proven historical
         // routing, preserve a hash boundary using the current model/provider.

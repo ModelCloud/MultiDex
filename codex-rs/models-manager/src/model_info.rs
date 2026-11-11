@@ -30,6 +30,7 @@ const PERSONALITY_SECTION_HEADER: &str = "# Personality";
 const MULTIDEX_DSV41_FLASH: &str = "DS v4.1 Flash 1017";
 /// The same DS v4.1 Flash model routed through OpenRouter's aggregate API.
 const OPENROUTER_DSV41_FLASH: &str = "deepseek/deepseek-v4.1-flash-1017";
+const WAFER_DSV41_FLASH: &str = "DeepSeek-V4.1-Flash-1017";
 const LITHOS_DSV41_FLASH: [&str; 3] = [
     "deepseek-ai/DeepSeek-V4.1-Flash",
     "deepseek-ai/DeepSeek-V4.1-Flash-fast",
@@ -164,6 +165,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     if slug == OPENROUTER_DSV41_FLASH {
         return openrouter_dsv41_flash_model_info();
     }
+    if slug == WAFER_DSV41_FLASH {
+        return wafer_dsv41_flash_model_info();
+    }
     if LITHOS_DSV41_FLASH.contains(&slug) {
         return lithos_dsv41_flash_model_info(slug);
     }
@@ -230,11 +234,13 @@ pub fn multidex_model_catalog() -> ModelsResponse {
     catalog.models.retain(|model| {
         model.slug != MULTIDEX_DSV41_FLASH
             && model.slug != OPENROUTER_DSV41_FLASH
+            && model.slug != WAFER_DSV41_FLASH
             && !LITHOS_DSV41_FLASH.contains(&model.slug.as_str())
     });
     catalog.models.push(apply_multidex_runtime_capabilities(
         multidex_dsv41_flash_model_info(),
     ));
+    catalog.models.push(wafer_dsv41_flash_model_info());
     catalog.models.push(openrouter_dsv41_flash_model_info());
     catalog
         .models
@@ -280,8 +286,23 @@ fn openrouter_dsv41_flash_model_info() -> ModelInfo {
         /*supports_reasoning_summary_parameter*/
         true,
         /*default_reasoning_summary*/ ReasoningSummary::Auto,
-        /*priority*/ 1,
+        /*priority*/ 2,
     )
+}
+
+fn wafer_dsv41_flash_model_info() -> ModelInfo {
+    let mut model = dsv41_flash_model_info(
+        WAFER_DSV41_FLASH,
+        "DeepSeek v4.1 Flash (Wafer)",
+        "DeepSeek v4.1 Flash 1017 standard model served by Wafer US.",
+        ReasoningEffort::High,
+        false,
+        ReasoningSummary::None,
+        1,
+    );
+    model.context_window = Some(1_048_576);
+    model.auto_compact_token_limit = None;
+    model
 }
 
 fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
@@ -297,7 +318,7 @@ fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         ReasoningEffort::Max,
         false,
         ReasoningSummary::None,
-        2,
+        3,
     );
     // Lithos publishes a 1M-token context; keep a conservative decimal fallback.
     model.context_window = Some(1_000_000);

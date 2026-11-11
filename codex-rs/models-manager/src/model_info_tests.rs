@@ -289,6 +289,26 @@ fn multidex_dsv41_flash_uses_native_metadata() {
 }
 
 #[test]
+fn wafer_catalog_registers_only_standard_1017_checkpoint() {
+    let models = multidex_model_catalog().models;
+    let wafer: Vec<_> = models
+        .iter()
+        .filter(|m| m.display_name.contains("(Wafer)"))
+        .collect();
+    assert_eq!(wafer.len(), 1);
+    assert_eq!(wafer[0].slug, "DeepSeek-V4.1-Flash-1017");
+    assert_eq!(wafer[0].context_window, Some(1_048_576));
+    assert_eq!(
+        wafer[0].default_reasoning_level,
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(
+        model_info_from_slug("DeepSeek-V4.1-Flash-1017").display_name,
+        "DeepSeek v4.1 Flash (Wafer)"
+    );
+}
+
+#[test]
 fn multidex_catalog_makes_the_local_model_selectable_without_replacing_codex_models() {
     let catalog = multidex_model_catalog();
     let model = catalog

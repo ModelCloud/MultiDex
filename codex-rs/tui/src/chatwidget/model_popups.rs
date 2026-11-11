@@ -8,6 +8,7 @@ use crate::model_catalog::LUNA_RESERVE_MODEL;
 use codex_model_provider_info::is_lithos_model;
 use codex_model_provider_info::is_multidex_model;
 use codex_model_provider_info::is_openrouter_model;
+use codex_model_provider_info::is_wafer_model;
 
 const ULTRA_REASONING_CONCURRENCY_WARNING_THRESHOLD: usize = 8;
 pub(super) const MODEL_OPTIONS_VIEW_ID: &str = "model-options";
@@ -23,6 +24,7 @@ enum PickerProvider {
     Local,
     OpenRouter,
     Lithos,
+    Wafer,
 }
 
 impl PickerProvider {
@@ -33,6 +35,8 @@ impl PickerProvider {
             Some(Self::OpenRouter)
         } else if is_lithos_model(model) {
             Some(Self::Lithos)
+        } else if is_wafer_model(model) {
+            Some(Self::Wafer)
         } else {
             None
         }
@@ -43,6 +47,7 @@ impl PickerProvider {
             Self::Local => "Local",
             Self::OpenRouter => "OpenRouter",
             Self::Lithos => "LithosAI",
+            Self::Wafer => "Wafer",
         }
     }
 }
