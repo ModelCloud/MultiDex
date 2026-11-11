@@ -165,6 +165,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     if slug == OPENROUTER_DSV41_FLASH {
         return openrouter_dsv41_flash_model_info();
     }
+    if slug == WAFER_DSV41_FLASH {
+        return wafer_dsv41_flash_model_info();
+    }
     if LITHOS_DSV41_FLASH.contains(&slug) {
         return lithos_dsv41_flash_model_info(slug);
     }
@@ -237,8 +240,8 @@ pub fn multidex_model_catalog() -> ModelsResponse {
     catalog.models.push(apply_multidex_runtime_capabilities(
         multidex_dsv41_flash_model_info(),
     ));
-    catalog.models.push(openrouter_dsv41_flash_model_info());
     catalog.models.push(wafer_dsv41_flash_model_info());
+    catalog.models.push(openrouter_dsv41_flash_model_info());
     catalog
         .models
         .extend(LITHOS_DSV41_FLASH.map(lithos_dsv41_flash_model_info));
@@ -283,7 +286,7 @@ fn openrouter_dsv41_flash_model_info() -> ModelInfo {
         /*supports_reasoning_summary_parameter*/
         true,
         /*default_reasoning_summary*/ ReasoningSummary::Auto,
-        /*priority*/ 1,
+        /*priority*/ 2,
     )
 }
 
@@ -295,7 +298,7 @@ fn wafer_dsv41_flash_model_info() -> ModelInfo {
         ReasoningEffort::High,
         false,
         ReasoningSummary::None,
-        2,
+        1,
     );
     model.context_window = Some(1_048_576);
     model.auto_compact_token_limit = None;
@@ -315,7 +318,7 @@ fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         ReasoningEffort::Max,
         false,
         ReasoningSummary::None,
-        2,
+        3,
     );
     // Lithos publishes a 1M-token context; keep a conservative decimal fallback.
     model.context_window = Some(1_000_000);

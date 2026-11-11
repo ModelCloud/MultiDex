@@ -302,6 +302,10 @@ fn wafer_catalog_registers_only_standard_1017_checkpoint() {
         wafer[0].default_reasoning_level,
         Some(ReasoningEffort::High)
     );
+    assert_eq!(
+        model_info_from_slug("DeepSeek-V4.1-Flash-1017").display_name,
+        "DeepSeek v4.1 Flash (Wafer)"
+    );
 }
 
 #[test]
