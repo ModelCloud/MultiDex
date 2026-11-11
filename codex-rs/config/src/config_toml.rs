@@ -1219,7 +1219,13 @@ experimental_bearer_token = "test-token"
             .get(WAFER_PROVIDER_ID)
             .expect("Wafer provider should be present");
         assert_eq!(provider.base_url.as_deref(), Some("https://us.pass.wafer.ai/v1"));
-        assert_eq!(provider.experimental_bearer_token.as_deref(), Some("test-token"));
+        assert_eq!(
+            provider
+                .experimental_bearer_token
+                .as_deref()
+                .map(String::as_str),
+            Some("test-token")
+        );
     }
 
     #[test]
