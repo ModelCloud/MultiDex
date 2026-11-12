@@ -297,7 +297,8 @@ fn wafer_catalog_registers_only_standard_1017_checkpoint() {
         .collect();
     assert_eq!(wafer.len(), 1);
     assert_eq!(wafer[0].slug, "DeepSeek-V4.1-Flash-1017");
-    assert_eq!(wafer[0].context_window, Some(1_048_576));
+    assert_eq!(wafer[0].context_window, Some(262_144));
+    assert_eq!(wafer[0].auto_compact_token_limit(), Some(257_948));
     assert_eq!(
         wafer[0].default_reasoning_level,
         Some(ReasoningEffort::High)
@@ -372,35 +373,58 @@ fn lithos_variants_use_1017_instructions_without_fallback_metadata() {
         assert!(model.display_name.starts_with("DeepSeek v4.1 Flash"));
         assert_eq!(render_model_instructions(&model), DEEPSEEK_INSTRUCTIONS);
         assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::Max));
-        assert_eq!(model.auto_compact_token_limit(), Some(900_000));
+        assert_eq!(model.context_window, Some(262_144));
+        assert_eq!(model.auto_compact_token_limit(), Some(257_948));
         assert!(!model.supports_reasoning_summary_parameter);
         assert!(model.service_tiers.is_empty());
     }
 }
 
 #[test]
-fn multidex_runtime_capability_uses_only_matching_positive_context_window() {
+fn multidex_runtime_capability_uses_only_matching_positive_local_budget() {
     assert_eq!(
-        super::multidex_runtime_context_window(
-            r#"{"model":"DS v4.1 Flash 1017","context_window":262144}"#,
-            "DS v4.1 Flash 1017",
+        super::multidex_runtime_context_budget(
+            r#"{"model":"DS v4.1 Flash 1017","context_window":294912,"max_prompt_tokens":262144}"#,
         ),
-        Some(262_144)
+        Some((294_912, 262_144))
     );
     assert_eq!(
-        super::multidex_runtime_context_window(
-            r#"{"model":"other","context_window":262144}"#,
-            "DS v4.1 Flash 1017",
-        ),
+        super::multidex_runtime_context_budget(r#"{"model":"other","context_window":262144}"#,),
         None
     );
     assert_eq!(
-        super::multidex_runtime_context_window(
+        super::multidex_runtime_context_budget(
             r#"{"model":"DS v4.1 Flash 1017","context_window":0}"#,
-            "DS v4.1 Flash 1017",
         ),
         None
     );
+    assert_eq!(
+        super::multidex_runtime_context_budget(
+            r#"{"model":"DS v4.1 Flash 1017","context_window":262144,"max_prompt_tokens":999999}"#,
+        ),
+        Some((262_144, 262_144))
+    );
+}
+
+#[test]
+fn deepseek_provider_switches_share_local_context_and_compaction_budget() {
+    let local_window = 294_912;
+    let local_prompt = 262_144;
+    for slug in [
+        MULTIDEX_DSV41_FLASH,
+        OPENROUTER_DSV41_FLASH,
+        WAFER_DSV41_FLASH,
+        LITHOS_DSV41_FLASH[0],
+        LITHOS_DSV41_FLASH[1],
+        LITHOS_DSV41_FLASH[2],
+    ] {
+        let bundled = model_info_from_slug(slug);
+        assert_eq!(bundled.context_window, Some(262_144), "{slug}");
+        assert_eq!(bundled.auto_compact_token_limit(), Some(257_948), "{slug}");
+        let model = super::apply_local_context_budget(bundled, local_window, local_prompt);
+        assert_eq!(model.context_window, Some(local_window), "{slug}");
+        assert_eq!(model.auto_compact_token_limit(), Some(257_948), "{slug}");
+    }
 }
 
 #[test]

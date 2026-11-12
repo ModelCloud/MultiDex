@@ -46,6 +46,8 @@ const MULTIDEX_RUNTIME_CAPABILITIES_FILE: &str = "multidex-runtime-capabilities.
 struct MultiDexRuntimeCapabilities {
     model: String,
     context_window: i64,
+    #[serde(default)]
+    max_prompt_tokens: Option<i64>,
 }
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
@@ -90,12 +92,12 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     apply_multidex_runtime_capabilities(model)
 }
 
-/// Apply the session-private endpoint capability snapshot when it is newer
-/// than bundled metadata. Omnigent writes this file immediately before every
-/// MultiDex turn after authenticating to `/v1/models/{id}`. Treat malformed or
-/// missing data as unavailable and retain the conservative bundled fallback.
-fn apply_multidex_runtime_capabilities(mut model: ModelInfo) -> ModelInfo {
-    if model.slug != MULTIDEX_DSV41_FLASH {
+/// Use the local endpoint's live budget for every DeepSeek provider variant.
+/// The snapshot comes from the local `/v1/models/{id}` endpoint. Keep the
+/// bundled local budget when discovery fails; never inherit a hosted
+/// provider's larger published window during a provider switch.
+fn apply_multidex_runtime_capabilities(model: ModelInfo) -> ModelInfo {
+    if !is_dsv41_flash_model(&model.slug) {
         return model;
     }
     let Some(codex_home) = std::env::var_os("CODEX_HOME") else {
@@ -105,20 +107,43 @@ fn apply_multidex_runtime_capabilities(mut model: ModelInfo) -> ModelInfo {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return model;
     };
-    let Some(context_window) = multidex_runtime_context_window(&contents, &model.slug) else {
+    let Some((context_window, max_prompt_tokens)) = multidex_runtime_context_budget(&contents)
+    else {
         return model;
     };
+    apply_local_context_budget(model, context_window, max_prompt_tokens)
+}
+
+fn apply_local_context_budget(
+    mut model: ModelInfo,
+    context_window: i64,
+    max_prompt_tokens: i64,
+) -> ModelInfo {
     model.context_window = Some(context_window);
     model.max_context_window = None;
     model.auto_compact_token_limit =
-        Some(context_window.saturating_sub(MULTIDEX_DSV41_FLASH_COMPACTION_HEADROOM));
+        Some(max_prompt_tokens.saturating_sub(MULTIDEX_DSV41_FLASH_COMPACTION_HEADROOM));
     model
 }
 
-fn multidex_runtime_context_window(contents: &str, model: &str) -> Option<i64> {
+fn is_dsv41_flash_model(slug: &str) -> bool {
+    slug == MULTIDEX_DSV41_FLASH
+        || slug == OPENROUTER_DSV41_FLASH
+        || slug == WAFER_DSV41_FLASH
+        || LITHOS_DSV41_FLASH.contains(&slug)
+}
+
+fn multidex_runtime_context_budget(contents: &str) -> Option<(i64, i64)> {
     let capabilities = serde_json::from_str::<MultiDexRuntimeCapabilities>(contents).ok()?;
-    (capabilities.model == model && capabilities.context_window > 0)
-        .then_some(capabilities.context_window)
+    if capabilities.model != MULTIDEX_DSV41_FLASH || capabilities.context_window <= 0 {
+        return None;
+    }
+    let max_prompt_tokens = capabilities
+        .max_prompt_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(capabilities.context_window)
+        .min(capabilities.context_window);
+    Some((capabilities.context_window, max_prompt_tokens))
 }
 
 fn strip_personality_section(mut instructions: String) -> String {
@@ -163,13 +188,13 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         return apply_multidex_runtime_capabilities(multidex_dsv41_flash_model_info());
     }
     if slug == OPENROUTER_DSV41_FLASH {
-        return openrouter_dsv41_flash_model_info();
+        return apply_multidex_runtime_capabilities(openrouter_dsv41_flash_model_info());
     }
     if slug == WAFER_DSV41_FLASH {
-        return wafer_dsv41_flash_model_info();
+        return apply_multidex_runtime_capabilities(wafer_dsv41_flash_model_info());
     }
     if LITHOS_DSV41_FLASH.contains(&slug) {
-        return lithos_dsv41_flash_model_info(slug);
+        return apply_multidex_runtime_capabilities(lithos_dsv41_flash_model_info(slug));
     }
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     ModelInfo {
@@ -237,14 +262,17 @@ pub fn multidex_model_catalog() -> ModelsResponse {
             && model.slug != WAFER_DSV41_FLASH
             && !LITHOS_DSV41_FLASH.contains(&model.slug.as_str())
     });
-    catalog.models.push(apply_multidex_runtime_capabilities(
-        multidex_dsv41_flash_model_info(),
-    ));
+    catalog.models.push(multidex_dsv41_flash_model_info());
     catalog.models.push(wafer_dsv41_flash_model_info());
     catalog.models.push(openrouter_dsv41_flash_model_info());
     catalog
         .models
         .extend(LITHOS_DSV41_FLASH.map(lithos_dsv41_flash_model_info));
+    for model in &mut catalog.models {
+        if is_dsv41_flash_model(&model.slug) {
+            *model = apply_multidex_runtime_capabilities(model.clone());
+        }
+    }
     catalog
 }
 
@@ -291,7 +319,7 @@ fn openrouter_dsv41_flash_model_info() -> ModelInfo {
 }
 
 fn wafer_dsv41_flash_model_info() -> ModelInfo {
-    let mut model = dsv41_flash_model_info(
+    dsv41_flash_model_info(
         WAFER_DSV41_FLASH,
         "DeepSeek v4.1 Flash (Wafer)",
         "DeepSeek v4.1 Flash 1017 standard model served by Wafer US.",
@@ -299,10 +327,7 @@ fn wafer_dsv41_flash_model_info() -> ModelInfo {
         false,
         ReasoningSummary::None,
         1,
-    );
-    model.context_window = Some(1_048_576);
-    model.auto_compact_token_limit = None;
-    model
+    )
 }
 
 fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
@@ -311,7 +336,7 @@ fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         "deepseek-ai/DeepSeek-V4.1-Flash-ultra" => "Ultra",
         _ => "Regular",
     };
-    let mut model = dsv41_flash_model_info(
+    dsv41_flash_model_info(
         slug,
         &format!("DeepSeek v4.1 Flash (Lithos {variant})"),
         "DeepSeek v4.1 Flash 1017 served by Lithos.",
@@ -319,12 +344,7 @@ fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         false,
         ReasoningSummary::None,
         3,
-    );
-    // Lithos publishes a 1M-token context; keep a conservative decimal fallback.
-    model.context_window = Some(1_000_000);
-    // Hosted Chat Completions follows upstream's compaction admission policy.
-    model.auto_compact_token_limit = None;
-    model
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,9 +416,9 @@ fn dsv41_flash_model_info(
         web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 10_000),
         supports_image_detail_original: false,
-        // The endpoint reserves two tokens for its prompt template, exposing
-        // a 262,142-token request budget from a 262,144-token context window.
-        // Reserve 4,196 tokens for new input and the compaction request.
+        // Conservative fallback shared by every DeepSeek provider. A live
+        // local endpoint snapshot replaces the context window and sets the
+        // compact threshold below its separate max_prompt_tokens ceiling.
         context_window: Some(MULTIDEX_DSV41_FLASH_CONTEXT_WINDOW),
         // A live endpoint capability snapshot may raise or lower this value;
         // do not cap that authoritative result to the bundled fallback.
