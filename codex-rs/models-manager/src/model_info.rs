@@ -420,9 +420,9 @@ fn dsv41_flash_model_info(
         // local endpoint snapshot replaces the context window and sets the
         // compact threshold below its separate max_prompt_tokens ceiling.
         context_window: Some(MULTIDEX_DSV41_FLASH_CONTEXT_WINDOW),
-        // A live endpoint capability snapshot may raise or lower this value;
-        // do not cap that authoritative result to the bundled fallback.
-        max_context_window: None,
+        // Cap user overrides to the shared fallback when discovery is absent.
+        // A live local endpoint snapshot removes this cap and replaces it.
+        max_context_window: Some(MULTIDEX_DSV41_FLASH_CONTEXT_WINDOW),
         auto_compact_token_limit: Some(MULTIDEX_DSV41_FLASH_AUTO_COMPACT_TOKEN_LIMIT),
         comp_hash: None,
         effective_context_window_percent: 100,
