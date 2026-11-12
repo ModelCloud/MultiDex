@@ -577,10 +577,18 @@ impl ModelInfo {
     }
 
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
-        // MultiDex publishes a fixed headroom budget for this model. Other models
-        // retain upstream's 90% auto-compaction ceiling.
-        if self.slug == "DS v4.1 Flash 1017"
-            && let Some(config_limit) = self.auto_compact_token_limit
+        // Every route to DeepSeek v4.1 Flash uses the local endpoint's prompt
+        // ceiling. Keep the explicit headroom budget when switching providers;
+        // unrelated models retain upstream's 90% auto-compaction ceiling.
+        if matches!(
+            self.slug.as_str(),
+            "DS v4.1 Flash 1017"
+                | "DeepSeek-V4.1-Flash-1017"
+                | "deepseek/deepseek-v4.1-flash-1017"
+                | "deepseek-ai/DeepSeek-V4.1-Flash"
+                | "deepseek-ai/DeepSeek-V4.1-Flash-fast"
+                | "deepseek-ai/DeepSeek-V4.1-Flash-ultra"
+        ) && let Some(config_limit) = self.auto_compact_token_limit
         {
             return Some(
                 self.usable_context_window()
@@ -2195,16 +2203,25 @@ mod tests {
     }
 
     #[test]
-    fn multidex_explicit_auto_compact_limit_can_reserve_fixed_headroom() {
-        let model = ModelInfo {
-            slug: "DS v4.1 Flash 1017".to_string(),
-            context_window: Some(393_216),
-            auto_compact_token_limit: Some(389_020),
-            effective_context_window_percent: 100,
-            ..test_model(/*spec*/ None)
-        };
+    fn deepseek_provider_variants_share_fixed_compaction_headroom() {
+        for slug in [
+            "DS v4.1 Flash 1017",
+            "DeepSeek-V4.1-Flash-1017",
+            "deepseek/deepseek-v4.1-flash-1017",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            "deepseek-ai/DeepSeek-V4.1-Flash-fast",
+            "deepseek-ai/DeepSeek-V4.1-Flash-ultra",
+        ] {
+            let model = ModelInfo {
+                slug: slug.to_string(),
+                context_window: Some(393_216),
+                auto_compact_token_limit: Some(389_020),
+                effective_context_window_percent: 100,
+                ..test_model(/*spec*/ None)
+            };
 
-        assert_eq!(model.auto_compact_token_limit(), Some(389_020));
+            assert_eq!(model.auto_compact_token_limit(), Some(389_020), "{slug}");
+        }
     }
 
     #[test]
