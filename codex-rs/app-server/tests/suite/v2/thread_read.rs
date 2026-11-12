@@ -415,6 +415,7 @@ async fn paginated_stored_thread_routes_projected_turns() -> Result<()> {
 
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
             current_account_only: false,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
@@ -708,6 +709,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                     thread_id,
                     "turn-1",
                     CoreTurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "commentary-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "commentary needle".to_string(),
@@ -722,6 +724,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                     thread_id,
                     "turn-1",
                     CoreTurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "partial-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "stable partial answer".to_string(),
@@ -736,6 +739,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                     thread_id,
                     "turn-1",
                     CoreTurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "final-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "😀 **Final**  \nneedle".to_string(),
@@ -1158,6 +1162,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(1),
             params: ThreadListParams {
+                include_attached_threads: false,
                 current_account_only: false,
                 excluded_thread_ids: None,
                 attached_to_thread_id: None,
@@ -1641,6 +1646,7 @@ async fn paginated_thread_name_set_is_reflected_in_read_list_and_metadata_resume
     // List should also surface the name.
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
             current_account_only: false,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
@@ -1832,13 +1838,15 @@ async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> 
 }
 
 #[tokio::test]
-async fn thread_items_list_defers_successful_command_output() -> Result<()> {
+async fn thread_items_list_defers_requested_outputs() -> Result<()> {
     use codex_protocol::items::CommandExecutionStatus::Completed;
     use codex_protocol::items::CommandExecutionStatus::Declined;
     use codex_protocol::items::CommandExecutionStatus::Failed;
     use codex_protocol::items::CommandExecutionStatus::InProgress;
 
-    async fn list(server: &mut TestAppServer, params: Value) -> Result<Value> {
+    async fn list(server: &mut TestAppServer, mut params: Value) -> Result<Value> {
+        // Compare all fixture items on one page.
+        params["limit"] = json!(100);
         let id = server
             .send_request("thread/items/list", Some(params))
             .await?;
@@ -1888,6 +1896,9 @@ async fn thread_items_list_defers_successful_command_output() -> Result<()> {
             }),
         ));
     }
+    let mcp_items = mcp_output_deferral_items(thread_id)?;
+    let expected_count = commands.len() + mcp_items.len();
+    items.extend(mcp_items);
     store
         .append_items(AppendThreadItemsParams { thread_id, items })
         .await?;
@@ -1911,7 +1922,28 @@ async fn thread_items_list_defers_successful_command_output() -> Result<()> {
     let mut params = json!({"threadId": thread_id, "turnId": "turn"});
     let full = list(&mut stable, params.clone()).await?;
     let entries = full["data"].as_array().expect("list entries");
-    assert_eq!(entries.len(), commands.len());
+    assert_eq!(entries.len(), expected_count);
+    let mcp_index = commands.len();
+    assert_eq!(entries[mcp_index]["item"]["id"], "large-mcp");
+    let saved = &entries[mcp_index]["item"]["result"];
+    let preview = saved["content"][0]["text"].as_str().expect("saved preview");
+    assert!(preview.contains("truncated"));
+    assert!(preview.contains("end of plain output"));
+    assert!(preview.len() < 64 * 1024);
+    let connector = entries
+        .iter()
+        .find(|entry| entry["item"]["id"] == "connector-mcp")
+        .expect("hosted connector");
+    assert_eq!(
+        connector["item"]["appContext"]["connectorId"],
+        "fixture-connector"
+    );
+    let empty = entries
+        .iter()
+        .find(|entry| entry["item"]["id"] == "empty-result")
+        .expect("empty MCP result");
+    assert_eq!(empty["item"]["result"]["content"], json!([]));
+    assert!(empty.get("outputDeferred").is_none());
     for (entry, (id, _, _, output)) in entries.iter().zip(commands) {
         assert_eq!(entry["item"]["id"], id);
         assert_eq!(
@@ -1924,23 +1956,25 @@ async fn thread_items_list_defers_successful_command_output() -> Result<()> {
     for options in [
         Value::Null,
         json!({}),
-        json!({"commandExecution": false}),
+        json!({"commandExecution": false, "mcpToolCall": false}),
         json!({"unknownItemKind": true}),
     ] {
         params["deferOutput"] = options;
         assert_eq!(list(&mut stable, params.clone()).await?, full);
     }
 
-    params["deferOutput"] = json!({"commandExecution": true, "unknownItemKind": true});
-    let id = stable
-        .send_request("thread/items/list", Some(params.clone()))
-        .await?;
-    let error = timeout(
-        DEFAULT_READ_TIMEOUT,
-        stable.read_stream_until_error_message(RequestId::Integer(id)),
-    )
-    .await??;
-    assert_eq!(error.error.code, -32600);
+    for option in ["commandExecution", "mcpToolCall"] {
+        params["deferOutput"] = json!({(option): true});
+        let id = stable
+            .send_request("thread/items/list", Some(params.clone()))
+            .await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            stable.read_stream_until_error_message(RequestId::Integer(id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, -32600);
+    }
 
     let mut experimental = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1955,41 +1989,164 @@ async fn thread_items_list_defers_successful_command_output() -> Result<()> {
         .await?,
         full
     );
-    let deferred = list(&mut experimental, params).await?;
-    let mut expected = full.clone();
-    for i in 0..2 {
-        expected["data"][i]["outputDeferred"] = json!(true);
-        expected["data"][i]["item"]["aggregatedOutput"] = Value::Null;
-    }
-    assert_eq!(deferred, expected);
+    for (commands, mcp) in [(true, false), (false, true), (true, true)] {
+        params["deferOutput"] =
+            json!({"commandExecution": commands, "mcpToolCall": mcp, "unknownItemKind": true});
+        let mut expected = full.clone();
+        let mut originals = Vec::new();
+        if commands {
+            for (i, original) in entries.iter().take(2).enumerate() {
+                originals.push(original);
+                expected["data"][i]["outputDeferred"] = json!(true);
+                expected["data"][i]["item"]["aggregatedOutput"] = Value::Null;
+            }
+        }
+        if mcp {
+            for (entry, original) in expected["data"]
+                .as_array_mut()
+                .expect("list entries")
+                .iter_mut()
+                .zip(entries)
+            {
+                if matches!(
+                    entry["item"]["id"].as_str(),
+                    Some("large-mcp" | "connector-mcp" | "small-mcp")
+                ) {
+                    entry["outputDeferred"] = json!(true);
+                    entry["item"]["result"]["content"] = json!([]);
+                    originals.push(original);
+                }
+            }
+        }
+        let response = list(&mut experimental, params.clone()).await?;
+        assert_eq!(response, expected);
 
-    let projected: ThreadItemsListResponse = serde_json::from_value(deferred)?;
-    let mut entries_to_fetch = projected
-        .data
-        .into_iter()
-        .filter_map(|entry| ThreadItem::try_from(entry).err());
-    let large_command = entries_to_fetch.next().expect("large command needs a read");
-    let small_command = entries_to_fetch.next().expect("small command needs a read");
-    assert!(entries_to_fetch.next().is_none());
+        let page: ThreadItemsListResponse = serde_json::from_value(response)?;
+        let deferred: Vec<_> = page
+            .data
+            .into_iter()
+            .filter_map(|entry| ThreadItem::try_from(entry).err())
+            .collect();
+        let exact: Value = experimental
+            .request(|request_id| ClientRequest::ThreadItemsRead {
+                request_id,
+                params: ThreadItemsReadParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: deferred
+                        .first()
+                        .expect("each opt-in defers an item")
+                        .turn_id
+                        .clone(),
+                    item_ids: deferred.into_iter().map(|item| item.item_id).collect(),
+                },
+            })
+            .await?;
+        assert_eq!(exact, json!({"data": originals}));
+    }
 
     let across_turns = list(
         &mut experimental,
-        json!({"threadId": thread_id, "deferOutput": {"commandExecution": true}}),
+        json!({"threadId": thread_id, "deferOutput": {"commandExecution": true, "mcpToolCall": true}}),
     )
     .await?;
     assert_eq!(across_turns["data"], full["data"]);
-    let exact: Value = experimental
-        .request(|request_id| ClientRequest::ThreadItemsRead {
-            request_id,
-            params: ThreadItemsReadParams {
-                thread_id: thread_id.to_string(),
-                turn_id: small_command.turn_id,
-                item_ids: vec![large_command.item_id, small_command.item_id],
-            },
-        })
-        .await?;
-    assert_eq!(exact, json!({"data": [entries[0], entries[1]]}));
     Ok(())
+}
+
+fn mcp_output_deferral_items(thread_id: codex_protocol::ThreadId) -> Result<Vec<RolloutItem>> {
+    let text = |text: &str| json!({"type": "text", "text": text});
+    let content = |blocks: Vec<Value>| json!({"result": {"content": blocks}});
+    let oversized = "é".repeat(40 * 1024);
+    let large = "x".repeat(4096);
+    let plain = || text(&large);
+    let notion = json!({"results": [{"object": "page", "url": "https://www.notion.so/page", "title": large}]}).to_string();
+    let cases = [
+        (
+            "large-mcp",
+            content(vec![text(&oversized), text("end of plain output")]),
+        ),
+        (
+            "connector-mcp",
+            json!({"server": "codex_apps", "connectorId": "fixture-connector", "linkId": "link-1"}),
+        ),
+        (
+            "builtin-terminal",
+            json!({"server": "codex_app", "tool": "read_thread_terminal"}),
+        ),
+        ("small-mcp", content(vec![text("x"), text("")])),
+        ("empty-text", content(vec![text("")])),
+        ("empty-result", content(vec![])),
+        (
+            "failed-mcp",
+            json!({"status": "failed", "error": {"message": "tool failed"}}),
+        ),
+        ("running-mcp", json!({"status": "inProgress"})),
+        ("missing-result", json!({"result": null})),
+        (
+            "annotated",
+            content(vec![
+                plain(),
+                json!({"type": "text", "text": "caption", "annotations": {"audience": ["user"]}}),
+            ]),
+        ),
+        (
+            "image-result",
+            content(vec![
+                plain(),
+                json!({"type": "image", "mimeType": "image/png", "data": "YQ=="}),
+            ]),
+        ),
+        (
+            "structured-result",
+            json!({"result": {"content": [plain()], "structuredContent": {"title": "Source"}}}),
+        ),
+        (
+            "metadata-result",
+            json!({"result": {"content": [plain()], "_meta": {"uri": "ui://result"}}}),
+        ),
+        (
+            "app-resource",
+            json!({"server": "codex_apps", "connectorId": "fixture-connector", "mcpAppResourceUri": "ui://panel"}),
+        ),
+        ("legacy-app-ui", json!({"mcpAppResourceUri": "ui://panel"})),
+        (
+            "app-ui",
+            json!({"mcpAppUi": {"resourceUri": "ui://panel", "preferredModelDisplayMode": "inline"}}),
+        ),
+        (
+            "json-result",
+            content(vec![text(&format!("\u{feff} {notion}"))]),
+        ),
+        (
+            "mixed-json",
+            content(vec![text(&oversized), text(" \n []")]),
+        ),
+        (
+            "fenced-result",
+            content(vec![plain(), text(" \n ```json\n{}\n```")]),
+        ),
+        (
+            "tilde-fence",
+            content(vec![plain(), text("~~~json\n{}\n~~~")]),
+        ),
+    ];
+    let mut items = Vec::new();
+    for (id, overrides) in cases {
+        let mut call = json!({
+            "id": id, "server": "fixture", "tool": "lookup", "status": "completed",
+            "arguments": {"query": "saved"}, "pluginId": "fixture@local", "readOnlyHint": true,
+            "result": {"content": [plain()]},
+        });
+        for (field, value) in overrides.as_object().expect("fixture overrides") {
+            call[field] = value.clone();
+        }
+        items.push(paginated_completed_item(
+            thread_id,
+            "turn",
+            CoreTurnItem::McpToolCall(serde_json::from_value(call)?),
+        ));
+    }
+    Ok(items)
 }
 
 #[tokio::test]
@@ -2026,6 +2183,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                     thread_id,
                     "turn-1",
                     CoreTurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "first".to_string(),
@@ -2082,6 +2240,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                 content: Vec::new(),
             },
             ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "agent-1".to_string(),
                 text: "first".to_string(),
                 phase: None,
@@ -2286,6 +2445,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                     content: Vec::new(),
                 },
                 ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "agent-1".to_string(),
                     text: "first".to_string(),
                     phase: None,
@@ -2532,6 +2692,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                 output_deferred: false,
                 item: codex_app_server_protocol::ThreadItem {
                     payload: ThreadItemPayload::AgentMessage {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         text: "first".to_string(),
                         phase: None,
@@ -2660,15 +2821,17 @@ async fn thread_items_read_validates_ids_before_history_access() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case("model_not_found", CodexErrorInfo::ModelNotFound, "Access to this deployment ended."; "model_not_found")]
+#[test_case::test_case("inference_hook_denied", CodexErrorInfo::InferenceHookDenied, "Blocked by the workspace hook."; "inference_hook_denied")]
 #[tokio::test]
-async fn thread_read_preserves_model_not_found_after_failed_turn() -> Result<()> {
+async fn thread_read_preserves_provider_error_after_failed_turn(
+    code: &str,
+    expected: CodexErrorInfo,
+    message: &str,
+) -> Result<()> {
     let server = responses::start_mock_server().await;
-    let message = "Access to this deployment ended.";
-    let _response_mock = responses::mount_sse_once(
-        &server,
-        responses::sse_failed("resp-1", "model_not_found", message),
-    )
-    .await;
+    let response_mock =
+        responses::mount_sse_once(&server, responses::sse_failed("resp-1", code, message)).await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
@@ -2700,10 +2863,7 @@ async fn thread_read_preserves_model_not_found_after_failed_turn() -> Result<()>
     let live: ErrorNotification =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("error")).await??;
     assert!(!live.will_retry);
-    assert_eq!(
-        live.error.codex_error_info,
-        Some(CodexErrorInfo::ModelNotFound)
-    );
+    assert_eq!(live.error.codex_error_info, Some(expected));
     assert_eq!(live.error.message, message);
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -2725,6 +2885,7 @@ async fn thread_read_preserves_model_not_found_after_failed_turn() -> Result<()>
         thread.turns.last().and_then(|turn| turn.error.as_ref()),
         Some(&live.error)
     );
+    assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
 }
@@ -2756,6 +2917,7 @@ fn append_agent_message(path: &Path, timestamp: &str, text: &str) -> anyhow::Res
             "timestamp": timestamp,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
+                moderation: None,
                 message: text.to_string(),
                 phase: None,
                 memory_citation: None,

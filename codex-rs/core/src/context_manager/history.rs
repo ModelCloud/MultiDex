@@ -79,7 +79,9 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_payload;
 use codex_utils_output_truncation::with_serialization_allowance;
+use image::ImageReader;
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -103,6 +105,8 @@ fn next_guardian_review_context_revision() -> u64 {
 pub(crate) struct ContextManager {
     item_id_generator: ItemIdGenerator,
     sampling: super::sampling::SamplingProgress,
+    /// Inclusive sequence cutoff for calls that may still be running in the fork source.
+    pub(crate) restored_through_sequence: u64,
     /// The oldest items are at the beginning of the vector. Snapshots share the vector until a
     /// caller needs to mutate it, avoiding deep copies for read-only history consumers.
     items: Arc<Vec<ResponseItemEnvelope>>,
@@ -317,6 +321,7 @@ impl ContextManager {
         Self {
             item_id_generator,
             sampling: Default::default(),
+            restored_through_sequence: 0,
             items: Arc::new(Vec::new()),
             review_history: None,
             review_budgeting: ContextBudgeting::Fixed,
@@ -874,6 +879,9 @@ impl ContextManager {
 
     pub(crate) fn replace_annotated(&mut self, mut items: Vec<ResponseItemEnvelope>) {
         self.sampling = super::sampling::SamplingProgress::restore(&mut items);
+        self.restored_through_sequence = self
+            .restored_through_sequence
+            .min(self.sampling.last_sequence);
         self.retained_context = Arc::default();
         self.user_message_revision = self.user_message_revision.saturating_add(1);
         if let Some(review_history) = &mut self.review_history {
@@ -1172,7 +1180,7 @@ impl ContextManager {
         let items = Arc::make_mut(&mut self.items);
 
         // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(items);
+        normalize::ensure_call_outputs_present(items, self.restored_through_sequence);
 
         // Paired outputs must have a corresponding call; named external outputs stand alone.
         normalize::remove_orphan_outputs(items);
@@ -1507,15 +1515,18 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
                 return None;
             }
         };
-        let dynamic = match image::load_from_memory(&bytes) {
-            Ok(dynamic) => dynamic,
+        let dimensions = image::guess_format(&bytes).and_then(|format| {
+            ImageReader::with_format(Cursor::new(bytes.as_slice()), format).into_dimensions()
+        });
+        let (width, height) = match dimensions {
+            Ok(dimensions) => dimensions,
             Err(error) => {
-                tracing::trace!("failed to decode original-detail image bytes: {error}");
+                tracing::trace!("failed to read original-detail image dimensions: {error}");
                 return None;
             }
         };
-        let width = i64::from(dynamic.width());
-        let height = i64::from(dynamic.height());
+        let width = i64::from(width);
+        let height = i64::from(height);
         let patch_size = i64::from(ORIGINAL_IMAGE_PATCH_SIZE);
         let patches_wide = width.saturating_add(patch_size.saturating_sub(1)) / patch_size;
         let patches_high = height.saturating_add(patch_size.saturating_sub(1)) / patch_size;

@@ -38,6 +38,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
+use crate::chatwidget::ClipboardPasteContext;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::ThreadInputState;
@@ -136,7 +137,6 @@ use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::Turn;
-use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WriteStatus;
 use codex_config::CloudConfigBundleLoader;
@@ -221,6 +221,9 @@ mod backend_events;
 pub(crate) mod backend_selection;
 pub(crate) mod backend_sessions;
 mod background_requests;
+mod cloud_switch_wait;
+#[cfg(test)]
+pub(crate) use cloud_switch_wait::wait_for_cloud_switch;
 mod composer_hints;
 mod config_panel;
 mod config_persistence;
@@ -279,10 +282,13 @@ mod side_companion;
 mod side_focus;
 mod side_pane;
 mod sidebar;
+mod sidebar_close;
+pub(crate) mod sidebar_loading;
 mod startup;
 pub(crate) mod startup_bootstrap;
 mod startup_prompts;
 mod startup_warnings;
+pub(crate) mod thread_attachment;
 mod thread_event_buffer;
 mod thread_events;
 mod thread_goal_actions;
@@ -660,6 +666,7 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     agents_overview: agents_overview::AgentsOverviewState,
     side_threads: HashMap<ThreadId, SideThreadState>,
+    saved_openings: sidebar_loading::Openings,
     sidebars: HashMap<Option<ThreadId>, sidebar::SidebarPane>,
     /// A parked parent view survives child cleanup until its own replay finishes.
     side_companions: HashMap<ThreadId, SideCompanion>,
@@ -794,49 +801,6 @@ impl RuntimePermissionProfileOverride {
     }
 }
 
-fn active_turn_not_steerable_turn_error(error: &TypedRequestError) -> Option<AppServerTurnError> {
-    let TypedRequestError::Server { source, .. } = error else {
-        return None;
-    };
-    let turn_error: AppServerTurnError = serde_json::from_value(source.data.clone()?).ok()?;
-    matches!(
-        turn_error.codex_error_info,
-        Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable { .. })
-    )
-    .then_some(turn_error)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ActiveTurnSteerRace {
-    Missing,
-    ExpectedTurnMismatch { actual_turn_id: String },
-}
-
-fn active_turn_steer_race(error: &TypedRequestError) -> Option<ActiveTurnSteerRace> {
-    let TypedRequestError::Server { method, source } = error else {
-        return None;
-    };
-    if method != "turn/steer" {
-        return None;
-    }
-    if source.message == "no active turn to steer" {
-        return Some(ActiveTurnSteerRace::Missing);
-    }
-
-    // App-server steer mismatches mean our cached active turn id is stale, but the response
-    // includes the server's current active turn so we can resynchronize and retry once.
-    let mismatch_prefix = "expected active turn id `";
-    let mismatch_separator = "` but found `";
-    let actual_turn_id = source
-        .message
-        .strip_prefix(mismatch_prefix)?
-        .split_once(mismatch_separator)?
-        .1
-        .strip_suffix('`')?
-        .to_string();
-    Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id })
-}
-
 fn active_turn_interrupt_race(error: &TypedRequestError) -> Option<String> {
     let TypedRequestError::Server { method, source } = error else {
         return None;
@@ -896,28 +860,47 @@ impl App {
         self.transcript_view
             .sync_patch_approval(self.chat_widget.current_patch_approval());
         // A chooser action must never decide a modal that has not been painted yet.
-        if self.conversation_frame.chooser_area().is_some()
+        if (self.conversation_frame.chooser_area().is_some()
+            || self.sidebar().is_some_and(|pane| pane.close.is_some()))
             && self.chat_widget.has_active_modal()
             && matches!(
                 &event,
                 TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_)
             )
         {
+            if let TuiEvent::Key(key) = &event
+                && key.kind != KeyEventKind::Release
+            {
+                self.chat_widget.suppress_current_view_key_until_release(
+                    KeyBinding::from_event(*key),
+                    Instant::now(),
+                    crate::activation_key_guard::ActivationKeySuppression::ViewTransition,
+                );
+            }
             tui.frame_requester().schedule_frame();
             return Ok(AppRunControl::Continue);
         }
+        let previous = tui.link_hover.position();
         tui.link_hover.observe(&event);
+        let current = tui.link_hover.position();
+        if previous != current
+            && self.hovered_sidebar_target(previous) != self.hovered_sidebar_target(current)
+        {
+            tui.frame_requester().schedule_frame();
+        }
+        if Box::pin(sidebar_close::handle(self, tui, app_server, &event)).await {
+            return Ok(AppRunControl::Continue);
+        }
         if self.handle_pane_resize(tui, &event).await {
             return Ok(AppRunControl::Continue);
         }
         if let TuiEvent::Mouse(mouse) = &event
-            && (self.key_chord_matcher.workspace_leader().is_some()
-                || self.chat_widget.quick_dial_menu_open())
+            && (self.key_chord_matcher.is_pending() || self.chat_widget.quick_dial_menu_open())
             && !matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
-            && self.conversation_frame.hud_contains(*mouse)
+            && tui.shortcut_hud_contains(*mouse)
         {
             if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
                 self.cancel_pending_key_chord();
@@ -1011,6 +994,7 @@ impl App {
         }
         if self.reconnect.offline
             && !transcript_owns_input
+            && self.chooser_focus() != Some(sidebar::PaneFocus::Sidebar)
             && !self.chat_widget.keymap_contexts().is_warnings()
             && !self
                 .chat_widget
@@ -1090,7 +1074,7 @@ impl App {
         {
             return Ok(AppRunControl::Continue);
         }
-        if self.handle_chooser_input(tui, &event) {
+        if Box::pin(self.handle_sidebar_input(tui, app_server, &event)).await {
             return Ok(AppRunControl::Continue);
         }
         if let TuiEvent::Mouse(press) = &event
@@ -1353,7 +1337,9 @@ impl App {
                         self.app_event_tx.send(AppEvent::LaunchExternalEditor);
                     }
                 }
-                TuiEvent::Mouse(mouse) => self.start_right_click_paste(tui, mouse),
+                TuiEvent::Mouse(mouse) => {
+                    self.start_right_click_paste(tui, mouse, ClipboardPasteContext::Composer);
+                }
                 TuiEvent::FocusLost => {}
             }
         }
@@ -1454,6 +1440,7 @@ impl App {
             self.schedule_immediate_resize_reflow(tui);
             self.maybe_run_resize_reflow(tui, screen_size)?;
         }
+        let hud = self.workspace_hud(tui, screen_size.into());
         self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
             let desired_height = if dashboard_visible {
                 screen_size.height
@@ -1461,7 +1448,7 @@ impl App {
                 desired_height
             };
             let mut rendered_area = Rect::default();
-            tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
+            tui.draw_with_resize_reflow(desired_height, screen_size, hud, |frame| {
                 let area = frame.area();
                 rendered_area = area;
                 chat_widget.render(area, frame.buffer);

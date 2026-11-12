@@ -4,6 +4,7 @@ use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
 use super::Thread;
+use super::ThreadEnvironment;
 use super::ThreadHistoryMode;
 use super::ThreadItem;
 use super::ThreadRealtimeItem;
@@ -242,6 +243,12 @@ pub struct ThreadSettingsUpdateParams {
     /// Override the working directory for subsequent turns.
     #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
+    /// Replace the environments for future turns without changing the running turn.
+    /// Omitted/null preserves the selection unless `cwd` is also provided, which selects
+    /// the default environments for that directory. [] clears the selection.
+    #[experimental("thread/settings/update.environments")]
+    #[ts(optional = nullable)]
+    pub environments: Option<Vec<TurnEnvironmentParams>>,
     /// Override the approval policy for subsequent turns.
     #[experimental(nested)]
     #[ts(optional = nullable)]
@@ -311,6 +318,11 @@ pub struct ThreadSettings {
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
+    /// Environments configured for future turns, in priority order, primary first.
+    /// `null` means the server does not expose the selection; [] means none are selected.
+    #[experimental("thread/settings.environments")]
+    #[serde(default)]
+    pub environments: Option<Vec<ThreadEnvironment>>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,
@@ -944,6 +956,8 @@ pub struct QueuedSubmission {
     pub id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// Metadata retained with this input, including across reconnect and restoration.
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -953,6 +967,9 @@ pub struct ThreadQueueAddParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// ResponsesAPI metadata captured from the client submitting this input.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -991,6 +1008,9 @@ pub struct ThreadQueueUpdateParams {
     pub thread_id: String,
     pub queued_submission_id: String,
     pub input: Vec<UserInput>,
+    /// Non-empty metadata replaces the input's metadata; omission or an empty map preserves it.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1432,6 +1452,10 @@ pub struct ThreadSectionDeleteResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadListParams {
+    /// Include persistent threads attached to a parent when searching by title.
+    #[experimental("thread/list.includeAttachedThreads")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_attached_threads: bool,
     /// Show local history visible to the current ChatGPT account. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current_account_only: bool,
@@ -1523,6 +1547,9 @@ pub struct ThreadListParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchParams {
+    /// Include persistent threads attached to a parent in search results.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_attached_threads: bool,
     /// Show local history visible to the current ChatGPT account. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current_account_only: bool,
@@ -1876,6 +1903,10 @@ pub struct ThreadItemOutputDeferral {
     #[experimental("thread/items/list.deferOutput.commandExecution")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub command_execution: bool,
+    /// Defer nonempty plain-text results from successful MCP tool calls.
+    #[experimental("thread/items/list.deferOutput.mcpToolCall")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_tool_call: bool,
 }
 
 /// Starting position for an item-history page.
@@ -1906,7 +1937,7 @@ pub struct ThreadItemEntry {
     /// Turn containing this item.
     pub turn_id: String,
     pub item: ThreadItem,
-    /// The saved command output was omitted. Fetch the complete item with `thread/items/read`.
+    /// The saved output was omitted. Fetch the complete item with `thread/items/read`.
     #[experimental("thread/items/list.outputDeferred")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_deferred: bool,

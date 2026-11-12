@@ -138,6 +138,7 @@ mod tests {
                 sort_direction: SortDirection::Asc,
                 sort_key: ItemSortKey::CreatedAtOrdinal,
                 after_updated_at_ordinal: None,
+                before_updated_at_ordinal: None,
             })
             .await
             .expect_err("default list_items should be unsupported");
@@ -1006,10 +1007,9 @@ impl ThreadStore for InMemoryThreadStore {
                     page.items
                         .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
                 }
-                Some(ThreadRelationFilter::AttachedThreadsOf(_)) => {
-                    return Err(ThreadStoreError::Unsupported {
-                        operation: "attached threads",
-                    });
+                Some(ThreadRelationFilter::AttachedThreadsOf(parent)) => {
+                    page.items
+                        .retain(|thread| thread.attached_to_thread_id == Some(parent));
                 }
                 Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
                     let mut subtree = HashSet::from([ancestor_thread_id]);
@@ -1032,7 +1032,10 @@ impl ThreadStore for InMemoryThreadStore {
                             && subtree.contains(&thread.thread_id)
                     });
                 }
-                None => {}
+                Some(ThreadRelationFilter::IncludeAttached) => {}
+                None => page
+                    .items
+                    .retain(|thread| thread.attached_to_thread_id.is_none()),
             }
             if let Some(section) = params.section.as_ref() {
                 page.items.retain(|thread| {
@@ -1131,6 +1134,7 @@ fn stored_thread_from_state(
             .and_then(|metadata| metadata.rollout_path.clone())
             .or(rollout_path),
         forked_from_id: created.forked_from_id,
+        attached_to_thread_id: created.forked_from_id.filter(|_| created.attached_thread),
         parent_thread_id: created.parent_thread_id,
         preview: metadata
             .and_then(|metadata| metadata.preview.clone())

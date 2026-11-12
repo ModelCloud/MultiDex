@@ -236,6 +236,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "done".to_string(),
@@ -330,6 +331,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "done".to_string(),
@@ -646,6 +648,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                     thread_id,
                     "turn-1",
                     TurnItem::AgentMessage(AgentMessageItem {
+                        moderation: None,
                         id: "agent-1".to_string(),
                         content: vec![AgentMessageContent::Text {
                             text: "Result".to_string(),
@@ -1792,13 +1795,13 @@ async fn summary_items_use_final_answers_and_ignore_nonterminal_messages() {
     )
     .await
     .expect("state runtime");
-    let mut builder = codex_state::ThreadMetadataBuilder::new(
+    let builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
         home.path().join("missing-rollout.jsonl"),
         Utc::now(),
         SessionSource::Cli,
-    );
-    builder.history_mode = ThreadHistoryMode::Paginated;
+    )
+    .with_history_mode(ThreadHistoryMode::Paginated);
     runtime
         .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
         .await
@@ -3183,6 +3186,7 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
 
 fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
     TurnItem::AgentMessage(AgentMessageItem {
+        moderation: None,
         id: id.to_string(),
         content: vec![AgentMessageContent::Text {
             text: id.to_string(),

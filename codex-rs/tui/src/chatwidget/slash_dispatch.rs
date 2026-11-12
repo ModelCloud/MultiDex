@@ -132,6 +132,11 @@ impl ChatWidget {
         self.request_redraw();
         self.app_event_tx.send(AppEvent::StartSide {
             parent_thread_id,
+            mode: if user_message.is_some() {
+                crate::app_event::SideStartMode::New
+            } else {
+                crate::app_event::SideStartMode::Reuse
+            },
             user_message,
         });
     }
@@ -253,17 +258,7 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Feedback => {
-                if !self.config.feedback_enabled {
-                    let params = crate::bottom_pane::feedback_disabled_params();
-                    self.bottom_pane.show_selection_view(params);
-                    self.request_redraw();
-                    return;
-                }
-                // Step 1: pick a category (UI built in feedback_view)
-                let params =
-                    crate::bottom_pane::feedback_selection_params(self.app_event_tx.clone());
-                self.bottom_pane.show_selection_view(params);
-                self.request_redraw();
+                self.app_event_tx.send(AppEvent::OpenFeedback);
             }
             SlashCommand::New => {
                 self.show_session_checkout_picker(ManagedWorktreeMode::New, /*name*/ None);
@@ -305,7 +300,8 @@ impl ChatWidget {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
                     title: Some("Delete this session?".to_string()),
                     subtitle: Some(
-                        "Cannot be undone. Subagent threads will also be deleted.".to_string(),
+                        "Also deletes subagents and saved side chats. Cannot be undone."
+                            .to_string(),
                     ),
                     footer_hint: Some(standard_popup_hint_line()),
                     items: vec![

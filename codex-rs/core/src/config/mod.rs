@@ -94,6 +94,7 @@ use codex_model_provider::ChatgptBaseUrl;
 use codex_model_provider::DEFAULT_CHATGPT_BASE_URL;
 use codex_model_provider::ProviderCapabilities;
 use codex_model_provider_info::GCP_PROVIDER_ID;
+use codex_model_provider_info::GatewayOAuthConfig;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::MULTIDEX_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
@@ -217,6 +218,8 @@ pub use network_config::NetworkConfigInputs;
 pub use network_config::PreparedNetworkConfig;
 pub use network_config::project_environment_profile_network;
 pub use network_config::validate_environment_network_policy;
+#[cfg(test)]
+pub(crate) use network_proxy_spec::McpNetworkRoute;
 pub use network_proxy_spec::NetworkProxySpec;
 pub use network_proxy_spec::StartedNetworkProxy;
 pub use permission_profile_catalog::PermissionProfileCatalogEntry;
@@ -742,11 +745,11 @@ pub struct Config {
     /// Guardian publication observed before startup loading or last policy refresh.
     pub guardian_policy_revision: u64,
 
-    /// Additional Guardian policy from requirements.toml or config.toml.
+    /// Additional Guardian policy supplied by managed requirements or the host.
     /// Rendered into `{{ extra_policy }}` alongside the resolved tenant policy.
     pub guardian_extra_policy: Option<String>,
 
-    /// Guardian prompt template override from config.toml.
+    /// Guardian prompt template supplied by the host.
     /// The resolved policy config replaces its `{{ tenant_policy_config }}`
     /// placeholder when a review session is built.
     pub guardian_policy_template: Option<String>,
@@ -857,6 +860,7 @@ pub struct Config {
 
     /// Own the fullscreen transcript when the alternate screen is enabled.
     pub tui_fullscreen_transcript: bool,
+    pub tui_collapse_turn_details: bool,
 
     /// Preferred docked sidebar width as a percentage of the terminal.
     pub tui_sidebar_width_percent: Option<u8>,
@@ -1626,7 +1630,11 @@ impl ConfigBuilder {
         let cli_overrides = cli_overrides.unwrap_or_default();
         let mut harness_overrides = harness_overrides.unwrap_or_default();
         let loader_overrides = loader_overrides.unwrap_or_default();
-        let cwd_override = harness_overrides.cwd.as_deref().or(fallback_cwd.as_deref());
+        let cwd_override = harness_overrides
+            .cwd
+            .as_deref()
+            .or(fallback_cwd.as_deref())
+            .or(loader_overrides.default_cwd.as_deref());
         let cwd = match cwd_override {
             Some(path) => AbsolutePathBuf::relative_to_current_dir(path)?,
             None => AbsolutePathBuf::current_dir()?,
@@ -1862,6 +1870,14 @@ impl Config {
         };
         let mut factory = HttpClientFactory::new(outbound_proxy_policy)
             .with_network_policy(self.application_network_policy.clone());
+        if self
+            .model_provider
+            .gateway_oauth
+            .as_ref()
+            .is_some_and(GatewayOAuthConfig::uses_credential_export)
+        {
+            factory = factory.with_sensitive_header_protection();
+        }
         if !self.respect_system_proxy && self.features.enabled(Feature::SystemProxyFallback) {
             factory = factory.with_system_proxy_fallback();
         }
@@ -3624,6 +3640,9 @@ impl Config {
         {
             configured_features.enable(Feature::Collab);
         }
+        let runtime_auth_mode = managed_features::resolve_runtime_auth_mode(
+            &cfg, feature_requirements.as_ref(),
+        )?;
         let features = ManagedFeatures::from_configured_with_warnings(
             configured_features,
             feature_requirements,
@@ -4092,15 +4111,6 @@ impl Config {
                 FeatureToml::Config(config) => config.mode,
             })
             .unwrap_or_default();
-        let runtime_auth_mode = cfg
-            .features
-            .as_ref()
-            .and_then(|features| features.runtime_agent_instances.as_ref())
-            .and_then(|feature| match feature {
-                FeatureToml::Enabled(_) => None,
-                FeatureToml::Config(config) => config.mode,
-            })
-            .unwrap_or_default();
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
@@ -4433,14 +4443,6 @@ impl Config {
                 policy.validate().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 Ok::<_, std::io::Error>(policy)
             }).transpose()?;
-        let guardian_policy_template = cfg
-            .auto_review
-            .as_ref()
-            .and_then(|auto_review| {
-                normalize_guardian_policy_config(
-                    auto_review.experimental_policy_template.as_deref(),
-                )
-            });
         let guardian_conversation_history_prompt = cfg.auto_review.as_ref().and_then(|auto_review| {
             normalize_guardian_policy_config(
                 auto_review.experimental_conversation_history_prompt.as_deref(),
@@ -4818,7 +4820,7 @@ impl Config {
             guardian_policy_config,
             guardian_policy_revision: 0,
             guardian_extra_policy,
-            guardian_policy_template,
+            guardian_policy_template: None,
             guardian_transcript_mode,
             guardian_sync_elastic_budget,
             guardian_conversation_history_prompt,
@@ -4944,6 +4946,7 @@ impl Config {
                 .as_ref()
                 .map(|t| t.raw_output_mode)
                 .unwrap_or(false),
+            tui_collapse_turn_details: cfg.tui.as_ref().is_some_and(|tui| tui.collapse_turn_details),
             tui_fullscreen_transcript: cfg
                 .tui
                 .as_ref()
@@ -5419,3 +5422,7 @@ mod tests;
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]
 mod config_loader_tests;
+
+#[cfg(test)]
+#[path = "runtime_auth_tests.rs"]
+mod runtime_auth_tests;

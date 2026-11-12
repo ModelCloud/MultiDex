@@ -533,6 +533,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
         .build_with_auto_env(&server)
         .await?;
     let root_id = test.session_configured.thread_id;
+    let root_tree_id = test.codex.agent_tree_id();
     let manager = &test.thread_manager;
     let options = || StartThreadOptions {
         environments: Some(vec![test.executor_environment().request()]),
@@ -551,6 +552,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
         internal.session_configured.session_id,
         test.session_configured.session_id
     );
+    assert_eq!(internal.thread.agent_tree_id(), root_tree_id);
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let saved = test.codex.load_history(/*include_archived*/ false).await?;
@@ -567,6 +569,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
         fork.session_configured.session_id,
         SessionId::from(fork.thread_id)
     );
+    assert_ne!(fork.thread.agent_tree_id(), root_tree_id);
     let warm = manager
         .start_thread(StartThreadOptions {
             initial_history: history.clone(),
@@ -574,6 +577,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
         })
         .await?;
     assert!(Arc::ptr_eq(&warm.thread, &test.codex));
+    assert_eq!(warm.thread.agent_tree_id(), root_tree_id);
     assert_eq!(
         *calls.lock().expect("factory calls lock"),
         vec![root_id, fork.thread_id]
@@ -587,6 +591,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
         })
         .await?;
     assert!(!Arc::ptr_eq(&cold.thread, &test.codex));
+    assert_ne!(cold.thread.agent_tree_id(), root_tree_id);
     assert_eq!(cold.thread_id, root_id);
     assert_eq!(
         *calls.lock().expect("factory calls lock"),
