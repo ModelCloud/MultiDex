@@ -264,6 +264,91 @@ fn sanitize_plaintext_compaction_for_official_provider(
     }
 }
 
+/// Wafer accepts standard Responses messages and calls, but rejects Codex's
+/// inter-agent message item. Preserve readable communication in the request
+/// without changing the durable conversation history.
+fn sanitize_agent_messages_for_wafer(input: &mut Vec<ResponseItem>) {
+    input.retain_mut(|item| {
+        if let ResponseItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        } = item
+        {
+            let text = codex_protocol::models::plaintext_agent_message_content(content);
+            if let Some(text) = text {
+                *item = ResponseItem::Message {
+                    encrypted_content: None,
+                    status: None,
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: format!("Message from {author} to {recipient}: {text}"),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                true
+            } else {
+                false
+            }
+        } else {
+            !matches!(
+                item,
+                ResponseItem::AdditionalTools { .. } | ResponseItem::ConfigurationUpdate { .. }
+            )
+        }
+    });
+}
+
+#[cfg(test)]
+mod wafer_input_tests {
+    use super::*;
+    use codex_protocol::models::AgentMessageInputContent;
+
+    #[test]
+    fn converts_readable_agent_message_and_drops_unreadable_items() {
+        let mut input = vec![
+            ResponseItem::AgentMessage {
+                id: None,
+                author: "worker".into(),
+                recipient: "brain".into(),
+                content: vec![AgentMessageInputContent::InputText {
+                    text: "Review complete".into(),
+                }],
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::AgentMessage {
+                id: None,
+                author: "worker".into(),
+                recipient: "brain".into(),
+                content: vec![AgentMessageInputContent::EncryptedContent {
+                    encrypted_content: "opaque".into(),
+                }],
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::AdditionalTools {
+                id: None,
+                role: "developer".into(),
+                tools: Arc::from(Vec::<serde_json::Value>::new()),
+            },
+            ResponseItem::ConfigurationUpdate {
+                reasoning: codex_protocol::models::ConfigurationReasoning {
+                    effort: codex_protocol::openai_models::ReasoningEffort::High,
+                },
+            },
+        ];
+        sanitize_agent_messages_for_wafer(&mut input);
+        assert_eq!(input.len(), 1);
+        assert!(
+            matches!(&input[0], ResponseItem::Message { role, content, .. }
+            if role == "user" && matches!(&content[0], ContentItem::InputText { text }
+                if text == "Message from worker to brain: Review complete"))
+        );
+    }
+}
+
 /// Wafer's DeepSeek endpoint rejects literal DeepSeek image control tokens even
 /// when they occur in quoted user text (for example in an old error report).
 /// Keep the transcript unchanged and escape only the outgoing request copy.
@@ -1483,6 +1568,9 @@ impl ModelClient {
             prefix.push(instructions);
         }
         input.splice(0..0, prefix);
+        if self.state.provider.info().is_wafer() {
+            sanitize_agent_messages_for_wafer(&mut input);
+        }
         if !model_info.use_responses_lite {
             // Only RLite accepts per-content attribution until the Responses API schema expands.
             for item in &mut input {

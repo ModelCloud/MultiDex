@@ -881,6 +881,10 @@ other non-default provider fields are not supported"
         self.name == OPENROUTER_PROVIDER_NAME
     }
 
+    pub fn is_wafer(&self) -> bool {
+        self.name == "Wafer"
+    }
+
     pub fn is_lithos(&self) -> bool {
         self.name == "Lithos"
     }
