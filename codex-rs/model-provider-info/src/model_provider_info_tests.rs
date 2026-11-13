@@ -1235,7 +1235,11 @@ fn wafer_provider_is_us_only_and_uses_configured_token() {
     let wafer = merged.get(WAFER_PROVIDER_ID).unwrap();
     assert_eq!(wafer.base_url.as_deref(), Some(WAFER_US_BASE_URL));
     assert_eq!(
-        wafer.experimental_bearer_token.clone().map(|token| token.into_inner()).as_deref(),
+        wafer
+            .experimental_bearer_token
+            .clone()
+            .map(|token| token.into_inner())
+            .as_deref(),
         Some("test-token")
     );
 

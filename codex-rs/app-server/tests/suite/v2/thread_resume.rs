@@ -6981,15 +6981,6 @@ async fn thread_resume_recovers_after_provider_configuration_is_restored() -> Re
         thread_id,
         ..Default::default()
     };
-    if configured {
-        // The saved provider is defined, so the ambient default differing from
-        // it is a provider hand-off and the resume must be admitted on the
-        // saved route instead of failing read-only.
-        let id = client.send_thread_resume_request(params.clone()).await?;
-        let resumed: ThreadResumeResponse = client.read_response(id).await?;
-        assert_eq!(resumed.model_provider, "old_provider");
-        return Ok(());
-    }
     let id = client.send_thread_resume_request(params.clone()).await?;
     let error = client
         .read_stream_until_error_message(RequestId::Integer(id))

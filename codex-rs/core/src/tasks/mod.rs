@@ -284,15 +284,25 @@ impl Session {
         self.start_task(turn_context, input, task).await;
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with task registration"
-    )]
-    pub(crate) async fn start_task<T: SessionTask>(
+    pub(crate) fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
+    ) -> impl std::future::Future<Output = ()> {
+        self.start_task_with_mail_reservation(turn_context, input, task, None)
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "record the started turn atomically with task registration"
+    )]
+    async fn start_task_with_mail_reservation<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mail_reservation: Option<Arc<Mutex<TurnState>>>,
     ) {
         // Replace the cache; in-flight acquisitions retain their previous Arc.
         self.services
@@ -333,21 +343,29 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             if self.outcome_handoffs_closed() {
                 return;
             }
+            if mail_reservation.as_ref().is_some_and(|expected| {
+                active
+                    .as_ref()
+                    .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, expected))
+            }) {
+                return;
+            }
+            let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             turn.finishing = None;
-            Arc::clone(&turn.turn_state)
+            let turn_state = Arc::clone(&turn.turn_state);
+            self.input_queue
+                .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+                .await;
+            turn_state
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
@@ -356,6 +374,21 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        // Cancellable mail may be fenced or interrupted during asynchronous startup.
+        if let Some(expected) = mail_reservation {
+            if active
+                .as_ref()
+                .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &expected))
+            {
+                return;
+            }
+            let mut state = turn_state.lock().await;
+            let cancelled_mail = state.pending_input.discard_cancelled_mail();
+            if cancelled_mail && state.pending_input.is_empty() && input.is_empty() {
+                *active = None;
+                return;
+            }
+        }
         // Shutdown closes registration before taking this same lock to abort active work.
         let outcome_handoff = if let Some(reporting) = &self.outcome_reporting {
             if reporting.handoffs.is_closed() {
@@ -558,6 +591,17 @@ impl Session {
         };
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
+        if input.is_empty() {
+            let mut active = self.active_turn.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, &turn_state))
+            {
+                *active = None;
+            }
+            return;
+        }
+        let cancellable_mail = input.iter().any(|item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.cancellation.is_some()));
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {
@@ -623,8 +667,13 @@ impl Session {
         {
             return;
         }
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        self.start_task_with_mail_reservation(
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+            cancellable_mail.then_some(turn_state),
+        )
+        .await;
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

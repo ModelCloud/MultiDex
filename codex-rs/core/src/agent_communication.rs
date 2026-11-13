@@ -110,6 +110,8 @@ pub struct PendingAgentMessage {
     communication: InterAgentCommunication,
     #[serde(skip)]
     pub(crate) delivery: Option<MessageDelivery>,
+    #[serde(skip)]
+    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl From<InterAgentCommunication> for PendingAgentMessage {
@@ -139,7 +141,14 @@ impl PendingAgentMessage {
         Self {
             communication,
             delivery,
+            cancellation: None,
         }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
     }
 }
 

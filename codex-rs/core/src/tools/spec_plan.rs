@@ -198,6 +198,21 @@ pub(crate) fn build_tool_router(
         registry.remove(&ToolName::namespaced("web", "run"));
     }
     append_dynamic_tool_runtimes(dynamic_tools, &mut registry);
+    if session
+        .services
+        .thread_extension_data
+        .get::<crate::bgr::BgrBinding>()
+        .is_some()
+    {
+        let blocked = registry
+            .entries()
+            .map(|tool| tool.runtime.tool_name())
+            .filter(|tool| crate::bgr::is_delegation_tool(&tool.name))
+            .collect::<Vec<_>>();
+        for name in blocked {
+            let _ = registry.remove(&name);
+        }
+    }
     let hosted_specs = if let Some(mode) = native_mode {
         hosted_model_tool_specs(
             turn_context,

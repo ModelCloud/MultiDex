@@ -958,8 +958,8 @@ async fn configured_provider_models_manager_uses_provider_bearer_token() {
                     provider_info.clone(),
                     auth.clone().map(AuthManager::from_auth_for_testing),
                 );
-                let manager = provider
-                    .models_manager(test_codex_home(), /*config_model_catalog*/ None);
+                let manager =
+                    provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
                 manager.set_api_key_model_discovery_enabled(enabled);
                 let refresh_strategy = if enabled {
                     RefreshStrategy::Online

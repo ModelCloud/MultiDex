@@ -319,6 +319,7 @@
         "wait",
         "closeAgent",
         "sendMessage",
+        "setAgentSettings",
         "followupTask",
         "interruptAgent",
         "listAgents"

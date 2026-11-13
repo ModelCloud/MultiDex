@@ -195,6 +195,7 @@ pub use codex_guardian_reviewer::GuardianAuthorizationVersion;
 pub use codex_guardian_reviewer::GuardianRootSnapshot;
 
 pub struct CodexThread {
+    pub(crate) bgr: Mutex<Option<crate::bgr::BgrRuntime>>,
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
     // Queued agent mail owns a read guard until handled or dropped; eviction needs a write guard.
@@ -233,6 +234,7 @@ impl CodexThread {
         session_source: SessionSource,
     ) -> Self {
         Self {
+            bgr: Mutex::new(None),
             session,
             io,
             residency_gate: Arc::default(),
@@ -246,6 +248,23 @@ impl CodexThread {
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
+    }
+
+    fn ensure_bgr_reviewer_op_allowed(&self, op: &Op) -> CodexResult<()> {
+        if self.is_bgr_reviewer() && !crate::bgr::allows_reviewer_op(op) {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer operation is forbidden".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_bgr_reviewer(&self) -> bool {
+        self.session
+            .services
+            .thread_extension_data
+            .get::<crate::bgr::BgrReviewerIsolation>()
+            .is_some()
     }
 
     /// Returns the source used for registration and agent-reference resolution.
@@ -491,6 +510,7 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        self.ensure_bgr_reviewer_op_allowed(&op)?;
         // Use the same admission guard as MAv2 sends, retaining it through dispatch.
         let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
             self.session
@@ -678,6 +698,7 @@ impl CodexThread {
                 root_turn_id: None,
                 residency_guard: None,
                 message_delivery: None,
+                mail_cancellation: None,
             })
             .await
             .map_err(|_| CodexErr::Fatal("thread session has stopped".to_string()))?;
@@ -717,6 +738,14 @@ impl CodexThread {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        let request = request.into();
+        if self.is_bgr_reviewer()
+            && !crate::bgr::allows_reviewer_settings(&request.request.thread_settings)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer settings are immutable except model routing".into(),
+            ));
+        }
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.ensure_execution_capacity_for_turn_start(
                 self.session.services.agent_control.as_ref(),
@@ -827,12 +856,14 @@ impl CodexThread {
             request: thread_settings,
             turn_extension_init,
         } = thread_settings.into();
+        let op = Op::ThreadSettings {
+            thread_settings,
+            reply: Some(reply),
+        };
+        self.ensure_bgr_reviewer_op_allowed(&op)?;
         self.io
             .submit(WithTurnExtensionData {
-                request: Op::ThreadSettings {
-                    thread_settings,
-                    reply: Some(reply),
-                },
+                request: op,
                 turn_extension_init,
             })
             .await?;
@@ -862,6 +893,11 @@ impl CodexThread {
         &self,
         tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     ) -> CodexResult<()> {
+        if self.is_bgr_reviewer() {
+            return Err(CodexErr::InvalidRequest(
+                "isolated BGR reviewer tool policy is immutable".into(),
+            ));
+        }
         let (reply, result) = oneshot::channel();
         self.io
             .submit(Op::ReplaceDynamicTools { tools, reply })
