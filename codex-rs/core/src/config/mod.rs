@@ -100,10 +100,12 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::OPENROUTER_PROVIDER_ID;
+use codex_model_provider_info::WAFER_PROVIDER_ID;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::is_multidex_model;
 use codex_model_provider_info::is_multidex_provider_id;
 use codex_model_provider_info::is_openrouter_model;
+use codex_model_provider_info::is_wafer_model;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_model_provider_info::{LITHOS_PROVIDER_ID, is_lithos_model};
 use codex_models_manager::ModelsManagerConfig;
@@ -4121,7 +4123,13 @@ impl Config {
         let requested_model_provider_id = required_model_provider.map(str::to_string)
             .or(model_provider)
             .or(cfg.model_provider)
-            .unwrap_or_else(|| "openai".to_string());
+            .unwrap_or_else(|| {
+                if model_providers.contains_key(MULTIDEX_PROVIDER_ID) {
+                    MULTIDEX_PROVIDER_ID.to_string()
+                } else {
+                    codex_model_provider_info::OPENAI_PROVIDER_ID.to_string()
+                }
+            });
         // The MultiDex model must never be sent to the OpenAI/ChatGPT provider. CLI
         // --model and app-server launches both pass through this config load.
         let selected_model = model.as_deref().or(cfg.model.as_deref());
@@ -4149,9 +4157,17 @@ impl Config {
                 ));
             }
             OPENROUTER_PROVIDER_ID.to_string()
+        } else if selected_model.is_some_and(is_wafer_model) {
+            if required_model_provider.is_some_and(|provider| provider != WAFER_PROVIDER_ID) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the Wafer model requires the wafer provider, but a different provider is required by managed configuration",
+                ));
+            }
+            WAFER_PROVIDER_ID.to_string()
         } else if selected_model.is_some()
             && (is_multidex_provider_id(&requested_model_provider_id)
-                || (matches!(requested_model_provider_id.as_str(), OPENROUTER_PROVIDER_ID | LITHOS_PROVIDER_ID)
+                || (matches!(requested_model_provider_id.as_str(), OPENROUTER_PROVIDER_ID | LITHOS_PROVIDER_ID | WAFER_PROVIDER_ID)
                     && selected_model.is_some_and(
                         codex_models_manager::model_info::is_bundled_openai_model,
                     )))

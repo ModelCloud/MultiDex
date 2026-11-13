@@ -1222,6 +1222,39 @@ allow_fallbacks = false
 }
 
 #[test]
+fn wafer_provider_is_us_only_and_uses_configured_token() {
+    let configured: ModelProviderInfo = toml::from_str(
+        "base_url = \"https://us.pass.wafer.ai/v1\"\nexperimental_bearer_token = \"test-token\"",
+    )
+    .unwrap();
+    let merged = merge_configured_model_providers(
+        built_in_model_providers(None),
+        HashMap::from([(WAFER_PROVIDER_ID.to_string(), configured)]),
+    )
+    .unwrap();
+    let wafer = merged.get(WAFER_PROVIDER_ID).unwrap();
+    assert_eq!(wafer.base_url.as_deref(), Some(WAFER_US_BASE_URL));
+    assert_eq!(
+        wafer
+            .experimental_bearer_token
+            .clone()
+            .map(|token| token.into_inner())
+            .as_deref(),
+        Some("test-token")
+    );
+
+    let wrong_region: ModelProviderInfo =
+        toml::from_str("base_url = \"https://pass.wafer.ai/v1\"").unwrap();
+    assert!(
+        merge_configured_model_providers(
+            built_in_model_providers(None),
+            HashMap::from([(WAFER_PROVIDER_ID.to_string(), wrong_region)]),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn test_openrouter_override_rejects_unsupported_fields() {
     let configured: ModelProviderInfo = toml::from_str(
         r#"

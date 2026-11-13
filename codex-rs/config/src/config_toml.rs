@@ -42,7 +42,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
-use codex_model_provider_info::{LITHOS_PROVIDER_ID, OPENROUTER_PROVIDER_ID};
+use codex_model_provider_info::{LITHOS_PROVIDER_ID, OPENROUTER_PROVIDER_ID, WAFER_PROVIDER_ID};
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
@@ -66,13 +66,14 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 8] = [
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 9] = [
     AMAZON_BEDROCK_PROVIDER_ID,
     AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
     GCP_PROVIDER_ID,
     OPENAI_PROVIDER_ID,
     OPENROUTER_PROVIDER_ID,
     LITHOS_PROVIDER_ID,
+    WAFER_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
@@ -973,6 +974,7 @@ pub fn validate_reserved_model_provider_ids(
                     | GCP_PROVIDER_ID
                     | OPENROUTER_PROVIDER_ID
                     | LITHOS_PROVIDER_ID
+                    | WAFER_PROVIDER_ID
             ) && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
         })
         .map(|key| format!("`{key}`"))
@@ -1014,6 +1016,7 @@ pub fn validate_model_providers(
                 | GCP_PROVIDER_ID
                 | OPENROUTER_PROVIDER_ID
                 | LITHOS_PROVIDER_ID
+                | WAFER_PROVIDER_ID
         ) && key != "openai"
             && provider.name.trim().is_empty()
         {
@@ -1197,6 +1200,34 @@ command = "print-token"
                 provider.auth.as_ref().map(|auth| auth.command.as_str()),
             ),
             (Some("https://vertex.example.com/v1"), Some("print-token"))
+        );
+    }
+
+    #[test]
+    fn wafer_provider_accepts_built_in_endpoint_and_token_overrides() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[model_providers.wafer]
+base_url = "https://us.pass.wafer.ai/v1"
+experimental_bearer_token = "test-token"
+"#,
+        )
+        .expect("Wafer built-in overrides should deserialize without a custom name");
+
+        let provider = config
+            .model_providers
+            .get(WAFER_PROVIDER_ID)
+            .expect("Wafer provider should be present");
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://us.pass.wafer.ai/v1")
+        );
+        assert_eq!(
+            provider
+                .experimental_bearer_token
+                .as_deref()
+                .map(String::as_str),
+            Some("test-token")
         );
     }
 
