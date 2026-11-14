@@ -215,6 +215,17 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, Vec<CatalogModel>>;
 
+    /// The selected endpoint's catalog before shared picker overlays are applied.
+    /// Callers can use this to distinguish an advertised model from an overlay
+    /// with the same slug without discarding the overlay's tuned metadata.
+    fn provider_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        self.model_catalog_with_origins(refresh_strategy, http_client_factory)
+    }
+
     /// Best-effort refresh when the in-memory catalog belongs to different credentials.
     /// Static catalogs need no refresh. Failures follow the catalog's fallback policy.
     fn refresh_after_auth_change(
@@ -359,6 +370,15 @@ impl ModelsManagerOverlay {
 }
 
 impl ModelsManager for ModelsManagerOverlay {
+    fn provider_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        self.inner
+            .provider_catalog_with_origins(refresh_strategy, http_client_factory)
+    }
+
     fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
         self.inner.for_originator(originator).map(|inner| {
             Arc::new(Self::new(

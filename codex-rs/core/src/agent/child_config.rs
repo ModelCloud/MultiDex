@@ -10,6 +10,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_features::Feature;
+use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -303,13 +304,8 @@ async fn apply_requested_spawn_agent_model_overrides(
     };
 
     if let Some(requested_model) = requested_model {
-        let available_models = models_manager
-            .list_models(refresh_strategy, config.http_client_factory())
-            .await;
-        let available_models = available_models
-            .into_iter()
-            .filter(|model| model_available_from_provider(&model.model, &config.model_provider_id))
-            .collect::<Vec<_>>();
+        let available_models =
+            provider_spawn_models(models_manager, config, refresh_strategy).await;
         let selected_model_name = find_spawn_agent_model_name(
             &available_models,
             requested_model,
@@ -336,20 +332,17 @@ async fn apply_requested_spawn_agent_model_overrides(
 
     // Provider changed without an explicit model: pick the new provider's default catalog entry.
     if cross_provider && requested_model.is_none() {
-        let available_models = models_manager
-            .list_models(refresh_strategy, config.http_client_factory())
-            .await;
+        let available_models =
+            provider_spawn_models(models_manager, config, refresh_strategy).await;
         let selected_model = available_models
             .iter()
             .find(|model| {
                 model.is_default
-                    && model_available_from_provider(&model.model, &config.model_provider_id)
                     && model_supports_multi_agent_backend(model, turn.multi_agent_version)
             })
             .or_else(|| {
                 available_models.iter().find(|model| {
                     model.show_in_picker
-                        && model_available_from_provider(&model.model, &config.model_provider_id)
                         && model_supports_multi_agent_backend(model, turn.multi_agent_version)
                 })
             })
@@ -587,7 +580,55 @@ fn last_model_word(name: &str) -> Option<&str> {
 
 /// Shared picker catalogs can include models for other endpoints. A child's
 /// chosen provider must actually serve the matched model before it is spawned.
-pub(crate) fn model_available_from_provider(model: &str, provider: &str) -> bool {
+/// Use the selected provider's catalog provenance before building spawn choices. Bundled
+/// entries are shared picker overlays; endpoint and explicit entries belong to this manager
+/// even when their slugs are unknown to the bundled provider list.
+pub(crate) async fn provider_spawn_models(
+    manager: &dyn ModelsManager,
+    config: &Config,
+    refresh_strategy: RefreshStrategy,
+) -> Vec<ModelPreset> {
+    let advertised = manager
+        .provider_catalog_with_origins(refresh_strategy, config.http_client_factory())
+        .await
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.origin,
+                ModelOrigin::Provider | ModelOrigin::ExplicitConfig
+            )
+        })
+        .map(|entry| entry.model.slug.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let models = manager
+        .model_catalog_with_origins(RefreshStrategy::InMemory, config.http_client_factory())
+        .await
+        .into_iter()
+        .filter(|entry| {
+            model_available_from_provider(
+                &entry.model.slug,
+                &config.model_provider_id,
+                entry.origin,
+                advertised.contains(&entry.model.slug),
+            )
+        })
+        .map(|entry| std::sync::Arc::unwrap_or_clone(entry.model))
+        .collect();
+    manager.build_available_models(models)
+}
+
+pub(crate) fn model_available_from_provider(
+    model: &str,
+    provider: &str,
+    origin: ModelOrigin,
+    advertised: bool,
+) -> bool {
+    if origin == ModelOrigin::Synthetic {
+        return false;
+    }
+    if origin == ModelOrigin::Provider || advertised {
+        return true;
+    }
     use codex_model_provider_info as info;
     if info::is_multidex_model(model) {
         info::is_multidex_provider_id(provider)
@@ -598,13 +639,9 @@ pub(crate) fn model_available_from_provider(model: &str, provider: &str) -> bool
     } else if info::is_wafer_model(model) {
         provider == info::WAFER_PROVIDER_ID
     } else {
-        // Other IDs may be discovered on OpenAI or a custom provider. Endpoint
-        // providers only serve their own registered model IDs.
-        !info::is_multidex_provider_id(provider)
-            && !matches!(
-                provider,
-                info::OPENROUTER_PROVIDER_ID | info::LITHOS_PROVIDER_ID | info::WAFER_PROVIDER_ID
-            )
+        // Remaining bundled IDs belong to OpenAI. A custom endpoint serving one
+        // of these must advertise it; its shared picker entry is not authority.
+        provider == info::OPENAI_PROVIDER_ID
     }
 }
 
@@ -656,6 +693,66 @@ fn validate_spawn_agent_reasoning_effort(
 #[cfg(test)]
 mod model_alias_tests {
     use super::*;
+
+    #[test]
+    fn selected_provider_catalog_accepts_discovered_and_configured_models() {
+        for origin in [ModelOrigin::Provider, ModelOrigin::ExplicitConfig] {
+            assert!(model_available_from_provider(
+                "provider-only-spawn-model",
+                "multidex",
+                origin,
+                true,
+            ));
+            assert!(model_available_from_provider(
+                "vendor/new-frontier",
+                "openrouter",
+                origin,
+                true,
+            ));
+            assert!(model_available_from_provider(
+                codex_model_provider_info::MULTIDEX_MODEL_ID,
+                "custom",
+                origin,
+                true,
+            ));
+        }
+        assert!(!model_available_from_provider(
+            codex_model_provider_info::MULTIDEX_MODEL_ID,
+            "openrouter",
+            ModelOrigin::ExplicitConfig,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "gpt-6-astra",
+            "multidex",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "gpt-6-astra",
+            "custom",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "vendor/overlay-only",
+            "custom",
+            ModelOrigin::ExplicitConfig,
+            false,
+        ));
+        assert!(model_available_from_provider(
+            "gpt-6-astra",
+            "openai",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "provider-only-spawn-model",
+            "multidex",
+            ModelOrigin::Synthetic,
+            false,
+        ));
+    }
 
     #[test]
     fn short_names_come_from_the_selected_provider_catalog() {

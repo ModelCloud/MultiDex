@@ -224,22 +224,7 @@ pub(crate) async fn prepare(
         let instructions = config
             .developer_instructions
             .get_or_insert_with(String::new);
-        instructions.push_str(
-            "\n\nYou are an independent reviewer. Use only this clean checkout and the review task, not the parent's conversation or working tree. Review the committed changes, then return your findings to the parent with file paths and line numbers. If no issues are found, say so plainly.",
-        );
-        if let Some(repository) = review_repository.as_deref() {
-            let slug = crate::agent::reviewer_workspace::github_repository_slug(repository)
-                .map_err(ThreadSpawnError::Preparation)?;
-            if let Some(number) = review_pull_request {
-                instructions.push_str(&format!(
-                    "\nThis review targets https://github.com/{slug}/pull/{number}. Compare its checked-out head with the PR base. After finishing, post the same review as one PR discussion comment with `gh pr comment {number} --repo {slug} --body-file <review-file>`. Check whether a prior comment from this review exists before posting, and include the comment URL in your final response to the parent."
-                ));
-            } else if let Some(branch) = review_ref.as_deref() {
-                instructions.push_str(&format!(
-                    "\nThis review targets branch `{branch}` in `{slug}`. Compare it with the repository's default branch. Report findings only to the parent; there is no PR discussion to post."
-                ));
-            }
-        }
+        instructions.push_str(&checkout.instructions);
     }
     let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.thread_id,

@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::agent::child_config::edit_distance;
-use crate::agent::child_config::model_available_from_provider;
 use crate::agent::child_config::model_supports_multi_agent_backend;
 use crate::agent::child_config::normalized_model_name;
+use crate::agent::child_config::provider_spawn_models;
 use crate::agent::child_config::ranked_spawn_model_matches;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::handlers::multi_agents_spec::create_resolve_model_tool;
@@ -75,23 +75,27 @@ impl ToolExecutor<ToolInvocation> for Handler {
                 provider_config.model_provider = provider_info.clone();
                 provider_config.model_provider_id = provider_id.clone();
                 let models = if provider_id == config.model_provider_id {
-                    turn.available_models.clone()
+                    provider_spawn_models(
+                        invocation.session.services.models_manager.as_ref(),
+                        &provider_config,
+                        RefreshStrategy::Offline,
+                    )
+                    .await
                 } else {
                     let manager = crate::thread_manager::build_models_manager(
                         &provider_config,
                         std::sync::Arc::clone(&invocation.session.services.auth_manager),
                         /*runtime*/ None,
                     );
-                    manager
-                        .list_models(
-                            RefreshStrategy::Offline,
-                            provider_config.http_client_factory(),
-                        )
-                        .await
+                    provider_spawn_models(
+                        manager.as_ref(),
+                        &provider_config,
+                        RefreshStrategy::OnlineIfUncached,
+                    )
+                    .await
                 };
                 for model in models {
                     if model_supports_multi_agent_backend(&model, turn.multi_agent_version)
-                        && model_available_from_provider(&model.model, &provider_id)
                         && !available.iter().any(|choice| {
                             choice.provider == provider_id && choice.model.model == model.model
                         })
@@ -303,7 +307,18 @@ mod tests {
 
     #[test]
     fn openai_models_are_not_claimed_by_the_local_provider() {
-        assert!(!model_available_from_provider("gpt-6-astra", "multidex"));
-        assert!(model_available_from_provider("gpt-6-astra", "openai"));
+        use codex_protocol::openai_models::ModelOrigin;
+        assert!(!crate::agent::child_config::model_available_from_provider(
+            "gpt-6-astra",
+            "multidex",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(crate::agent::child_config::model_available_from_provider(
+            "gpt-6-astra",
+            "openai",
+            ModelOrigin::Bundled,
+            false,
+        ));
     }
 }

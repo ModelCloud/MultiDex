@@ -28,6 +28,7 @@ use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+use crate::tools::handlers::multi_agents_v2::ResolveModelHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
@@ -4957,6 +4958,77 @@ async fn multi_agent_v2_override_regression_spawn_prepares_uncached_provider_mod
     assert_eq!(
         model.model.description.as_deref(),
         Some("Model supplied by the test provider catalog")
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn resolve_model_handler_discovers_uncached_provider_model() {
+    let server = MockServer::start().await;
+    mount_override_catalog(
+        &server,
+        ModelsResponse {
+            models: vec![
+                override_catalog_model("provider-only-spawn-model", None),
+                override_catalog_model(codex_model_provider_info::MULTIDEX_MODEL_ID, None),
+            ],
+        },
+    )
+    .await;
+    let (session, mut turn) = make_session_and_context().await;
+    let home = tempfile::tempdir().expect("unique codex home");
+    let provider_id = "multi-agent-override-provider";
+    let mut config = turn.config.as_ref().clone();
+    set_unique_codex_home(&mut config, &home);
+    config.model_catalog = None;
+    configure_override_provider(&mut config, provider_id, Some(&server.uri()));
+    config
+        .features
+        .enable(Feature::ApiKeyModelDiscovery)
+        .unwrap();
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let output = ResolveModelHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "resolve_model",
+            function_payload(json!({
+                "provider": provider_id,
+                "query": "Override catalog provider-only-spawn-model",
+            })),
+        ))
+        .await
+        .expect("resolve_model should fetch an uncached provider catalog");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(result["status"], "match");
+    assert_eq!(result["choices"][0]["provider"], provider_id);
+    assert_eq!(result["choices"][0]["model"], "provider-only-spawn-model");
+    let output = ResolveModelHandler
+        .handle(invocation(
+            session,
+            turn,
+            "resolve_model",
+            function_payload(json!({
+                "provider": provider_id,
+                "query": codex_model_provider_info::MULTIDEX_MODEL_ID,
+            })),
+        ))
+        .await
+        .expect("a custom provider may advertise a known bundled model slug");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(result["status"], "match");
+    assert_eq!(
+        result["choices"][0]["model"],
+        codex_model_provider_info::MULTIDEX_MODEL_ID
     );
     assert_eq!(
         server.received_requests().await.unwrap_or_default().len(),

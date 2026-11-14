@@ -286,7 +286,8 @@ impl LocalAgentControl {
         let mut environment_selections = evicted_environments
             .as_ref()
             .map(|environments| environments.selections.clone());
-        let evicted_environments = evicted_environments.map(|environments| environments.bindings);
+        let mut evicted_environments =
+            evicted_environments.map(|environments| environments.bindings);
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -300,6 +301,7 @@ impl LocalAgentControl {
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
+        let stored_cwd = stored_thread.cwd.clone();
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
             .await?
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
@@ -315,6 +317,7 @@ impl LocalAgentControl {
         let (session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
+        let is_reviewer = session_source.get_agent_role().as_deref() == Some("reviewer");
         if let Some(parent_thread_id) = owner_thread_id {
             if session_source.parent_thread_id() != Some(parent_thread_id)
                 || initial_history
@@ -400,14 +403,41 @@ impl LocalAgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
+        if is_reviewer {
+            let checkout =
+                crate::agent::reviewer_workspace::restore_checkout(&stored_cwd, &config.codex_home)
+                    .await
+                    .map_err(|reason| {
+                        CodexErr::InvalidRequest(format!(
+                            "cannot resume reviewer {thread_id}: {reason}"
+                        ))
+                    })?;
+            config.cwd = checkout.cwd;
+            config.workspace_roots = vec![checkout.root.clone()];
+            config.workspace_roots_explicit = true;
+            config.permissions.set_workspace_roots(vec![checkout.root]);
+            config
+                .developer_instructions
+                .get_or_insert_with(String::new)
+                .push_str(&checkout.instructions);
+            // A reviewer has no authority from the parent's workspace, even after
+            // an eviction snapshot is lost during a cold parent resume.
+            environment_selections = None;
+            evicted_environments = None;
+        }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
             .or(stored_parent_thread_id);
-        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if let Some(
-            (parent, parent_environments),
-        ) =
-            parent.as_ref()
+        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if is_reviewer
         {
+            (
+                None,
+                None,
+                parent
+                    .as_ref()
+                    .map(|(parent, _)| parent.client_mcp_extensions()),
+            )
+        } else if let Some((parent, parent_environments)) = parent.as_ref() {
             let parent_config = parent.session.get_config().await;
             if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, &config) {
                 return Err(CodexErr::InvalidRequest(format!(

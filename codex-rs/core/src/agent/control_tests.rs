@@ -1692,6 +1692,142 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     assert_thread_not_loaded(&resumed_manager, sibling_thread_id).await;
 }
 
+#[tokio::test]
+async fn cold_resume_reviewer_keeps_its_own_checkout_and_roots() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    let parent_repo = home.path().join("parent-repo");
+    let review_repo = home.path().join("review-repo");
+    for (repo, contents) in [(&parent_repo, "parent"), (&review_repo, "review")] {
+        std::fs::create_dir_all(repo).unwrap();
+        std::fs::write(repo.join("file.txt"), contents).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "file.txt"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    config.cwd =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&parent_repo).unwrap();
+    config.workspace_roots = vec![config.cwd.clone()];
+    config
+        .permissions
+        .set_workspace_roots(config.workspace_roots.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    let review_cwd =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&review_repo).unwrap();
+    let checkout = crate::agent::reviewer_workspace::create_clean_checkout(
+        &review_cwd,
+        &harness.config.codex_home,
+    )
+    .await
+    .unwrap();
+    let mut reviewer_config = harness.config.clone();
+    reviewer_config.cwd = checkout.cwd.clone();
+    reviewer_config.workspace_roots = vec![checkout.root.clone()];
+    reviewer_config.workspace_roots_explicit = true;
+    reviewer_config
+        .permissions
+        .set_workspace_roots(vec![checkout.root.clone()]);
+    reviewer_config.developer_instructions = Some(checkout.instructions.clone());
+    let child = harness
+        .control
+        .spawn_agent_with_metadata(
+            reviewer_config,
+            text_input("review the other repository"),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent_id,
+                depth: 1,
+                agent_path: Some(AgentPath::root().join("reviewer").unwrap()),
+                agent_nickname: None,
+                agent_role: Some("reviewer".into()),
+            }),
+            SpawnAgentOptions {
+                fresh_environments: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let child_thread = harness.manager.get_thread(child.thread_id).await.unwrap();
+    persist_thread_for_tree_resume(&parent, "parent persisted").await;
+    persist_thread_for_tree_resume(&child_thread, "reviewer persisted").await;
+    wait_for_live_thread_spawn_children(&harness.control, parent_id, &[child.thread_id]).await;
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.submit_failed.is_empty());
+    assert!(report.timed_out.is_empty());
+
+    let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        harness.config.model_provider.clone(),
+        harness.config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        harness.state_db.clone(),
+    );
+    let resumed_control = resumed_manager.agent_control();
+    resumed_control
+        .resume_agent_from_rollout(harness.config.clone(), parent_id, SessionSource::Exec)
+        .await
+        .expect("parent should resume cold");
+    resumed_control
+        .restore_v2_agent_metadata(&harness.config, parent_id)
+        .await;
+    resumed_manager
+        .ensure_multi_agent_v2_child_loaded(child.thread_id)
+        .await
+        .expect("reviewer should wake from its persisted checkout");
+    let reloaded = resumed_manager.get_thread(child.thread_id).await.unwrap();
+    let config = reloaded.session.get_config().await;
+    assert_eq!(config.cwd, checkout.cwd);
+    assert_eq!(config.workspace_roots, vec![checkout.root.clone()]);
+    assert_eq!(
+        config.permissions.workspace_roots(),
+        &[checkout.root.clone()]
+    );
+    assert_ne!(config.cwd, harness.config.cwd);
+    assert!(
+        config
+            .developer_instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains("independent reviewer"))
+    );
+    let turn = reloaded.session.new_default_turn().await;
+    assert_eq!(turn.config.cwd, checkout.cwd);
+    assert_eq!(turn.config.workspace_roots, vec![checkout.root]);
+    let primary = turn
+        .initial_environments
+        .primary()
+        .expect("reviewer environment");
+    assert_eq!(primary.selection.cwd, PathUri::from_abs_path(&checkout.cwd));
+    assert_eq!(
+        primary.selection.workspace_roots,
+        vec![PathUri::from_abs_path(&turn.config.workspace_roots[0])]
+    );
+}
+
 struct TestThreadInstructionsProvider {
     text: RwLock<&'static str>,
     shared: bool,
@@ -1767,7 +1903,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
 
     let target_thread_id = if nested {
         let grandchild_id =
-            spawn_v2_reload_test_child(control, harness.config.clone(), &worker, "reviewer")
+            spawn_v2_reload_test_child(control, harness.config.clone(), &worker, "worker")
                 .await
                 .thread_id;
         let grandchild = harness
