@@ -530,6 +530,51 @@ async fn native_openai_catalog_prefers_high_for_new_and_cached_models() {
 }
 
 #[tokio::test]
+async fn shared_picker_prefers_high_for_bundled_openai_but_not_custom_provider_models() {
+    let mut custom = remote_model("provider-model", "Provider", 0);
+    custom
+        .supported_reasoning_levels
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "High".to_string(),
+        });
+    let endpoint = TestModelsEndpoint::new(vec![vec![custom]]);
+    let manager = OpenAiModelsManager::new_without_cache(
+        endpoint,
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+
+    let bundled = manager
+        .list_models(RefreshStrategy::InMemory, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert_eq!(
+        bundled
+            .iter()
+            .find(|model| model.model == "gpt-6-astra")
+            .unwrap()
+            .default_reasoning_effort,
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        manager
+            .get_model_info("gpt-6-astra", &ModelsManagerConfig::default())
+            .await
+            .model
+            .default_reasoning_level,
+        Some(ReasoningEffort::High)
+    );
+    let provider_catalog = manager
+        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert_eq!(
+        provider_catalog.models[0].default_reasoning_level,
+        Some(ReasoningEffort::Medium)
+    );
+}
+
+#[tokio::test]
 async fn explicit_provider_catalog_keeps_its_own_effort_default() {
     let mut model = remote_model("provider-model", "Provider", 0);
     model
@@ -1127,10 +1172,7 @@ async fn endpoint_overlay_preserves_remote_refresh_defaults_and_prompt_metadata(
     let info = manager
         .get_model_info(slug, &ModelsManagerConfig::default())
         .await;
-    assert_eq!(
-        info.default_reasoning_level,
-        Some(ReasoningEffort::High)
-    );
+    assert_eq!(info.default_reasoning_level, Some(ReasoningEffort::High));
     assert_eq!(
         info.model_messages
             .as_ref()
