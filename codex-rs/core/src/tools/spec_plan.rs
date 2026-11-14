@@ -1535,7 +1535,10 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                             // available even when no user-defined roles are configured.
                             expose_agent_type: expose_model_overrides
                                 || !turn_context.config.agent_roles.is_empty(),
-                            hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
+                            // Hidden spawn receipts must not hide provider/model controls
+                            // on endpoints that accept our extended tool schema.
+                            hide_agent_type_model_reasoning: hide_spawn_agent_metadata
+                                && !expose_model_overrides,
                             expose_spawn_agent_model_overrides: expose_model_overrides,
                             usage_hint_text: turn_context
                                 .config
