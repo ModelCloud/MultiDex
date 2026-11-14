@@ -220,12 +220,20 @@ impl SpawnAgentArgs {
             ));
         }
 
+        let is_reviewer = self.agent_type.as_deref() == Some("reviewer");
         let fork_turns = self
             .fork_turns
             .as_deref()
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty())
-            .unwrap_or("all");
+            .unwrap_or(if is_reviewer { "none" } else { "all" });
+
+        if is_reviewer && !fork_turns.eq_ignore_ascii_case("none") {
+            return Err(FunctionCallError::RespondToModel(
+                "reviewer agents require fork_turns=`none` to keep every review independent"
+                    .to_string(),
+            ));
+        }
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -238,6 +246,43 @@ impl SpawnAgentArgs {
         Err(FunctionCallError::RespondToModel(
             "fork_turns must be `none` or `all`".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn args(agent_type: Option<&str>, fork_turns: Option<&str>) -> SpawnAgentArgs {
+        SpawnAgentArgs {
+            message: "Review the changed files".to_string(),
+            task_name: "review".to_string(),
+            agent_type: agent_type.map(str::to_string),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            fork_turns: fork_turns.map(str::to_string),
+            fork_context: None,
+        }
+    }
+
+    #[test]
+    fn reviewers_always_start_without_parent_history() {
+        assert!(args(Some("reviewer"), None).fork_mode().unwrap().is_none());
+        assert!(
+            args(Some("reviewer"), Some("none"))
+                .fork_mode()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            args(Some("reviewer"), Some("all")).fork_mode(),
+            Err(FunctionCallError::RespondToModel(
+                "reviewer agents require fork_turns=`none` to keep every review independent"
+                    .to_string(),
+            ))
+        );
+        assert!(args(None, None).fork_mode().unwrap().is_some());
     }
 }
 

@@ -4925,7 +4925,9 @@ async fn multi_agent_v2_override_regression_spawn_prepares_uncached_provider_mod
             full_history_fork: false,
             role_name: None,
             provider: Some(provider_id),
-            model: Some(model_slug),
+            // A display name from live provider discovery must resolve to its
+            // wire ID without a model-specific alias in MultiDex.
+            model: Some("Override catalog provider-only-spawn-model"),
             reasoning_effort: None,
         },
     )

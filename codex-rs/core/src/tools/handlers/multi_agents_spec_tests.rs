@@ -39,6 +39,7 @@ fn spawn_agent_tool_v2_requires_task_name() {
     assert!(description.contains("The spawned agent will have the same tools as you"));
     assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains("resolve_model"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
     assert_eq!(
@@ -71,6 +72,17 @@ fn spawn_agent_tool_v2_requires_task_name() {
         output_schema.expect("spawn_agent output schema").to_value()["required"],
         json!(["task_name", "nickname"])
     );
+}
+
+#[test]
+fn resolver_tool_accepts_a_user_model_name_and_optional_provider() {
+    let ToolSpec::Function(tool) = create_resolve_model_tool() else {
+        panic!("resolve_model should be a function tool");
+    };
+    assert_eq!(tool.name, "resolve_model");
+    let properties = tool.parameters.properties.expect("resolver parameters");
+    assert!(properties.contains_key("query"));
+    assert!(properties.contains_key("provider"));
 }
 
 #[test]

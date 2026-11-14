@@ -46,6 +46,7 @@ use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+use crate::tools::handlers::multi_agents_v2::ResolveModelHandler as ResolveModelHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SetAgentSettingsHandler as SetAgentSettingsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
@@ -1530,7 +1531,10 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                                 .features
                                 .enabled(Feature::ModelCatalogInContext),
                             agent_type_description,
-                            expose_agent_type: !turn_context.config.agent_roles.is_empty(),
+                            // Built-in roles (including the clean-context reviewer) are
+                            // available even when no user-defined roles are configured.
+                            expose_agent_type: expose_model_overrides
+                                || !turn_context.config.agent_roles.is_empty(),
                             hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
                             expose_spawn_agent_model_overrides: expose_model_overrides,
                             usage_hint_text: turn_context
@@ -1573,6 +1577,16 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 );
             }
             if expose_model_overrides {
+                registry.register_trusted_with_native_review(
+                    multi_agent_v2_handler(
+                        ResolveModelHandlerV2,
+                        tool_namespace,
+                        /*description_override*/ None,
+                        /*parameters_override*/ None,
+                    ),
+                    exposure,
+                    native_review,
+                );
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
                         SetAgentSettingsHandlerV2,

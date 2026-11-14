@@ -16,11 +16,9 @@ const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and manag
 
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE_V2: &str = "Spawned agents inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model.";
-const SPAWN_AGENT_MODEL_CATALOG_GUIDANCE: &str =
-    "Pick model overrides from the latest <model_catalog> listing.";
+const SPAWN_AGENT_MODEL_CATALOG_GUIDANCE: &str = "Use resolve_model to find a registered provider/model when the user's model name is abbreviated, misspelled, or absent from the short catalog listing. Pass its returned provider and model to spawn_agent; ask for clarification if it reports ambiguity.";
 const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.";
-const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
-    "Model override for the new agent. Omit unless an explicit override is needed.";
+const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Model override for the new agent. Omit unless requested. Accepts a registered model ID, display name, or unique short name; resolve_model can disambiguate approximate names.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -161,6 +159,24 @@ pub fn create_spawn_agent_tool_v2(
         output_schema: Some(
             spawn_agent_output_schema_v2(options.hide_agent_type_model_reasoning).into(),
         ),
+    })
+}
+
+pub fn create_resolve_model_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "resolve_model".to_string(),
+        description: "Look up every registered provider's current model catalog for a sub-agent. Resolve a user-supplied model name (including common spelling or punctuation errors) to an exact provider and model ID. Returns choices when the name is ambiguous; omit query to list available models. Call before spawn_agent when a model is requested by an approximate name.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::from([
+                ("query".to_string(), JsonSchema::string(Some("User's model name or ID; omit to browse registered models.".to_string()))),
+                ("provider".to_string(), JsonSchema::string(Some("Optional provider ID to restrict the lookup.".to_string()))),
+            ]),
+            None,
+            Some(false.into()),
+        ),
+        output_schema: None,
     })
 }
 
@@ -714,13 +730,13 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(format!(
-                "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
+                "Agent type override for the new agent. When the user asks for a review agent, use `reviewer`; it starts without parent conversation history in its own clean Git clone at the committed HEAD. Uncommitted parent edits are absent.\n{agent_type_description}"
             ))),
         ),
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(
-                "Parent history to inherit. Defaults to `all`; use `none` to start without parent history. Only `all` and `none` are supported.".to_string(),
+                "Parent history to inherit. Defaults to `all` for ordinary agents and `none` for reviewers. Reviewers cannot inherit parent history. Only `all` and `none` are supported.".to_string(),
             )),
         ),
         (
@@ -849,7 +865,7 @@ fn spawn_agent_tool_description_v2(
         let available_models_description = available_models_description.unwrap_or_default();
         (
             format!("        {available_models_description}\n"),
-            String::new(),
+            format!("\n{model_catalog_guidance}"),
         )
     };
     let tool_description = if let Some(description) = description {

@@ -682,11 +682,15 @@ impl LocalAgentControl {
             .runtime
             .registry
             .reserve_spawn_slot(reservation_max_threads)?;
-        let inherited_environments = match &options.environments {
-            Some(environments) => Some(environments.clone()),
-            None => {
-                self.inherited_environments_for_source(&state, session_source.as_ref())
-                    .await
+        let inherited_environments = if options.fresh_environments {
+            None
+        } else {
+            match &options.environments {
+                Some(environments) => Some(environments.clone()),
+                None => {
+                    self.inherited_environments_for_source(&state, session_source.as_ref())
+                        .await
+                }
             }
         };
         // Omitted plugin choices follow the parent even when no history is copied.
@@ -703,8 +707,11 @@ impl LocalAgentControl {
                     .disabled_plugin_ids,
             );
         }
-        let inherited_exec_policy =
-            inherited_exec_policy_for_source(&state, session_source.as_ref(), &config).await;
+        let inherited_exec_policy = if options.fresh_environments {
+            None
+        } else {
+            inherited_exec_policy_for_source(&state, session_source.as_ref(), &config).await
+        };
         let (session_source, mut agent_metadata) = match session_source {
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,

@@ -159,10 +159,28 @@ pub(crate) async fn prepare(
     .await
     .map_err(ThreadSpawnError::Preparation)?;
     let crate::agent::child_config::PreparedSpawnConfig {
-        config,
+        mut config,
         role_name,
         models_manager,
     } = prepared;
+    let is_reviewer = role_name.as_deref() == Some("reviewer");
+    if is_reviewer {
+        if fork_mode.is_some() {
+            return Err(ThreadSpawnError::Preparation(
+                "reviewer agents cannot inherit parent conversation history".to_string(),
+            ));
+        }
+        let checkout = crate::agent::reviewer_workspace::create_clean_checkout(
+            &config.cwd,
+            &config.codex_home,
+        )
+        .await
+        .map_err(ThreadSpawnError::Preparation)?;
+        config.cwd = checkout.cwd;
+        config.workspace_roots = vec![checkout.root.clone()];
+        config.workspace_roots_explicit = true;
+        config.permissions.set_workspace_roots(vec![checkout.root]);
+    }
     let task_name = turn
         .session_source
         .get_agent_path()
@@ -215,7 +233,8 @@ pub(crate) async fn prepare(
                 parent_turn_id: Some(turn.sub_id.clone()),
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
-                environments: Some(step_context.inherited_environments.clone()),
+                environments: (!is_reviewer).then(|| step_context.inherited_environments.clone()),
+                fresh_environments: is_reviewer,
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,
