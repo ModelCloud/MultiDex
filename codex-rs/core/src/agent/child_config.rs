@@ -638,6 +638,8 @@ pub(crate) fn model_available_from_provider(
         provider == info::LITHOS_PROVIDER_ID
     } else if info::is_wafer_model(model) {
         provider == info::WAFER_PROVIDER_ID
+    } else if info::is_deepinfra_model(model) {
+        provider == info::DEEPINFRA_PROVIDER_ID
     } else {
         // Remaining bundled IDs belong to OpenAI. A custom endpoint serving one
         // of these must advertise it; its shared picker entry is not authority.

@@ -310,6 +310,43 @@ fn wafer_catalog_registers_only_standard_1017_checkpoint() {
 }
 
 #[test]
+fn deepinfra_variants_share_the_local_context_budget() {
+    let models = multidex_model_catalog().models;
+    let local = models
+        .iter()
+        .find(|model| model.slug == MULTIDEX_DSV41_FLASH)
+        .unwrap();
+    let deepinfra: Vec<_> = models
+        .iter()
+        .filter(|model| DEEPINFRA_DSV41_FLASH.contains(&model.slug.as_str()))
+        .collect();
+    assert_eq!(deepinfra.len(), 2);
+    for model in deepinfra {
+        assert_eq!(model.context_window, local.context_window);
+        assert_eq!(
+            model.auto_compact_token_limit(),
+            local.auto_compact_token_limit()
+        );
+        assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
+        assert_eq!(model.apply_patch_tool_type, None);
+        assert_eq!(
+            model
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]
+        );
+    }
+}
+
+#[test]
 fn multidex_catalog_makes_the_local_model_selectable_without_replacing_codex_models() {
     let catalog = multidex_model_catalog();
     let model = catalog
@@ -414,6 +451,8 @@ fn deepseek_provider_switches_share_local_context_and_compaction_budget() {
         MULTIDEX_DSV41_FLASH,
         OPENROUTER_DSV41_FLASH,
         WAFER_DSV41_FLASH,
+        DEEPINFRA_DSV41_FLASH[0],
+        DEEPINFRA_DSV41_FLASH[1],
         LITHOS_DSV41_FLASH[0],
         LITHOS_DSV41_FLASH[1],
         LITHOS_DSV41_FLASH[2],
@@ -438,6 +477,8 @@ fn deepseek_without_local_snapshot_clamps_oversized_config_override() {
     for slug in [
         MULTIDEX_DSV41_FLASH,
         WAFER_DSV41_FLASH,
+        DEEPINFRA_DSV41_FLASH[0],
+        DEEPINFRA_DSV41_FLASH[1],
         OPENROUTER_DSV41_FLASH,
     ] {
         let model = with_config_overrides(model_info_from_slug(slug), &config);

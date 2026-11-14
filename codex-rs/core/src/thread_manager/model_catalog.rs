@@ -123,6 +123,7 @@ fn with_endpoint_catalog(config: &Config, manager: SharedModelsManager) -> Share
                 || codex_model_provider_info::is_openrouter_model(&model.slug)
                 || codex_model_provider_info::is_lithos_model(&model.slug)
                 || codex_model_provider_info::is_wafer_model(&model.slug)
+                || codex_model_provider_info::is_deepinfra_model(&model.slug)
         })
         .collect();
     let default_model =
@@ -134,6 +135,8 @@ fn with_endpoint_catalog(config: &Config, manager: SharedModelsManager) -> Share
             Some(codex_model_provider_info::LITHOS_MODEL_IDS[0].to_string())
         } else if config.model_provider_id == codex_model_provider_info::WAFER_PROVIDER_ID {
             Some(codex_model_provider_info::WAFER_DSV41_FLASH_MODEL_ID.to_string())
+        } else if config.model_provider_id == codex_model_provider_info::DEEPINFRA_PROVIDER_ID {
+            Some(codex_model_provider_info::DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID.to_string())
         } else {
             None
         };
@@ -167,7 +170,10 @@ pub fn multidex_model_catalog_for_config(config: &Config) -> Option<ModelsRespon
         let has_wafer = config
             .model_providers
             .contains_key(codex_model_provider_info::WAFER_PROVIDER_ID);
-        (has_multidex || has_openrouter || has_lithos || has_wafer).then(|| {
+        let has_deepinfra = config
+            .model_providers
+            .contains_key(codex_model_provider_info::DEEPINFRA_PROVIDER_ID);
+        (has_multidex || has_openrouter || has_lithos || has_wafer || has_deepinfra).then(|| {
             let mut catalog = codex_models_manager::model_info::multidex_model_catalog();
             catalog.models.retain(|model| {
                 (has_multidex || !codex_model_provider_info::is_multidex_model(&model.slug))
@@ -175,6 +181,8 @@ pub fn multidex_model_catalog_for_config(config: &Config) -> Option<ModelsRespon
                         || !codex_model_provider_info::is_openrouter_model(&model.slug))
                     && (has_lithos || !codex_model_provider_info::is_lithos_model(&model.slug))
                     && (has_wafer || !codex_model_provider_info::is_wafer_model(&model.slug))
+                    && (has_deepinfra
+                        || !codex_model_provider_info::is_deepinfra_model(&model.slug))
             });
             catalog
         })
