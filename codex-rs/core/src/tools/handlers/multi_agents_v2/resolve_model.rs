@@ -58,6 +58,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
                             codex_model_provider_info::OPENROUTER_PROVIDER_ID
                                 | codex_model_provider_info::LITHOS_PROVIDER_ID
                                 | codex_model_provider_info::WAFER_PROVIDER_ID
+                                | codex_model_provider_info::DEEPINFRA_PROVIDER_ID
                         )
                         || !codex_model_provider_info::built_in_model_providers(None)
                             .contains_key(*id)

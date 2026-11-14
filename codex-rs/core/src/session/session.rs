@@ -446,7 +446,7 @@ impl SessionConfiguration {
             .map(codex_protocol::config_types::CollaborationMode::model)
             .or(updates.step_settings.model.as_deref());
         let current_model = self.step_settings.collaboration_mode.model();
-        let openrouter_to_openai = next_model
+        let endpoint_to_openai = next_model
             .is_some_and(codex_models_manager::model_info::is_bundled_openai_model)
             && matches!(
                 updates
@@ -455,6 +455,8 @@ impl SessionConfiguration {
                     .unwrap_or(&self.original_config_do_not_use.model_provider_id),
                 codex_model_provider_info::OPENROUTER_PROVIDER_ID
                     | codex_model_provider_info::LITHOS_PROVIDER_ID
+                    | codex_model_provider_info::WAFER_PROVIDER_ID
+                    | codex_model_provider_info::DEEPINFRA_PROVIDER_ID
             );
         let requested_model_provider =
             if next_model.is_some_and(codex_model_provider_info::is_multidex_model) {
@@ -465,7 +467,9 @@ impl SessionConfiguration {
                 Some(codex_model_provider_info::OPENROUTER_PROVIDER_ID)
             } else if next_model.is_some_and(codex_model_provider_info::is_wafer_model) {
                 Some(codex_model_provider_info::WAFER_PROVIDER_ID)
-            } else if openrouter_to_openai {
+            } else if next_model.is_some_and(codex_model_provider_info::is_deepinfra_model) {
+                Some(codex_model_provider_info::DEEPINFRA_PROVIDER_ID)
+            } else if endpoint_to_openai {
                 Some(codex_model_provider_info::OPENAI_PROVIDER_ID)
             } else if let Some(model_provider) = updates.model_provider.as_deref()
                 && !codex_model_provider_info::is_multidex_provider_id(model_provider)

@@ -93,6 +93,7 @@ use codex_mcp::ResolvedMcpCatalog;
 use codex_model_provider::ChatgptBaseUrl;
 use codex_model_provider::DEFAULT_CHATGPT_BASE_URL;
 use codex_model_provider::ProviderCapabilities;
+use codex_model_provider_info::DEEPINFRA_PROVIDER_ID;
 use codex_model_provider_info::GCP_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::MULTIDEX_PROVIDER_ID;
@@ -102,6 +103,7 @@ use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::OPENROUTER_PROVIDER_ID;
 use codex_model_provider_info::WAFER_PROVIDER_ID;
 use codex_model_provider_info::built_in_model_providers;
+use codex_model_provider_info::is_deepinfra_model;
 use codex_model_provider_info::is_multidex_model;
 use codex_model_provider_info::is_multidex_provider_id;
 use codex_model_provider_info::is_openrouter_model;
@@ -4165,9 +4167,17 @@ impl Config {
                 ));
             }
             WAFER_PROVIDER_ID.to_string()
+        } else if selected_model.is_some_and(is_deepinfra_model) {
+            if required_model_provider.is_some_and(|provider| provider != DEEPINFRA_PROVIDER_ID) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the DeepInfra model requires the deepinfra provider, but a different provider is required by managed configuration",
+                ));
+            }
+            DEEPINFRA_PROVIDER_ID.to_string()
         } else if selected_model.is_some()
             && (is_multidex_provider_id(&requested_model_provider_id)
-                || (matches!(requested_model_provider_id.as_str(), OPENROUTER_PROVIDER_ID | LITHOS_PROVIDER_ID | WAFER_PROVIDER_ID)
+                || (matches!(requested_model_provider_id.as_str(), OPENROUTER_PROVIDER_ID | LITHOS_PROVIDER_ID | WAFER_PROVIDER_ID | DEEPINFRA_PROVIDER_ID)
                     && selected_model.is_some_and(
                         codex_models_manager::model_info::is_bundled_openai_model,
                     )))

@@ -422,6 +422,66 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }
 
+#[test]
+fn deepinfra_variants_use_one_wire_model_and_session_cache_key() -> anyhow::Result<()> {
+    for (slug, tier) in [
+        (
+            codex_model_provider_info::DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID,
+            "flex",
+        ),
+        (
+            codex_model_provider_info::DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID,
+            "priority",
+        ),
+    ] {
+        let mut client = test_model_client(SessionSource::Cli);
+        Arc::get_mut(&mut client.state)
+            .expect("test client should have unique session state")
+            .provider = create_model_provider(
+            ModelProviderInfo::create_deepinfra_provider(),
+            /*auth_manager*/ None,
+        );
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let request = client.build_responses_request(
+            &Prompt::default(),
+            &codex_models_manager::model_info::model_info_from_slug(slug),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &metadata,
+            /*include_internal*/ true,
+        )?;
+        assert_eq!(
+            request.model,
+            codex_model_provider_info::DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID
+        );
+        assert_eq!(request.service_tier.as_deref(), Some(tier));
+        assert!(!request.store);
+        assert!(request.prompt_cache_key.is_some());
+        assert!(request.prompt_cache_options.is_none());
+        let disabled_reasoning = client.build_responses_request(
+            &Prompt::default(),
+            &codex_models_manager::model_info::model_info_from_slug(slug),
+            Some(ReasoningEffort::Custom("off".to_string())),
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &metadata,
+            /*include_internal*/ true,
+        )?;
+        assert_eq!(
+            disabled_reasoning.reasoning.unwrap().effort,
+            Some(ReasoningEffort::None)
+        );
+    }
+    Ok(())
+}
+
 fn test_model_client_with_thread_id(
     thread_id: ThreadId,
     session_source: SessionSource,

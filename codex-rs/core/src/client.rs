@@ -264,10 +264,9 @@ fn sanitize_plaintext_compaction_for_official_provider(
     }
 }
 
-/// Wafer accepts standard Responses messages and calls, but rejects Codex's
-/// inter-agent message item. Preserve readable communication in the request
-/// without changing the durable conversation history.
-fn sanitize_agent_messages_for_wafer(input: &mut Vec<ResponseItem>) {
+/// Portable Responses endpoints accept messages and calls, but not Codex's
+/// inter-agent message item. Keep readable communication in the request copy.
+fn sanitize_portable_responses_items(input: &mut Vec<ResponseItem>) {
     input.retain_mut(|item| {
         if let ResponseItem::AgentMessage {
             author,
@@ -302,8 +301,94 @@ fn sanitize_agent_messages_for_wafer(input: &mut Vec<ResponseItem>) {
     });
 }
 
+/// DeepInfra accepts messages, reasoning, and function calls as input. Convert
+/// readable history from other providers without changing the saved transcript.
+fn sanitize_deepinfra_input(input: &mut Vec<ResponseItem>) {
+    input.retain_mut(|item| match item {
+        ResponseItem::Message { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::FunctionCallOutput { .. } => true,
+        ResponseItem::Reasoning {
+            content: Some(_),
+            encrypted_content,
+            ..
+        } => {
+            *encrypted_content = None;
+            true
+        }
+        ResponseItem::Compaction {
+            encrypted_content: summary,
+            ..
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(summary),
+            ..
+        } if summary.chars().any(char::is_whitespace) => {
+            let summary = std::mem::take(summary);
+            *item = ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText { text: summary }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            true
+        }
+        ResponseItem::CustomToolCall { .. } => {
+            let ResponseItem::CustomToolCall {
+                status,
+                id,
+                call_id,
+                name,
+                namespace,
+                input,
+                ..
+            } = std::mem::replace(item, ResponseItem::Other)
+            else {
+                unreachable!()
+            };
+            *item = ResponseItem::FunctionCall {
+                status,
+                id,
+                name,
+                namespace,
+                arguments: serde_json::json!({"input": input}).to_string(),
+                encrypted_function_args: None,
+                encrypted_content: None,
+                call_id,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            true
+        }
+        ResponseItem::CustomToolCallOutput { .. } => {
+            let ResponseItem::CustomToolCallOutput {
+                id,
+                call_id,
+                name,
+                output,
+                ..
+            } = std::mem::replace(item, ResponseItem::Other)
+            else {
+                unreachable!()
+            };
+            *item = ResponseItem::FunctionCallOutput {
+                id,
+                call_id: Some(call_id),
+                name,
+                namespace: None,
+                output,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            true
+        }
+        _ => false,
+    });
+}
+
 #[cfg(test)]
-mod wafer_input_tests {
+mod portable_responses_input_tests {
     use super::*;
     use codex_protocol::models::AgentMessageInputContent;
 
@@ -339,13 +424,38 @@ mod wafer_input_tests {
                 },
             },
         ];
-        sanitize_agent_messages_for_wafer(&mut input);
+        sanitize_portable_responses_items(&mut input);
         assert_eq!(input.len(), 1);
         assert!(
             matches!(&input[0], ResponseItem::Message { role, content, .. }
             if role == "user" && matches!(&content[0], ContentItem::InputText { text }
                 if text == "Message from worker to brain: Review complete"))
         );
+    }
+
+    #[test]
+    fn deepinfra_replays_only_supported_responses_items() {
+        let mut input: Vec<ResponseItem> = vec![
+            serde_json::json!({"type":"compaction","encrypted_content":"Readable conversation summary"}),
+            serde_json::json!({"type":"compaction","encrypted_content":"opaqueToken"}),
+            serde_json::json!({"type":"reasoning","summary":[],"encrypted_content":"opaqueToken"}),
+            serde_json::json!({"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"think"}],"encrypted_content":null}),
+            serde_json::json!({"type":"custom_tool_call","call_id":"call-1","name":"apply_patch","input":"patch"}),
+            serde_json::json!({"type":"custom_tool_call_output","call_id":"call-1","output":"done"}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+        sanitize_deepinfra_input(&mut input);
+        let wire = serde_json::to_value(&input).unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(wire[0]["type"], "message");
+        assert_eq!(wire[1]["type"], "reasoning");
+        assert_eq!(wire[1]["content"][0]["text"], "think");
+        assert!(wire[1]["encrypted_content"].is_null());
+        assert_eq!(wire[2]["type"], "function_call");
+        assert_eq!(wire[2]["arguments"], "{\"input\":\"patch\"}");
+        assert_eq!(wire[3]["type"], "function_call_output");
     }
 }
 
@@ -1512,7 +1622,8 @@ impl ModelClient {
         // Responses models reject reasoning items with nonempty `content`.
         sanitize_reasoning_for_official_provider(
             &mut input,
-            self.state.provider.info().multidex_compatibility,
+            self.state.provider.info().multidex_compatibility
+                || self.state.provider.info().is_deepinfra(),
         );
         sanitize_plaintext_compaction_for_official_provider(
             &mut input,
@@ -1568,8 +1679,11 @@ impl ModelClient {
             prefix.push(instructions);
         }
         input.splice(0..0, prefix);
-        if self.state.provider.info().is_wafer() {
-            sanitize_agent_messages_for_wafer(&mut input);
+        if self.state.provider.info().is_wafer() || self.state.provider.info().is_deepinfra() {
+            sanitize_portable_responses_items(&mut input);
+        }
+        if self.state.provider.info().is_deepinfra() {
+            sanitize_deepinfra_input(&mut input);
         }
         if !model_info.use_responses_lite {
             // Only RLite accepts per-content attribution until the Responses API schema expands.
@@ -1597,7 +1711,12 @@ impl ModelClient {
                 }
             }
         }
-        let reasoning = self.build_reasoning(model_info, effort, summary);
+        let mut reasoning = self.build_reasoning(model_info, effort, summary);
+        if self.state.provider.info().is_deepinfra()
+            && matches!(reasoning.effort, Some(ReasoningEffortConfig::Custom(ref value)) if value == "off")
+        {
+            reasoning.effort = Some(ReasoningEffortConfig::None);
+        }
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
@@ -1624,17 +1743,28 @@ impl ModelClient {
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
-        let service_tier = model_info
-            .service_tier_for_request(service_tier)
-            .filter(|tier| {
-                // Bedrock requires an advertised tier, including for flex, which the
-                // generic OpenAI resolver permits without catalog support.
-                !self.state.provider.info().is_amazon_bedrock()
-                    || model_info
-                        .service_tiers
-                        .iter()
-                        .any(|supported| supported.id == *tier)
-            });
+        let deepinfra_tier = self
+            .state
+            .provider
+            .info()
+            .is_deepinfra()
+            .then(|| codex_model_provider_info::deepinfra_service_tier(&model_info.slug))
+            .flatten();
+        let service_tier = if let Some(tier) = deepinfra_tier {
+            Some(tier.to_string())
+        } else {
+            model_info
+                .service_tier_for_request(service_tier)
+                .filter(|tier| {
+                    // Bedrock requires an advertised tier, including for flex, which the
+                    // generic OpenAI resolver permits without catalog support.
+                    !self.state.provider.info().is_amazon_bedrock()
+                        || model_info
+                            .service_tiers
+                            .iter()
+                            .any(|supported| supported.id == *tier)
+                })
+        };
         if !include_internal {
             for item in &mut input {
                 item.clear_tool_result_metadata();
@@ -1642,7 +1772,11 @@ impl ModelClient {
         }
         let client_metadata = responses_metadata.client_metadata(include_internal);
         let request = ResponsesApiRequest {
-            model: model_info.slug.clone(),
+            model: if deepinfra_tier.is_some() {
+                codex_model_provider_info::DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID.to_string()
+            } else {
+                model_info.slug.clone()
+            },
             max_output_tokens: None,
             provider: self.state.provider.info().provider.clone(),
             input,
@@ -1659,9 +1793,15 @@ impl ModelClient {
             include,
             service_tier,
             prompt_cache_key: self.prompt_cache_key(responses_metadata),
-            prompt_cache_options: prompt
-                .prompt_cache_ttl
-                .map(|ttl| codex_api::PromptCacheOptions { ttl }),
+            // DeepInfra caches matching prefixes automatically; paid TTL retention
+            // is unavailable for this DeepSeek model.
+            prompt_cache_options: if deepinfra_tier.is_some() {
+                None
+            } else {
+                prompt
+                    .prompt_cache_ttl
+                    .map(|ttl| codex_api::PromptCacheOptions { ttl })
+            },
             text,
             client_metadata: Some(client_metadata),
             access_programs: None,
@@ -2656,7 +2796,8 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             if let Some((wire, interceptor)) = crate::multidex_tool_namespace::prepare(
-                self.client.provider_info().multidex_compatibility,
+                self.client.provider_info().multidex_compatibility
+                    || self.client.provider_info().is_deepinfra(),
                 &full_request,
                 &request.input,
             )? {
@@ -3075,7 +3216,8 @@ impl ModelClientSession {
             }
             let ResponsesWsRequest::ResponseCreate(payload) = &mut ws_request;
             let (namespace_wire, namespace_interceptor) = crate::multidex_tool_namespace::prepare(
-                self.client.provider_info().multidex_compatibility,
+                self.client.provider_info().multidex_compatibility
+                    || self.client.provider_info().is_deepinfra(),
                 &request,
                 payload.input,
             )?

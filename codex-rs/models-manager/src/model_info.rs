@@ -31,6 +31,10 @@ const MULTIDEX_DSV41_FLASH: &str = "DS v4.1 Flash 1017";
 /// The same DS v4.1 Flash model routed through OpenRouter's aggregate API.
 const OPENROUTER_DSV41_FLASH: &str = "deepseek/deepseek-v4.1-flash-1017";
 const WAFER_DSV41_FLASH: &str = "DeepSeek-V4.1-Flash-1017";
+const DEEPINFRA_DSV41_FLASH: [&str; 2] = [
+    "deepinfra/deepseek-v4.1-flash-1017-flex",
+    "deepinfra/deepseek-v4.1-flash-1017-priority",
+];
 const LITHOS_DSV41_FLASH: [&str; 3] = [
     "deepseek-ai/DeepSeek-V4.1-Flash",
     "deepseek-ai/DeepSeek-V4.1-Flash-fast",
@@ -143,6 +147,7 @@ fn is_dsv41_flash_model(slug: &str) -> bool {
     slug == MULTIDEX_DSV41_FLASH
         || slug == OPENROUTER_DSV41_FLASH
         || slug == WAFER_DSV41_FLASH
+        || DEEPINFRA_DSV41_FLASH.contains(&slug)
         || LITHOS_DSV41_FLASH.contains(&slug)
 }
 
@@ -205,6 +210,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     }
     if slug == WAFER_DSV41_FLASH {
         return apply_multidex_runtime_capabilities(wafer_dsv41_flash_model_info());
+    }
+    if DEEPINFRA_DSV41_FLASH.contains(&slug) {
+        return apply_multidex_runtime_capabilities(deepinfra_dsv41_flash_model_info(slug));
     }
     if LITHOS_DSV41_FLASH.contains(&slug) {
         return apply_multidex_runtime_capabilities(lithos_dsv41_flash_model_info(slug));
@@ -273,10 +281,14 @@ pub fn multidex_model_catalog() -> ModelsResponse {
         model.slug != MULTIDEX_DSV41_FLASH
             && model.slug != OPENROUTER_DSV41_FLASH
             && model.slug != WAFER_DSV41_FLASH
+            && !DEEPINFRA_DSV41_FLASH.contains(&model.slug.as_str())
             && !LITHOS_DSV41_FLASH.contains(&model.slug.as_str())
     });
     catalog.models.push(multidex_dsv41_flash_model_info());
     catalog.models.push(wafer_dsv41_flash_model_info());
+    catalog
+        .models
+        .extend(DEEPINFRA_DSV41_FLASH.map(deepinfra_dsv41_flash_model_info));
     catalog.models.push(openrouter_dsv41_flash_model_info());
     catalog
         .models
@@ -339,6 +351,51 @@ fn wafer_dsv41_flash_model_info() -> ModelInfo {
         ReasoningSummary::None,
         1,
     )
+}
+
+fn deepinfra_dsv41_flash_model_info(slug: &str) -> ModelInfo {
+    let variant = if slug == DEEPINFRA_DSV41_FLASH[0] {
+        "Flex"
+    } else {
+        "Priority"
+    };
+    let mut model = dsv41_flash_model_info(
+        slug,
+        &format!("DeepSeek v4.1 Flash (DeepInfra {variant})"),
+        "DeepSeek v4.1 Flash 1017 served through DeepInfra Responses.",
+        ReasoningEffort::High,
+        false,
+        ReasoningSummary::None,
+        2,
+    );
+    model.supported_reasoning_levels = [
+        (
+            ReasoningEffort::None,
+            "Disable thinking for the fastest responses",
+        ),
+        (
+            ReasoningEffort::Low,
+            "Fast responses with lighter reasoning",
+        ),
+        (ReasoningEffort::Medium, "Balanced reasoning depth"),
+        (
+            ReasoningEffort::High,
+            "Greater reasoning depth for complex work",
+        ),
+        (
+            ReasoningEffort::Max,
+            "Maximum reasoning depth for difficult work",
+        ),
+    ]
+    .into_iter()
+    .map(|(effort, description)| ReasoningEffortPreset {
+        effort,
+        description: description.to_string(),
+    })
+    .collect();
+    // DeepInfra Responses accepts function tools but not freeform tool schemas.
+    model.apply_patch_tool_type = None;
+    model
 }
 
 fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {

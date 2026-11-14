@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::model_catalog::LUNA_RESERVE_MODEL;
+use codex_model_provider_info::is_deepinfra_model;
 use codex_model_provider_info::is_lithos_model;
 use codex_model_provider_info::is_multidex_model;
 use codex_model_provider_info::is_openrouter_model;
@@ -25,6 +26,7 @@ enum PickerProvider {
     OpenRouter,
     Lithos,
     Wafer,
+    DeepInfra,
 }
 
 impl PickerProvider {
@@ -37,6 +39,8 @@ impl PickerProvider {
             Some(Self::Lithos)
         } else if is_wafer_model(model) {
             Some(Self::Wafer)
+        } else if is_deepinfra_model(model) {
+            Some(Self::DeepInfra)
         } else {
             None
         }
@@ -48,6 +52,7 @@ impl PickerProvider {
             Self::OpenRouter => "OpenRouter",
             Self::Lithos => "LithosAI",
             Self::Wafer => "Wafer",
+            Self::DeepInfra => "DeepInfra",
         }
     }
 }
@@ -111,6 +116,10 @@ fn group_picker_rows(presets: Vec<ModelPreset>) -> Vec<PickerRow> {
 /// Derive a variant label from the slug suffix relative to the family's base
 /// slug; the base preset is the Regular variant.
 fn variant_label(preset: &ModelPreset, base_slug: &str) -> String {
+    if let Some(tier) = codex_model_provider_info::deepinfra_service_tier(&preset.model) {
+        let mut chars = tier.chars();
+        return chars.next().unwrap().to_uppercase().collect::<String>() + chars.as_str();
+    }
     let Some(suffix) = preset
         .model
         .strip_prefix(base_slug)
