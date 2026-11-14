@@ -13050,8 +13050,9 @@ enabled = true
             config.agent_max_threads,
             config.effective_agent_max_threads(MultiAgentVersion::V2)
         ),
-        (None, Some(3))
+        (None, Some(8))
     );
+    assert_eq!(config.effective_agent_max_threads(MultiAgentVersion::V1), Some(8));
 
     Ok(())
 }
