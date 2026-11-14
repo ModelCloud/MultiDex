@@ -127,7 +127,7 @@ async fn handle_spawn_agent(
         &call_id,
         ThreadSpawnRequest {
             task_name: args.task_name,
-            message: agent_message_from_tool(message, &source),
+            message: agent_message_from_tool(message, &source, turn.provider.info().is_openai()),
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
             provider: args.provider,
