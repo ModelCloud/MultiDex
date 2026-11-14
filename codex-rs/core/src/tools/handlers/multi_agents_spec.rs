@@ -128,6 +128,9 @@ pub fn create_spawn_agent_tool_v2(
         properties.remove("provider");
         properties.remove("model");
         properties.remove("reasoning_effort");
+        properties.remove("review_repository");
+        properties.remove("review_ref");
+        properties.remove("review_pull_request");
     }
     properties.insert(
         "task_name".to_string(),
@@ -730,7 +733,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(format!(
-                "Agent type override for the new agent. When the user asks for a review agent, use `reviewer`; it starts without parent conversation history in its own clean Git clone at the committed HEAD. Uncommitted parent edits are absent.\n{agent_type_description}"
+                "Agent type override for the new agent. When the user asks for a review agent, use `reviewer`; it starts without parent conversation history in its own clean Git clone. Set review_repository and either review_ref or review_pull_request for a different branch or PR. Uncommitted parent edits are absent.\n{agent_type_description}"
             ))),
         ),
         (
@@ -759,6 +762,27 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                     .to_string(),
             )),
         ),
+        (
+            "review_repository".to_string(),
+            JsonSchema::string(Some(
+                "For reviewer agents, GitHub owner/repo or repository URL to clone into a private clean checkout. Omit to review the parent's committed HEAD."
+                    .to_string(),
+            )),
+        ),
+        (
+            "review_ref".to_string(),
+            JsonSchema::string(Some(
+                "For reviewer agents, branch name to check out. Use only with review_repository; omit when reviewing a pull request."
+                    .to_string(),
+            )),
+        ),
+        (
+            "review_pull_request".to_string(),
+            JsonSchema::number(Some(
+                "For reviewer agents, GitHub PR number. The reviewer checks out its head and posts its review to the PR discussion before reporting back. Use with review_repository."
+                    .to_string(),
+            )),
+        ),
     ])
 }
 
@@ -766,6 +790,9 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
+    properties.remove("review_repository");
+    properties.remove("review_ref");
+    properties.remove("review_pull_request");
 }
 
 fn spawn_agent_tool_description(

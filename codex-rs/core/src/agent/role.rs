@@ -359,7 +359,7 @@ Rules:
                 (
                     "reviewer".to_string(),
                     AgentRoleConfig {
-                        description: Some("Use for an independent review. Each reviewer starts with a fresh conversation in its own clean Git clone at the parent's committed HEAD. Put the review scope and relevant files in its task message; uncommitted parent edits are absent.".to_string()),
+                        description: Some("Use for an independent review. Each reviewer starts with a fresh conversation in its own clean Git clone of the requested repository and revision, or the parent's committed HEAD. Put the review scope and relevant files in its task message; uncommitted parent edits are absent.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
                     }

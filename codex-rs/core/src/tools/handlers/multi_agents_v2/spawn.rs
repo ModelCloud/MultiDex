@@ -133,6 +133,9 @@ async fn handle_spawn_agent(
             provider: args.provider,
             model: args.model,
             reasoning_effort: args.reasoning_effort,
+            review_repository: args.review_repository,
+            review_ref: args.review_ref,
+            review_pull_request: args.review_pull_request,
         },
     )
     .await
@@ -208,6 +211,9 @@ struct SpawnAgentArgs {
     provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    review_repository: Option<String>,
+    review_ref: Option<String>,
+    review_pull_request: Option<u64>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
 }
@@ -261,6 +267,9 @@ mod review_tests {
             provider: None,
             model: None,
             reasoning_effort: None,
+            review_repository: None,
+            review_ref: None,
+            review_pull_request: None,
             fork_turns: fork_turns.map(str::to_string),
             fork_context: None,
         }

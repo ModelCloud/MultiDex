@@ -49,6 +49,9 @@ fn spawn_agent_tool_v2_requires_task_name() {
         Some(true)
     );
     assert!(properties.contains_key("fork_turns"));
+    assert!(properties.contains_key("review_repository"));
+    assert!(properties.contains_key("review_ref"));
+    assert!(properties.contains_key("review_pull_request"));
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
@@ -243,6 +246,9 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
         .properties
         .as_ref()
         .expect("spawn_agent should use object params");
+    assert!(!properties.contains_key("review_repository"));
+    assert!(!properties.contains_key("review_ref"));
+    assert!(!properties.contains_key("review_pull_request"));
 
     for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
         assert!(!properties.contains_key(property));

@@ -96,6 +96,119 @@ pub(crate) async fn create_clean_checkout(
     Ok(ReviewCheckout { root, cwd })
 }
 
+pub(crate) fn github_repository_slug(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let slug = trimmed
+        .strip_prefix("https://github.com/")
+        .unwrap_or(trimmed);
+    let slug = slug.strip_suffix(".git").unwrap_or(slug);
+    let parts = slug.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || part.starts_with('-')
+                || part.starts_with('.')
+                || !part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        })
+    {
+        return Err("review_repository must be a GitHub owner/repo or HTTPS repository URL".into());
+    }
+    Ok(slug.to_string())
+}
+
+pub(crate) async fn create_github_checkout(
+    codex_home: &AbsolutePathBuf,
+    repository: &str,
+    branch: Option<&str>,
+    pull_request: Option<u64>,
+) -> Result<ReviewCheckout, String> {
+    let slug = github_repository_slug(repository)?;
+    if branch.is_some() && pull_request.is_some() {
+        return Err("review_ref and review_pull_request cannot be used together".into());
+    }
+    if pull_request == Some(0) {
+        return Err("review_pull_request must be greater than zero".into());
+    }
+    if let Some(branch) = branch {
+        if branch.starts_with('-')
+            || !Command::new("git")
+                .args(["check-ref-format", "--branch", branch])
+                .output()
+                .await
+                .map_err(|err| format!("could not validate review branch: {err}"))?
+                .status
+                .success()
+        {
+            return Err("review_ref must be a valid Git branch name".into());
+        }
+    }
+
+    let checkout_parent = codex_home.as_path().join("review-clones");
+    std::fs::create_dir_all(&checkout_parent)
+        .map_err(|err| format!("could not create reviewer workspace directory: {err}"))?;
+    let checkout_path = checkout_parent.join(format!("review-{}", Uuid::new_v4()));
+    let url = format!("https://github.com/{slug}.git");
+    let output = Command::new("git")
+        .args(["clone", "--filter=blob:none", "--no-checkout"])
+        .arg(&url)
+        .arg(&checkout_path)
+        .output()
+        .await
+        .map_err(|err| format!("could not clone review repository: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not clone review repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let revision = if let Some(number) = pull_request {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout_path)
+            .args(["fetch", "--no-tags", "origin"])
+            .arg(format!("refs/pull/{number}/head"))
+            .output()
+            .await
+            .map_err(|err| format!("could not fetch review PR: {err}"))?;
+        if !output.status.success() {
+            let _ = std::fs::remove_dir_all(&checkout_path);
+            return Err(format!(
+                "could not fetch review PR: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        "FETCH_HEAD".to_string()
+    } else if let Some(branch) = branch {
+        format!("refs/remotes/origin/{branch}")
+    } else {
+        "HEAD".to_string()
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&checkout_path)
+        .args(["checkout", "--detach"])
+        .arg(revision)
+        .output()
+        .await
+        .map_err(|err| format!("could not check out review revision: {err}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&checkout_path);
+        return Err(format!(
+            "could not check out review revision: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let root = AbsolutePathBuf::from_absolute_path(&checkout_path)
+        .map_err(|err| format!("reviewer checkout path is invalid: {err}"))?;
+    Ok(ReviewCheckout {
+        cwd: root.clone(),
+        root,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +273,19 @@ mod tests {
             std::fs::read_to_string(second.cwd.join("file.txt")).unwrap(),
             "committed\n"
         );
+    }
+
+    #[test]
+    fn github_repository_names_are_bounded() {
+        assert_eq!(
+            github_repository_slug("https://github.com/ModelCloud/GPTQModel.git").unwrap(),
+            "ModelCloud/GPTQModel"
+        );
+        assert_eq!(
+            github_repository_slug("ModelCloud/GPTQModel").unwrap(),
+            "ModelCloud/GPTQModel"
+        );
+        assert!(github_repository_slug("https://example.com/owner/repo").is_err());
+        assert!(github_repository_slug("owner/../repo").is_err());
     }
 }
