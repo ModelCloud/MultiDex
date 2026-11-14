@@ -111,7 +111,11 @@ pub(super) async fn handle_message_string_tool(
             resume_config,
             settings,
             input: AgentInput::Message {
-                message: agent_message_from_tool(message, &source),
+                message: agent_message_from_tool(
+                    message,
+                    &source,
+                    turn.provider.info().is_openai(),
+                ),
                 mode,
             },
             start_options: TurnStartOptions {

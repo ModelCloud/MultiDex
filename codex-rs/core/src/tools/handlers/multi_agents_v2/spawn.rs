@@ -127,12 +127,15 @@ async fn handle_spawn_agent(
         &call_id,
         ThreadSpawnRequest {
             task_name: args.task_name,
-            message: agent_message_from_tool(message, &source),
+            message: agent_message_from_tool(message, &source, turn.provider.info().is_openai()),
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
             provider: args.provider,
             model: args.model,
             reasoning_effort: args.reasoning_effort,
+            review_repository: args.review_repository,
+            review_ref: args.review_ref,
+            review_pull_request: args.review_pull_request,
         },
     )
     .await
@@ -208,6 +211,9 @@ struct SpawnAgentArgs {
     provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    review_repository: Option<String>,
+    review_ref: Option<String>,
+    review_pull_request: Option<u64>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
 }
@@ -220,12 +226,20 @@ impl SpawnAgentArgs {
             ));
         }
 
+        let is_reviewer = self.agent_type.as_deref() == Some("reviewer");
         let fork_turns = self
             .fork_turns
             .as_deref()
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty())
-            .unwrap_or("all");
+            .unwrap_or(if is_reviewer { "none" } else { "all" });
+
+        if is_reviewer && !fork_turns.eq_ignore_ascii_case("none") {
+            return Err(FunctionCallError::RespondToModel(
+                "reviewer agents require fork_turns=`none` to keep every review independent"
+                    .to_string(),
+            ));
+        }
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -238,6 +252,46 @@ impl SpawnAgentArgs {
         Err(FunctionCallError::RespondToModel(
             "fork_turns must be `none` or `all`".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn args(agent_type: Option<&str>, fork_turns: Option<&str>) -> SpawnAgentArgs {
+        SpawnAgentArgs {
+            message: "Review the changed files".to_string(),
+            task_name: "review".to_string(),
+            agent_type: agent_type.map(str::to_string),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            review_repository: None,
+            review_ref: None,
+            review_pull_request: None,
+            fork_turns: fork_turns.map(str::to_string),
+            fork_context: None,
+        }
+    }
+
+    #[test]
+    fn reviewers_always_start_without_parent_history() {
+        assert!(args(Some("reviewer"), None).fork_mode().unwrap().is_none());
+        assert!(
+            args(Some("reviewer"), Some("none"))
+                .fork_mode()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            args(Some("reviewer"), Some("all")).fork_mode(),
+            Err(FunctionCallError::RespondToModel(
+                "reviewer agents require fork_turns=`none` to keep every review independent"
+                    .to_string(),
+            ))
+        );
+        assert!(args(None, None).fork_mode().unwrap().is_some());
     }
 }
 

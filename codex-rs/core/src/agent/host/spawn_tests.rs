@@ -195,6 +195,9 @@ async fn same_manager_creation_retains_step_executor_and_shares_exec_policy() ->
                 provider: None,
                 model: None,
                 reasoning_effort: None,
+                review_repository: None,
+                review_ref: None,
+                review_pull_request: None,
             },
             HostThreadSpawnReservation {
                 thread_id: child_id,

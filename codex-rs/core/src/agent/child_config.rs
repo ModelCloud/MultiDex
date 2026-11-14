@@ -10,6 +10,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_features::Feature;
+use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -303,9 +304,8 @@ async fn apply_requested_spawn_agent_model_overrides(
     };
 
     if let Some(requested_model) = requested_model {
-        let available_models = models_manager
-            .list_models(refresh_strategy, config.http_client_factory())
-            .await;
+        let available_models =
+            provider_spawn_models(models_manager, config, refresh_strategy).await;
         let selected_model_name = find_spawn_agent_model_name(
             &available_models,
             requested_model,
@@ -332,9 +332,8 @@ async fn apply_requested_spawn_agent_model_overrides(
 
     // Provider changed without an explicit model: pick the new provider's default catalog entry.
     if cross_provider && requested_model.is_none() {
-        let available_models = models_manager
-            .list_models(refresh_strategy, config.http_client_factory())
-            .await;
+        let available_models =
+            provider_spawn_models(models_manager, config, refresh_strategy).await;
         let selected_model = available_models
             .iter()
             .find(|model| {
@@ -445,26 +444,228 @@ fn find_spawn_agent_model_name(
     requested_model: &str,
     multi_agent_version: MultiAgentVersion,
 ) -> Result<String, String> {
-    available_models
-        .iter()
-        .find(|model| {
-            model.model == requested_model
-                && model_supports_multi_agent_backend(model, multi_agent_version)
-        })
-        .map(|model| model.model.clone())
-        .ok_or_else(|| {
-            let available = available_models
+    let matches =
+        ranked_spawn_model_matches(available_models, requested_model, multi_agent_version);
+    if let Some((best, score)) = matches.first() {
+        if matches.get(1).is_some_and(|(_, next_score)| {
+            next_score == score || (*score >= 100 && *next_score <= *score + 1)
+        }) {
+            let choices = matches
                 .iter()
-                .filter(|model| model.show_in_picker)
-                .filter(|model| model_supports_multi_agent_backend(model, multi_agent_version))
-                .take(MAX_SPAWN_AGENT_MODEL_OVERRIDES)
-                .map(|model| model.model.as_str())
+                .take_while(|(_, candidate_score)| {
+                    candidate_score == score || (*score >= 100 && *candidate_score <= *score + 1)
+                })
+                .map(|(model, _)| model.model.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
+            return Err(format!(
+                "Ambiguous model `{requested_model}` for spawn_agent. Choose a full model ID: {choices}"
+            ));
+        }
+        return Ok(best.model.clone());
+    }
+    Err({
+        let available = available_models
+            .iter()
+            .filter(|model| model.show_in_picker)
+            .filter(|model| model_supports_multi_agent_backend(model, multi_agent_version))
+            .take(MAX_SPAWN_AGENT_MODEL_OVERRIDES)
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Unknown model `{requested_model}` for spawn_agent. Available models: {available}")
+    })
+}
+
+/// Score names from the selected provider's current catalog. No model aliases are baked in:
+/// short names are the final word of an advertised slug or display name, if unambiguous.
+pub(crate) fn ranked_spawn_model_matches<'a>(
+    available_models: &'a [ModelPreset],
+    query: &str,
+    version: MultiAgentVersion,
+) -> Vec<(&'a ModelPreset, usize)> {
+    let query = query.trim();
+    let normalized_query = normalized_model_name(query);
+    if normalized_query.is_empty() || normalized_query.len() > 128 {
+        return Vec::new();
+    }
+    let query_words = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(normalized_model_name)
+        .collect::<Vec<_>>();
+    let mut matches = available_models
+        .iter()
+        .filter(|model| model_supports_multi_agent_backend(model, version))
+        .filter_map(|model| {
+            let slug = model.model.as_str();
+            let display = model.display_name.as_str();
+            let normalized_slug = normalized_model_name(slug);
+            let normalized_display = normalized_model_name(display);
+            let rank = if slug.eq_ignore_ascii_case(query) {
+                Some(0)
+            } else if display.eq_ignore_ascii_case(query) {
+                Some(1)
+            } else if normalized_slug == normalized_query || normalized_display == normalized_query
+            {
+                Some(2)
+            } else if [slug, display].iter().any(|name| {
+                last_model_word(name)
+                    .is_some_and(|word| normalized_model_name(word) == normalized_query)
+            }) {
+                Some(3)
+            } else if [normalized_slug.as_str(), normalized_display.as_str()]
+                .iter()
+                .any(|name| name.len() >= 5 && normalized_query.contains(name))
+            {
+                Some(4)
+            } else if [slug, display].iter().any(|name| {
+                last_model_word(name).is_some_and(|word| {
+                    let tail = normalized_model_name(word);
+                    tail.len() >= 3 && query_words.iter().any(|token| token == &tail)
+                })
+            }) {
+                Some(5)
+            } else if normalized_query.len() >= 5
+                && [normalized_slug.as_str(), normalized_display.as_str()]
+                    .iter()
+                    .any(|name| name.contains(&normalized_query))
+            {
+                Some(6)
+            } else if normalized_query.len() >= 4 {
+                let distance = edit_distance(&normalized_query, &normalized_slug)
+                    .min(edit_distance(&normalized_query, &normalized_display))
+                    .min(last_model_word(slug).map_or(usize::MAX, |word| {
+                        edit_distance(&normalized_query, &normalized_model_name(word))
+                    }))
+                    .min(last_model_word(display).map_or(usize::MAX, |word| {
+                        edit_distance(&normalized_query, &normalized_model_name(word))
+                    }))
+                    .min(
+                        query_words
+                            .iter()
+                            .filter(|token| token.len() >= 4)
+                            .map(|token| {
+                                [slug, display]
+                                    .iter()
+                                    .filter_map(|name| last_model_word(name))
+                                    .map(|word| edit_distance(token, &normalized_model_name(word)))
+                                    .min()
+                                    .unwrap_or(usize::MAX)
+                            })
+                            .min()
+                            .unwrap_or(usize::MAX),
+                    );
+                let allowed = if normalized_query.len() >= 5 { 2 } else { 1 };
+                (distance <= allowed).then_some(100 + distance)
+            } else {
+                None
+            };
+            rank.map(|rank| (model, rank))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left, left_rank), (right, right_rank)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    matches
+}
+
+fn last_model_word(name: &str) -> Option<&str> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .next_back()
+}
+
+/// Shared picker catalogs can include models for other endpoints. A child's
+/// chosen provider must actually serve the matched model before it is spawned.
+/// Use the selected provider's catalog provenance before building spawn choices. Bundled
+/// entries are shared picker overlays; endpoint and explicit entries belong to this manager
+/// even when their slugs are unknown to the bundled provider list.
+pub(crate) async fn provider_spawn_models(
+    manager: &dyn ModelsManager,
+    config: &Config,
+    refresh_strategy: RefreshStrategy,
+) -> Vec<ModelPreset> {
+    let advertised = manager
+        .provider_catalog_with_origins(refresh_strategy, config.http_client_factory())
+        .await
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.origin,
+                ModelOrigin::Provider | ModelOrigin::ExplicitConfig
             )
         })
+        .map(|entry| entry.model.slug.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let models = manager
+        .model_catalog_with_origins(RefreshStrategy::InMemory, config.http_client_factory())
+        .await
+        .into_iter()
+        .filter(|entry| {
+            model_available_from_provider(
+                &entry.model.slug,
+                &config.model_provider_id,
+                entry.origin,
+                advertised.contains(&entry.model.slug),
+            )
+        })
+        .map(|entry| std::sync::Arc::unwrap_or_clone(entry.model))
+        .collect();
+    manager.build_available_models(models)
+}
+
+pub(crate) fn model_available_from_provider(
+    model: &str,
+    provider: &str,
+    origin: ModelOrigin,
+    advertised: bool,
+) -> bool {
+    if origin == ModelOrigin::Synthetic {
+        return false;
+    }
+    if origin == ModelOrigin::Provider || advertised {
+        return true;
+    }
+    use codex_model_provider_info as info;
+    if info::is_multidex_model(model) {
+        info::is_multidex_provider_id(provider)
+    } else if info::is_openrouter_model(model) {
+        provider == info::OPENROUTER_PROVIDER_ID
+    } else if info::is_lithos_model(model) {
+        provider == info::LITHOS_PROVIDER_ID
+    } else if info::is_wafer_model(model) {
+        provider == info::WAFER_PROVIDER_ID
+    } else {
+        // Remaining bundled IDs belong to OpenAI. A custom endpoint serving one
+        // of these must advertise it; its shared picker entry is not authority.
+        provider == info::OPENAI_PROVIDER_ID
+    }
+}
+
+pub(crate) fn normalized_model_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    let mut current = vec![0; previous.len()];
+    for (row, left_char) in left.chars().enumerate() {
+        current[0] = row + 1;
+        for (column, right_char) in right.chars().enumerate() {
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(left_char != right_char));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.chars().count()]
 }
 
 fn validate_spawn_agent_reasoning_effort(
@@ -487,4 +688,114 @@ fn validate_spawn_agent_reasoning_effort(
     Err(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     ))
+}
+
+#[cfg(test)]
+mod model_alias_tests {
+    use super::*;
+
+    #[test]
+    fn selected_provider_catalog_accepts_discovered_and_configured_models() {
+        for origin in [ModelOrigin::Provider, ModelOrigin::ExplicitConfig] {
+            assert!(model_available_from_provider(
+                "provider-only-spawn-model",
+                "multidex",
+                origin,
+                true,
+            ));
+            assert!(model_available_from_provider(
+                "vendor/new-frontier",
+                "openrouter",
+                origin,
+                true,
+            ));
+            assert!(model_available_from_provider(
+                codex_model_provider_info::MULTIDEX_MODEL_ID,
+                "custom",
+                origin,
+                true,
+            ));
+        }
+        assert!(!model_available_from_provider(
+            codex_model_provider_info::MULTIDEX_MODEL_ID,
+            "openrouter",
+            ModelOrigin::ExplicitConfig,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "gpt-6-astra",
+            "multidex",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "gpt-6-astra",
+            "custom",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "vendor/overlay-only",
+            "custom",
+            ModelOrigin::ExplicitConfig,
+            false,
+        ));
+        assert!(model_available_from_provider(
+            "gpt-6-astra",
+            "openai",
+            ModelOrigin::Bundled,
+            false,
+        ));
+        assert!(!model_available_from_provider(
+            "provider-only-spawn-model",
+            "multidex",
+            ModelOrigin::Synthetic,
+            false,
+        ));
+    }
+
+    #[test]
+    fn short_names_come_from_the_selected_provider_catalog() {
+        let model = codex_models_manager::model_info::model_info_from_slug("gpt-6-astra");
+        let available = vec![ModelPreset::from(model)];
+        assert_eq!(
+            find_spawn_agent_model_name(&available, "astra", MultiAgentVersion::V2).unwrap(),
+            "gpt-6-astra"
+        );
+        assert_eq!(
+            find_spawn_agent_model_name(&available, "ASTRA", MultiAgentVersion::V2).unwrap(),
+            "gpt-6-astra"
+        );
+        assert!(find_spawn_agent_model_name(&[], "astra", MultiAgentVersion::V2).is_err());
+        assert_eq!(
+            find_spawn_agent_model_name(&available, "gpt 6 astra", MultiAgentVersion::V2).unwrap(),
+            "gpt-6-astra"
+        );
+        assert_eq!(
+            find_spawn_agent_model_name(&available, "gpt-6-astr", MultiAgentVersion::V2).unwrap(),
+            "gpt-6-astra"
+        );
+        assert_eq!(
+            find_spawn_agent_model_name(
+                &available,
+                "review with atsra/high",
+                MultiAgentVersion::V2
+            )
+            .unwrap(),
+            "gpt-6-astra"
+        );
+    }
+
+    #[test]
+    fn ambiguous_short_names_do_not_pick_an_arbitrary_model() {
+        let mut first = ModelPreset::from(codex_models_manager::model_info::model_info_from_slug(
+            "gpt-6-astra",
+        ));
+        let mut second = first.clone();
+        first.model = "vendor-a/astra".to_string();
+        second.model = "vendor-b/astra".to_string();
+        let error = find_spawn_agent_model_name(&[first, second], "astra", MultiAgentVersion::V2)
+            .unwrap_err();
+        assert!(error.contains("Ambiguous model"));
+    }
 }

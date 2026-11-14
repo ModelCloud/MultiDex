@@ -1014,6 +1014,24 @@ async fn endpoint_overlay_preserves_remote_refresh_defaults_and_prompt_metadata(
         );
         assert_eq!(sourced_catalog[0].origin, ModelOrigin::Provider);
         assert_eq!(sourced_catalog[1].origin, ModelOrigin::ExplicitConfig);
+        let endpoint_catalog = manager
+            .provider_catalog_with_origins(
+                RefreshStrategy::InMemory,
+                DEFAULT_HTTP_CLIENT_FACTORY.clone(),
+            )
+            .await;
+        assert!(
+            endpoint_catalog
+                .iter()
+                .all(|entry| entry.origin == ModelOrigin::Provider)
+        );
+        assert_eq!(
+            endpoint_catalog
+                .iter()
+                .any(|entry| entry.model.slug == slug),
+            expected == "remote-first",
+            "the provider-only view must exclude a shared overlay unless advertised"
+        );
         let presets = manager.build_available_models(catalog.models);
         assert!(
             presets
