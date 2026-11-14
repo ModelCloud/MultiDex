@@ -591,6 +591,7 @@ pub struct OpenAiModelsManager {
     endpoint_client: SharedModelsEndpointClient,
     catalog_source: CatalogSource,
     auth_manager: Option<Arc<AuthManager>>,
+    prefer_high_reasoning_default: bool,
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -662,13 +663,22 @@ impl OpenAiModelsManager {
             endpoint_client,
             catalog_source: CatalogSource::Default,
             auth_manager,
+            prefer_high_reasoning_default: false,
         }
+    }
+
+    /// Apply High as the native OpenAI catalog default without changing a
+    /// model's supported effort ladder or a session's explicit effort.
+    pub fn with_high_reasoning_default(mut self) -> Self {
+        self.prefer_high_reasoning_default = true;
+        self
     }
 
     /// Configure a newly constructed manager to use only the provider's explicit catalog.
     /// Clear the bundled seed before sharing it; the existing auth identity must be retained.
     pub fn with_provider_catalog(mut self) -> Self {
         self.catalog_source = CatalogSource::ExplicitProvider(Mutex::new(()));
+        self.prefer_high_reasoning_default = false;
         self.remote_models.get_mut().entry.models.clear();
         self
     }
@@ -760,6 +770,9 @@ impl ModelsManager for OpenAiModelsManager {
             .as_ref()
             .and_then(|cache| cache.for_originator(originator));
         let mut manager = Self::with_settings(settings, endpoint, self.auth_manager.clone());
+        if self.prefer_high_reasoning_default {
+            manager = manager.with_high_reasoning_default();
+        }
         if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
             manager = manager.with_provider_catalog();
         }
@@ -874,7 +887,7 @@ impl ModelsManager for OpenAiModelsManager {
 impl OpenAiModelsManager {
     /// Selects the catalog available under the current provider and auth identity.
     fn models_for_entry<'a>(&self, entry: &'a ModelsCacheEntry) -> SelectedCatalog<'a> {
-        if !self.api_key_discovery_disabled()
+        let selected = if !self.api_key_discovery_disabled()
             && entry.identity.is_some()
             && entry.identity == self.endpoint_client.identity()
         {
@@ -883,6 +896,24 @@ impl OpenAiModelsManager {
             SelectedCatalog::Fallback(Cow::Owned(
                 self.catalog_source.fallback_models().unwrap_or_default(),
             ))
+        };
+        if !self.prefer_high_reasoning_default {
+            return selected;
+        }
+        let prefer_high = |models: Cow<'a, [ModelInfo]>| {
+            Cow::Owned(
+                models
+                    .into_owned()
+                    .into_iter()
+                    .map(model_info::prefer_high_reasoning_default)
+                    .collect(),
+            )
+        };
+        match selected {
+            SelectedCatalog::CurrentSnapshot(models) => {
+                SelectedCatalog::CurrentSnapshot(prefer_high(models))
+            }
+            SelectedCatalog::Fallback(models) => SelectedCatalog::Fallback(prefer_high(models)),
         }
     }
 

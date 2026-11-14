@@ -20,6 +20,8 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelAccessPrograms;
 use codex_protocol::openai_models::ModelOrigin;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::turn_input::CyberAccessProgram;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -472,6 +474,82 @@ async fn manager_without_cache_fetches_on_every_refresh() {
     assert_eq!(second_catalog, catalog);
     assert_eq!(manager.get_remote_models().await, remote_models);
     assert_eq!(endpoint.fetch_count(), 2);
+}
+
+#[tokio::test]
+async fn native_openai_catalog_prefers_high_for_new_and_cached_models() {
+    let mut openai = remote_model("gpt-future", "Future", 0);
+    openai.default_reasoning_level = Some(ReasoningEffort::Low);
+    openai
+        .supported_reasoning_levels
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "High".to_string(),
+        });
+    let no_high = remote_model("gpt-no-high", "No High", 1);
+    let endpoint = TestModelsEndpoint::new(vec![vec![openai, no_high]]);
+    let manager = OpenAiModelsManager::new_without_cache(
+        endpoint,
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    )
+    .with_high_reasoning_default();
+
+    let models = manager
+        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert_eq!(
+        models
+            .iter()
+            .find(|model| model.model == "gpt-future")
+            .unwrap()
+            .default_reasoning_effort,
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        models
+            .iter()
+            .find(|model| model.model == "gpt-no-high")
+            .unwrap()
+            .default_reasoning_effort,
+        ReasoningEffort::Medium
+    );
+    assert_eq!(
+        manager
+            .get_model_info("gpt-future", &ModelsManagerConfig::default())
+            .await
+            .model
+            .default_reasoning_level,
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(
+        manager.get_remote_models().await[0].default_reasoning_level,
+        Some(ReasoningEffort::High)
+    );
+}
+
+#[tokio::test]
+async fn explicit_provider_catalog_keeps_its_own_effort_default() {
+    let mut model = remote_model("provider-model", "Provider", 0);
+    model
+        .supported_reasoning_levels
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "High".to_string(),
+        });
+    let endpoint = TestModelsEndpoint::new(vec![vec![model]]);
+    let manager = OpenAiModelsManager::new_without_cache(endpoint, None)
+        .with_high_reasoning_default()
+        .with_provider_catalog();
+
+    let models = manager
+        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert_eq!(
+        models.models[0].default_reasoning_level,
+        Some(ReasoningEffort::Medium)
+    );
 }
 
 #[tokio::test]
@@ -1051,7 +1129,7 @@ async fn endpoint_overlay_preserves_remote_refresh_defaults_and_prompt_metadata(
         .await;
     assert_eq!(
         info.default_reasoning_level,
-        Some(codex_protocol::openai_models::ReasoningEffort::Max)
+        Some(ReasoningEffort::High)
     );
     assert_eq!(
         info.model_messages
