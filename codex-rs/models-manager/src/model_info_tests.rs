@@ -345,7 +345,7 @@ fn dsv41_flash_uses_deepseek_harness_prompt() {
     assert_eq!(openrouter.context_window, Some(262_144));
     assert_eq!(
         openrouter.default_reasoning_level,
-        Some(ReasoningEffort::Max)
+        Some(ReasoningEffort::High)
     );
     assert!(openrouter.supports_reasoning_summary_parameter);
     assert_eq!(openrouter.visibility, ModelVisibility::List);
@@ -372,7 +372,7 @@ fn lithos_variants_use_1017_instructions_without_fallback_metadata() {
         assert_eq!(model.slug, slug);
         assert!(model.display_name.starts_with("DeepSeek v4.1 Flash"));
         assert_eq!(render_model_instructions(&model), DEEPSEEK_INSTRUCTIONS);
-        assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::Max));
+        assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
         assert_eq!(model.context_window, Some(262_144));
         assert_eq!(model.auto_compact_token_limit(), Some(257_948));
         assert!(!model.supports_reasoning_summary_parameter);

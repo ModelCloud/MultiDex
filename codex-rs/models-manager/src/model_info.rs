@@ -92,6 +92,19 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     apply_multidex_runtime_capabilities(model)
 }
 
+/// Prefer High for models returned by the native OpenAI catalog, when supported.
+/// An explicit per-session effort still takes precedence over this metadata.
+pub fn prefer_high_reasoning_default(mut model: ModelInfo) -> ModelInfo {
+    if model
+        .supported_reasoning_levels
+        .iter()
+        .any(|preset| preset.effort == ReasoningEffort::High)
+    {
+        model.default_reasoning_level = Some(ReasoningEffort::High);
+    }
+    model
+}
+
 /// Use the local endpoint's live budget for every DeepSeek provider variant.
 /// The snapshot comes from the local `/v1/models/{id}` endpoint. Keep the
 /// bundled local budget when discovery fails; never inherit a hosted
@@ -306,9 +319,7 @@ fn openrouter_dsv41_flash_model_info() -> ModelInfo {
         OPENROUTER_DSV41_FLASH,
         "DeepSeek v4.1 Flash (OpenRouter)",
         "DS v4.1 Flash 1017 coding model served through OpenRouter.",
-        // Matches the MultiDex Lite entry's default reasoning effort.
-        /*default_reasoning_level*/
-        ReasoningEffort::Max,
+        /*default_reasoning_level*/ ReasoningEffort::High,
         // OpenRouter normalizes reasoning into a distinct stream rather than
         // mirroring raw thinking text, so the summary parameter is safe.
         /*supports_reasoning_summary_parameter*/
@@ -340,7 +351,7 @@ fn lithos_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         slug,
         &format!("DeepSeek v4.1 Flash (Lithos {variant})"),
         "DeepSeek v4.1 Flash 1017 served by Lithos.",
-        ReasoningEffort::Max,
+        ReasoningEffort::High,
         false,
         ReasoningSummary::None,
         3,
