@@ -749,7 +749,7 @@ impl ModelsManager for OpenAiModelsManager {
                 error!("failed to refresh available models: {err}");
             }
             let state = self.remote_models.read().await;
-            state.model_catalog(self.models_for_entry(&state.entry))
+            state.model_catalog(self.models_for_entry(&state))
         })
     }
 
@@ -819,18 +819,13 @@ impl ModelsManager for OpenAiModelsManager {
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
             let entry = self.remote_models.read().await;
-            self.models_for_entry(&entry.entry)
-                .into_models()
-                .into_owned()
+            self.models_for_entry(&entry).into_models().into_owned()
         })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
         let entry = self.remote_models.try_read()?;
-        Ok(self
-            .models_for_entry(&entry.entry)
-            .into_models()
-            .into_owned())
+        Ok(self.models_for_entry(&entry).into_models().into_owned())
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
@@ -846,7 +841,7 @@ impl ModelsManager for OpenAiModelsManager {
         Box::pin(async move {
             let remote = {
                 let entry = self.remote_models.read().await;
-                let selected = self.models_for_entry(&entry.entry);
+                let selected = self.models_for_entry(&entry);
                 let models = match &selected {
                     SelectedCatalog::CurrentSnapshot(models)
                     | SelectedCatalog::Fallback(models) => models,
@@ -886,7 +881,8 @@ impl ModelsManager for OpenAiModelsManager {
 
 impl OpenAiModelsManager {
     /// Selects the catalog available under the current provider and auth identity.
-    fn models_for_entry<'a>(&self, entry: &'a ModelsCacheEntry) -> SelectedCatalog<'a> {
+    fn models_for_entry<'a>(&self, state: &'a CatalogState) -> SelectedCatalog<'a> {
+        let entry = &state.entry;
         let selected = if !self.api_key_discovery_disabled()
             && entry.identity.is_some()
             && entry.identity == self.endpoint_client.identity()
@@ -897,23 +893,36 @@ impl OpenAiModelsManager {
                 self.catalog_source.fallback_models().unwrap_or_default(),
             ))
         };
-        if !self.prefer_high_reasoning_default {
+        if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
             return selected;
         }
-        let prefer_high = |models: Cow<'a, [ModelInfo]>| {
+        let prefer_high = |models: Cow<'a, [ModelInfo]>, current: bool| {
             Cow::Owned(
                 models
                     .into_owned()
                     .into_iter()
-                    .map(model_info::prefer_high_reasoning_default)
+                    .map(|model| {
+                        // The shared picker carries bundled OpenAI rows even
+                        // when a local provider owns the current session.
+                        if self.prefer_high_reasoning_default
+                            || !current
+                            || !state.provider_model_ids.contains(&model.slug)
+                        {
+                            model_info::prefer_high_reasoning_default(model)
+                        } else {
+                            model
+                        }
+                    })
                     .collect(),
             )
         };
         match selected {
             SelectedCatalog::CurrentSnapshot(models) => {
-                SelectedCatalog::CurrentSnapshot(prefer_high(models))
+                SelectedCatalog::CurrentSnapshot(prefer_high(models, true))
             }
-            SelectedCatalog::Fallback(models) => SelectedCatalog::Fallback(prefer_high(models)),
+            SelectedCatalog::Fallback(models) => {
+                SelectedCatalog::Fallback(prefer_high(models, false))
+            }
         }
     }
 
@@ -1286,7 +1295,11 @@ impl ModelsManager for StaticModelsManager {
 }
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
-    Ok(crate::bundled_models_response()?.models)
+    Ok(crate::bundled_models_response()?
+        .models
+        .into_iter()
+        .map(model_info::prefer_high_reasoning_default)
+        .collect())
 }
 
 fn default_model_from_available(available: Vec<ModelPreset>) -> String {
