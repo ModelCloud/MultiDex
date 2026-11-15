@@ -518,6 +518,7 @@ fn settings_submission(
             root_turn_id: None,
             residency_guard: None,
             message_delivery: None,
+            mail_cancellation: None,
         },
         receiver,
     )

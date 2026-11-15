@@ -585,6 +585,8 @@ impl ModelInfo {
             "DS v4.1 Flash 1017"
                 | "DeepSeek-V4.1-Flash-1017"
                 | "deepseek/deepseek-v4.1-flash-1017"
+                | "deepinfra/deepseek-v4.1-flash-1017-flex"
+                | "deepinfra/deepseek-v4.1-flash-1017-priority"
                 | "deepseek-ai/DeepSeek-V4.1-Flash"
                 | "deepseek-ai/DeepSeek-V4.1-Flash-fast"
                 | "deepseek-ai/DeepSeek-V4.1-Flash-ultra"
@@ -2208,6 +2210,8 @@ mod tests {
             "DS v4.1 Flash 1017",
             "DeepSeek-V4.1-Flash-1017",
             "deepseek/deepseek-v4.1-flash-1017",
+            "deepinfra/deepseek-v4.1-flash-1017-flex",
+            "deepinfra/deepseek-v4.1-flash-1017-priority",
             "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4.1-Flash-fast",
             "deepseek-ai/DeepSeek-V4.1-Flash-ultra",

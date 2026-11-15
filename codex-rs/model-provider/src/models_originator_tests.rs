@@ -49,7 +49,14 @@ async fn originator_managers_share_api_key_discovery_policy() {
     ));
     let manager = OpenAiModelsManager::new(home.path().to_path_buf(), endpoint, Some(auth));
     let work = manager.for_originator("codex_work_cca").unwrap();
-    let bundled = codex_models_manager::bundled_models_response().unwrap();
+    let bundled = ModelsResponse {
+        models: codex_models_manager::bundled_models_response()
+            .unwrap()
+            .models
+            .into_iter()
+            .map(codex_models_manager::model_info::prefer_high_reasoning_default)
+            .collect(),
+    };
     let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
     assert_eq!(
         work.raw_model_catalog(RefreshStrategy::Online, client.clone())

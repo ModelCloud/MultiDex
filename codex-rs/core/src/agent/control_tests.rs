@@ -2280,7 +2280,7 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
     wait_for_recorded_user_message(thread.as_ref(), "spawned").await;
 }
 
-#[test_case::test_case(None, ReasoningEffort::Medium; "model default")]
+#[test_case::test_case(None, ReasoningEffort::High; "model default")]
 #[test_case::test_case(Some(ReasoningEffort::Ultra), ReasoningEffort::XHigh; "resolved ultra")]
 #[tokio::test]
 async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(

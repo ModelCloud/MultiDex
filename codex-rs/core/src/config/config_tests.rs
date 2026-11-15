@@ -13063,7 +13063,10 @@ enabled = true
         ),
         (None, Some(8))
     );
-    assert_eq!(config.effective_agent_max_threads(MultiAgentVersion::V1), Some(8));
+    assert_eq!(
+        config.effective_agent_max_threads(MultiAgentVersion::V1),
+        Some(8)
+    );
 
     Ok(())
 }
@@ -14572,11 +14575,9 @@ base_url = "http://127.0.0.1:2120/v1"
         &config,
         auth,
         "00000000-0000-0000-0000-000000000000".to_string(),
-        std::sync::Arc::new(
-            codex_models_manager::manager::ModelCatalogSettings::disk(
-                config.codex_home.to_path_buf(),
-            ),
-        ),
+        std::sync::Arc::new(codex_models_manager::manager::ModelCatalogSettings::disk(
+            config.codex_home.to_path_buf(),
+        )),
     )
     .models_manager();
 

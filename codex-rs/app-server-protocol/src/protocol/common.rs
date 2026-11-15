@@ -549,8 +549,75 @@ client_request_definitions! {
         response: v2::UserVerificationCancelResponse,
     },
 
-    /// NEW APIs
+    #[experimental("bgr/capabilities/read")]
+    BgrCapabilitiesRead => "bgr/capabilities/read" {
+        params: v2::BgrCapabilitiesReadParams,
+        serialization: None,
+        response: v2::BgrCapabilitiesReadResponse,
+    },
+    #[experimental("bgr/thread/bind")]
+    BgrThreadBind => "bgr/thread/bind" {
+        params: v2::BgrThreadBindParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::BgrThreadStateResponse,
+    },
+    #[experimental("bgr/thread/peers")]
+    BgrThreadPeers => "bgr/thread/peers" {
+        params: v2::BgrThreadPeersParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrThreadStateResponse,
+    },
+    #[experimental("bgr/reviewer/start")]
+    BgrReviewerStart => "bgr/reviewer/start" {
+        params: v2::BgrReviewerStartParams,
+        serialization: None,
+        manual_payload_conversion: manual,
+        response: v2::BgrReviewerStartResponse,
+    },
+    #[experimental("bgr/message/send")]
+    BgrMessageSend => "bgr/message/send" {
+        params: v2::BgrMessageSendParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::BgrMessageSendResponse,
+    },
+    #[experimental("bgr/message/deliver")]
+    BgrMessageDeliver => "bgr/message/deliver" {
+        params: v2::BgrMessageDeliverParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrMessageSendResponse,
+    },
+    #[experimental("bgr/message/record")]
+    BgrMessageRecord => "bgr/message/record" {
+        params: v2::BgrMessageRecordParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrMessageSendResponse,
+    },
+    #[experimental("bgr/thread/inspect")]
+    BgrThreadInspect => "bgr/thread/inspect" {
+        params: v2::BgrThreadInspectParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrThreadStateResponse,
+    },
+    #[experimental("bgr/thread/checkpoint")]
+    BgrThreadCheckpoint => "bgr/thread/checkpoint" {
+        params: v2::BgrThreadBindParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrThreadStateResponse,
+    },
+    #[experimental("bgr/thread/cancel")]
+    BgrThreadCancel => "bgr/thread/cancel" {
+        params: v2::BgrThreadBindParams,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::BgrThreadStateResponse,
+    },
     // Thread lifecycle
+    /// NEW APIs
     // Uses `inspect_params` because only some fields are experimental.
     ThreadStart => "thread/start" {
         params: v2::ThreadStartParams,
@@ -2015,6 +2082,8 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
 }
 
 server_notification_definitions! {
+    #[experimental("bgr/message")]
+    BgrMessage => "bgr/message" (v2::BgrMessageNotification),
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),

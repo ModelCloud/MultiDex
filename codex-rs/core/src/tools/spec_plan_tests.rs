@@ -2855,12 +2855,18 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         .properties
         .as_ref()
         .expect("spawn_agent should use object params");
-    for property in ["model", "reasoning_effort"] {
+    for property in [
+        "agent_type",
+        "provider",
+        "model",
+        "reasoning_effort",
+        "review_repository",
+        "review_ref",
+        "review_pull_request",
+    ] {
         assert!(spawn_agent_properties.contains_key(property));
     }
-    for property in ["agent_type", "service_tier"] {
-        assert!(!spawn_agent_properties.contains_key(property));
-    }
+    assert!(!spawn_agent_properties.contains_key("service_tier"));
     let spawn_agent_description = spawn_agent.description.as_str();
     assert!(!spawn_agent_description.contains("max_concurrent_threads_per_session"));
     assert!(spawn_agent_description.contains(
@@ -3038,6 +3044,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
             "followup_task".to_string(),
             "interrupt_agent".to_string(),
             "list_agents".to_string(),
+            "resolve_model".to_string(),
             "send_message".to_string(),
             "set_agent_settings".to_string(),
             "spawn_agent".to_string(),

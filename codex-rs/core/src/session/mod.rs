@@ -1168,8 +1168,33 @@ impl SessionIo {
             root_turn_id,
             residency_guard,
             message_delivery,
+            mail_cancellation: None,
         };
         self.submit_with_id(sub).await?;
+        Ok(id)
+    }
+
+    pub(crate) async fn submit_cancellable_mail(
+        &self,
+        communication: codex_protocol::protocol::InterAgentCommunication,
+        cancellation: CancellationToken,
+    ) -> CodexResult<String> {
+        let id = new_submission_id();
+        self.submit_with_id(Submission {
+            id: id.clone(),
+            op: Op::InterAgentCommunication {
+                communication,
+                start_options: Default::default(),
+            },
+            turn_extension_init: None,
+            trace: None,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+            message_delivery: None,
+            mail_cancellation: Some(cancellation),
+        })
+        .await?;
         Ok(id)
     }
 
@@ -1214,6 +1239,7 @@ impl SessionIo {
             root_turn_id: None,
             residency_guard: None,
             message_delivery: None,
+            mail_cancellation: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
@@ -1241,6 +1267,7 @@ impl SessionIo {
             root_turn_id: None,
             residency_guard: None,
             message_delivery: None,
+            mail_cancellation: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))

@@ -314,6 +314,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                         root_turn_id: None,
                         residency_guard: None,
                         message_delivery: None,
+                        mail_cancellation: None,
                     })
                     .await;
                 child_cancel.cancel();
