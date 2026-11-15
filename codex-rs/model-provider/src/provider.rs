@@ -706,7 +706,10 @@ impl ModelProvider for ConfiguredModelProvider {
             .with_runtime_auth(self.catalog_runtime_auth.clone()),
         );
         let auth_manager = self.auth_manager.clone();
-        let manager = OpenAiModelsManager::with_settings(settings, endpoint, auth_manager);
+        let mut manager = OpenAiModelsManager::with_settings(settings, endpoint, auth_manager);
+        if self.info.is_openai() && self.info.model_catalog_url.is_none() {
+            manager = manager.with_high_reasoning_default();
+        }
         match &self.info.model_catalog_url {
             Some(_) => Arc::new(manager.with_provider_catalog()),
             None => Arc::new(manager),

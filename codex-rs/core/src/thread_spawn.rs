@@ -36,6 +36,12 @@ pub struct ThreadCreateRequest {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Repository for an independent review, as `owner/repo` or a GitHub URL.
+    pub review_repository: Option<String>,
+    /// Branch name to review from the selected repository.
+    pub review_ref: Option<String>,
+    /// GitHub pull request number to review and discuss.
+    pub review_pull_request: Option<u64>,
 }
 
 pub(crate) struct ThreadSpawnRequest {
@@ -48,6 +54,9 @@ pub(crate) struct ThreadSpawnRequest {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub review_repository: Option<String>,
+    pub review_ref: Option<String>,
+    pub review_pull_request: Option<u64>,
 }
 
 impl ThreadSpawnRequest {
@@ -70,6 +79,9 @@ impl ThreadSpawnRequest {
                 provider: self.provider,
                 model: self.model,
                 reasoning_effort: self.reasoning_effort,
+                review_repository: self.review_repository,
+                review_ref: self.review_ref,
+                review_pull_request: self.review_pull_request,
             },
             self.message,
         ))
@@ -139,11 +151,27 @@ pub(crate) async fn prepare(
         provider,
         model,
         reasoning_effort,
+        review_repository,
+        review_ref,
+        review_pull_request,
     } = request;
     let role_name = agent_type
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    if role_name != Some("reviewer")
+        && (review_repository.is_some() || review_ref.is_some() || review_pull_request.is_some())
+    {
+        return Err(ThreadSpawnError::Preparation(
+            "review_repository, review_ref, and review_pull_request require agent_type=`reviewer`"
+                .to_string(),
+        ));
+    }
+    if review_repository.is_none() && (review_ref.is_some() || review_pull_request.is_some()) {
+        return Err(ThreadSpawnError::Preparation(
+            "review_ref and review_pull_request require review_repository".to_string(),
+        ));
+    }
     let prepared = prepare_agent_spawn_config(
         session,
         step_context,
@@ -159,16 +187,45 @@ pub(crate) async fn prepare(
     .await
     .map_err(ThreadSpawnError::Preparation)?;
     let crate::agent::child_config::PreparedSpawnConfig {
-        config,
+        mut config,
         role_name,
         models_manager,
     } = prepared;
+    let is_reviewer = role_name.as_deref() == Some("reviewer");
     let task_name = turn
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root)
         .join(&task_name)
         .map_err(ThreadSpawnError::Preparation)?;
+    if is_reviewer {
+        if fork_mode.is_some() {
+            return Err(ThreadSpawnError::Preparation(
+                "reviewer agents cannot inherit parent conversation history".to_string(),
+            ));
+        }
+        let checkout = if let Some(repository) = review_repository.as_deref() {
+            crate::agent::reviewer_workspace::create_github_checkout(
+                &config.codex_home,
+                repository,
+                review_ref.as_deref(),
+                review_pull_request,
+            )
+            .await
+        } else {
+            crate::agent::reviewer_workspace::create_clean_checkout(&config.cwd, &config.codex_home)
+                .await
+        }
+        .map_err(ThreadSpawnError::Preparation)?;
+        config.cwd = checkout.cwd;
+        config.workspace_roots = vec![checkout.root.clone()];
+        config.workspace_roots_explicit = true;
+        config.permissions.set_workspace_roots(vec![checkout.root]);
+        let instructions = config
+            .developer_instructions
+            .get_or_insert_with(String::new);
+        instructions.push_str(&checkout.instructions);
+    }
     let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.thread_id,
         depth: next_thread_spawn_depth(&turn.session_source),
@@ -215,7 +272,8 @@ pub(crate) async fn prepare(
                 parent_turn_id: Some(turn.sub_id.clone()),
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
-                environments: Some(step_context.inherited_environments.clone()),
+                environments: (!is_reviewer).then(|| step_context.inherited_environments.clone()),
+                fresh_environments: is_reviewer,
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,

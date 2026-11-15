@@ -163,6 +163,9 @@ fn create_request(name: &str, fork_history: bool) -> ThreadCreateRequest {
         provider: None,
         model: None,
         reasoning_effort: None,
+        review_repository: None,
+        review_ref: None,
+        review_pull_request: None,
     }
 }
 

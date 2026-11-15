@@ -1270,7 +1270,7 @@ region = "us-west-2"
 }
 
 #[tokio::test]
-async fn openrouter_model_selects_its_provider_and_preserves_other_routes() -> std::io::Result<()> {
+async fn endpoint_model_selects_its_provider_and_preserves_other_routes() -> std::io::Result<()> {
     for (model, requested_provider, expected_provider) in [
         ("deepseek-ai/DeepSeek-V4.1-Flash", "openai", "lithos"),
         (
@@ -1294,6 +1294,17 @@ async fn openrouter_model_selects_its_provider_and_preserves_other_routes() -> s
         ("gpt-5.6-sol", "openrouter", "openai"),
         ("another-vendor/model", "openrouter", "openrouter"),
         ("DS v4.1 Flash 1017", "openrouter", "multidex"),
+        (
+            "deepinfra/deepseek-v4.1-flash-1017-flex",
+            "openai",
+            "deepinfra",
+        ),
+        (
+            "deepinfra/deepseek-v4.1-flash-1017-priority",
+            "multidex",
+            "deepinfra",
+        ),
+        ("gpt-5.6-sol", "deepinfra", "openai"),
     ] {
         let cfg = toml::from_str::<ConfigToml>(&format!(
             r#"
@@ -13050,7 +13061,11 @@ enabled = true
             config.agent_max_threads,
             config.effective_agent_max_threads(MultiAgentVersion::V2)
         ),
-        (None, Some(3))
+        (None, Some(8))
+    );
+    assert_eq!(
+        config.effective_agent_max_threads(MultiAgentVersion::V1),
+        Some(8)
     );
 
     Ok(())

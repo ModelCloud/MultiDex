@@ -28,6 +28,7 @@ use serde_json::Value as JsonValue;
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
 pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
+pub(crate) use resolve_model::Handler as ResolveModelHandler;
 pub(crate) use send_message::Handler as SendMessageHandler;
 pub(crate) use set_agent_settings::Handler as SetAgentSettingsHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
@@ -38,6 +39,7 @@ mod followup_task;
 mod interrupt_agent;
 mod list_agents;
 mod message_tool;
+mod resolve_model;
 mod send_message;
 mod set_agent_settings;
 mod spawn;
@@ -56,14 +58,39 @@ pub(crate) async fn emit_sub_agent_activity(
 fn agent_message_from_tool(
     message: String,
     source: &crate::tools::context::ToolCallSource,
+    origin_is_openai: bool,
 ) -> AgentMessage {
-    if matches!(
-        source,
-        crate::tools::context::ToolCallSource::DirectPlaintextMessage
-            | crate::tools::context::ToolCallSource::CodeMode { .. }
-    ) {
+    // Only OpenAI's direct collaboration calls can carry decryptable message
+    // ciphertext. Other providers send ordinary text even when the tool schema
+    // marks the parameter as encrypted. Labeling that text as ciphertext makes
+    // a cross-provider child fail before it can read its first task.
+    if !origin_is_openai
+        || matches!(
+            source,
+            crate::tools::context::ToolCallSource::DirectPlaintextMessage
+                | crate::tools::context::ToolCallSource::CodeMode { .. }
+        )
+    {
         AgentMessage::Plaintext(message)
     } else {
         AgentMessage::Encrypted(message)
+    }
+}
+
+#[cfg(test)]
+mod agent_message_tests {
+    use super::*;
+    use crate::tools::context::ToolCallSource;
+
+    #[test]
+    fn non_openai_direct_messages_are_plaintext_for_cross_provider_children() {
+        assert!(matches!(
+            agent_message_from_tool("review this".into(), &ToolCallSource::Direct, false),
+            AgentMessage::Plaintext(message) if message == "review this"
+        ));
+        assert!(matches!(
+            agent_message_from_tool("ciphertext".into(), &ToolCallSource::Direct, true),
+            AgentMessage::Encrypted(message) if message == "ciphertext"
+        ));
     }
 }

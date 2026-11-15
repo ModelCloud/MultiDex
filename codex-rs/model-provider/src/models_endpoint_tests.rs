@@ -441,7 +441,14 @@ async fn command_auth_refresh_fetches_a_catalog_for_the_current_credentials() {
         .await;
     assert_eq!(manager.get_remote_models().await, catalog.models);
     auth.auth().await;
-    let bundled = codex_models_manager::bundled_models_response().unwrap();
+    let bundled = ModelsResponse {
+        models: codex_models_manager::bundled_models_response()
+            .unwrap()
+            .models
+            .into_iter()
+            .map(codex_models_manager::model_info::prefer_high_reasoning_default)
+            .collect(),
+    };
     assert_eq!(manager.get_remote_models().await, bundled.models);
     assert_eq!(manager.try_get_remote_models().unwrap(), bundled.models);
     assert_eq!(

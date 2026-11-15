@@ -137,6 +137,22 @@ pub const WAFER_US_BASE_URL: &str = "https://us.pass.wafer.ai/v1";
 pub fn is_wafer_model(model: &str) -> bool {
     model == WAFER_DSV41_FLASH_MODEL_ID
 }
+pub const DEEPINFRA_PROVIDER_ID: &str = "deepinfra";
+pub const DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+pub const DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+pub const DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID: &str = "deepinfra/deepseek-v4.1-flash-1017-flex";
+pub const DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID: &str =
+    "deepinfra/deepseek-v4.1-flash-1017-priority";
+pub fn deepinfra_service_tier(model: &str) -> Option<&'static str> {
+    match model {
+        DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID => Some("flex"),
+        DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID => Some("priority"),
+        _ => None,
+    }
+}
+pub fn is_deepinfra_model(model: &str) -> bool {
+    deepinfra_service_tier(model).is_some()
+}
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
@@ -885,6 +901,10 @@ other non-default provider fields are not supported"
         self.name == "Wafer"
     }
 
+    pub fn is_deepinfra(&self) -> bool {
+        self.name == "DeepInfra"
+    }
+
     pub fn is_lithos(&self) -> bool {
         self.name == "Lithos"
     }
@@ -909,6 +929,20 @@ other non-default provider fields are not supported"
         let mut provider = Self::create_openrouter_provider();
         provider.name = "Wafer".into();
         provider.base_url = Some(WAFER_US_BASE_URL.into());
+        provider.request_max_retries = Some(0);
+        provider.stream_max_retries = Some(0);
+        provider.capabilities = Some(ModelProviderCapabilities {
+            external_web_access: Some(false),
+            remote_compaction: Some(RemoteCompactionSupport::Unsupported),
+            ..Default::default()
+        });
+        provider
+    }
+
+    pub fn create_deepinfra_provider() -> ModelProviderInfo {
+        let mut provider = Self::create_openrouter_provider();
+        provider.name = "DeepInfra".into();
+        provider.base_url = Some(DEEPINFRA_BASE_URL.into());
         provider.request_max_retries = Some(0);
         provider.stream_max_retries = Some(0);
         provider.capabilities = Some(ModelProviderCapabilities {
@@ -961,6 +995,7 @@ pub fn built_in_model_providers(
         (OPENROUTER_PROVIDER_ID, P::create_openrouter_provider()),
         (LITHOS_PROVIDER_ID, P::create_lithos_provider()),
         (WAFER_PROVIDER_ID, P::create_wafer_provider()),
+        (DEEPINFRA_PROVIDER_ID, P::create_deepinfra_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -1050,9 +1085,12 @@ pub fn merge_configured_model_providers(
         } else if key == OPENROUTER_PROVIDER_ID
             || key == LITHOS_PROVIDER_ID
             || key == WAFER_PROVIDER_ID
+            || key == DEEPINFRA_PROVIDER_ID
         {
-            if matches!(key.as_str(), LITHOS_PROVIDER_ID | WAFER_PROVIDER_ID)
-                && provider.provider.is_some()
+            if matches!(
+                key.as_str(),
+                LITHOS_PROVIDER_ID | WAFER_PROVIDER_ID | DEEPINFRA_PROVIDER_ID
+            ) && provider.provider.is_some()
             {
                 return Err(format!(
                     "{key} does not support OpenRouter provider routing options"
@@ -1066,6 +1104,15 @@ pub fn merge_configured_model_providers(
                     .is_some_and(|url| url.trim_end_matches('/') != WAFER_US_BASE_URL)
             {
                 return Err("model_providers.wafer.base_url must use the Wafer US endpoint".into());
+            }
+            if key == DEEPINFRA_PROVIDER_ID
+                && base_url_override
+                    .as_deref()
+                    .is_some_and(|url| url.trim_end_matches('/') != DEEPINFRA_BASE_URL)
+            {
+                return Err(
+                    "model_providers.deepinfra.base_url must use the DeepInfra API endpoint".into(),
+                );
             }
             let auth_override = provider.auth.take();
             let http_headers_override = provider.http_headers.take();

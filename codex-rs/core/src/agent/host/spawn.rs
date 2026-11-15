@@ -47,9 +47,13 @@ async fn prepare_spawn_inputs(
     } = request;
     let caller = parent.session.thread_id;
     let instructions = parent.session.inherited_instructions().await;
-    let snapshot = options.environments.as_ref().ok_or_else(|| {
-        CodexErr::InvalidRequest("prepared spawn requires captured environments".into())
-    })?;
+    let snapshot = if options.fresh_environments {
+        None
+    } else {
+        Some(options.environments.as_ref().ok_or_else(|| {
+            CodexErr::InvalidRequest("prepared spawn requires captured environments".into())
+        })?)
+    };
     let (initial_history, history_mode, dynamic_tools) = if options.fork_mode.is_some() {
         let (history, mode) =
             prepare_forked_history(&state, &source, &options, &config, MultiAgentVersion::V2)
@@ -64,7 +68,11 @@ async fn prepare_spawn_inputs(
     if !std::ptr::eq(state.get_thread(caller).await?.as_ref(), parent) {
         return Err(CodexErr::ThreadNotFound(caller));
     }
-    let exec_policy = inherited_exec_policy_for_parent(parent, &config).await;
+    let exec_policy = if options.fresh_environments {
+        None
+    } else {
+        inherited_exec_policy_for_parent(parent, &config).await
+    };
     let mut thread_options = StartThreadOptions {
         session_source: Some(source),
         thread_source: Some(ThreadSource::Subagent),
@@ -80,13 +88,17 @@ async fn prepare_spawn_inputs(
             .prompt_cache_key_policy(),
         ..StartThreadOptions::new(config)
     };
-    thread_options
-        .thread_extension_init
-        .insert(snapshot.selected_capability_roots());
+    if let Some(snapshot) = snapshot {
+        thread_options
+            .thread_extension_init
+            .insert(snapshot.selected_capability_roots());
+    }
     thread_options
         .thread_extension_init
         .insert(HostToolInvocationLookup);
-    thread_options.inherited_environments = options.environments;
+    if !options.fresh_environments {
+        thread_options.inherited_environments = options.environments;
+    }
     let client_metadata = parent.session.app_server_client_metadata().await;
     let inheritance = PreparedChildInheritance {
         instructions,

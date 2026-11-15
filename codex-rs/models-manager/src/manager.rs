@@ -215,6 +215,17 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, Vec<CatalogModel>>;
 
+    /// The selected endpoint's catalog before shared picker overlays are applied.
+    /// Callers can use this to distinguish an advertised model from an overlay
+    /// with the same slug without discarding the overlay's tuned metadata.
+    fn provider_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        self.model_catalog_with_origins(refresh_strategy, http_client_factory)
+    }
+
     /// Best-effort refresh when the in-memory catalog belongs to different credentials.
     /// Static catalogs need no refresh. Failures follow the catalog's fallback policy.
     fn refresh_after_auth_change(
@@ -359,6 +370,15 @@ impl ModelsManagerOverlay {
 }
 
 impl ModelsManager for ModelsManagerOverlay {
+    fn provider_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        self.inner
+            .provider_catalog_with_origins(refresh_strategy, http_client_factory)
+    }
+
     fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
         self.inner.for_originator(originator).map(|inner| {
             Arc::new(Self::new(
@@ -571,6 +591,7 @@ pub struct OpenAiModelsManager {
     endpoint_client: SharedModelsEndpointClient,
     catalog_source: CatalogSource,
     auth_manager: Option<Arc<AuthManager>>,
+    prefer_high_reasoning_default: bool,
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -642,13 +663,22 @@ impl OpenAiModelsManager {
             endpoint_client,
             catalog_source: CatalogSource::Default,
             auth_manager,
+            prefer_high_reasoning_default: false,
         }
+    }
+
+    /// Apply High as the native OpenAI catalog default without changing a
+    /// model's supported effort ladder or a session's explicit effort.
+    pub fn with_high_reasoning_default(mut self) -> Self {
+        self.prefer_high_reasoning_default = true;
+        self
     }
 
     /// Configure a newly constructed manager to use only the provider's explicit catalog.
     /// Clear the bundled seed before sharing it; the existing auth identity must be retained.
     pub fn with_provider_catalog(mut self) -> Self {
         self.catalog_source = CatalogSource::ExplicitProvider(Mutex::new(()));
+        self.prefer_high_reasoning_default = false;
         self.remote_models.get_mut().entry.models.clear();
         self
     }
@@ -719,7 +749,7 @@ impl ModelsManager for OpenAiModelsManager {
                 error!("failed to refresh available models: {err}");
             }
             let state = self.remote_models.read().await;
-            state.model_catalog(self.models_for_entry(&state.entry))
+            state.model_catalog(self.models_for_entry(&state))
         })
     }
 
@@ -740,6 +770,9 @@ impl ModelsManager for OpenAiModelsManager {
             .as_ref()
             .and_then(|cache| cache.for_originator(originator));
         let mut manager = Self::with_settings(settings, endpoint, self.auth_manager.clone());
+        if self.prefer_high_reasoning_default {
+            manager = manager.with_high_reasoning_default();
+        }
         if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
             manager = manager.with_provider_catalog();
         }
@@ -786,18 +819,13 @@ impl ModelsManager for OpenAiModelsManager {
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
             let entry = self.remote_models.read().await;
-            self.models_for_entry(&entry.entry)
-                .into_models()
-                .into_owned()
+            self.models_for_entry(&entry).into_models().into_owned()
         })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
         let entry = self.remote_models.try_read()?;
-        Ok(self
-            .models_for_entry(&entry.entry)
-            .into_models()
-            .into_owned())
+        Ok(self.models_for_entry(&entry).into_models().into_owned())
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
@@ -813,7 +841,7 @@ impl ModelsManager for OpenAiModelsManager {
         Box::pin(async move {
             let remote = {
                 let entry = self.remote_models.read().await;
-                let selected = self.models_for_entry(&entry.entry);
+                let selected = self.models_for_entry(&entry);
                 let models = match &selected {
                     SelectedCatalog::CurrentSnapshot(models)
                     | SelectedCatalog::Fallback(models) => models,
@@ -853,8 +881,9 @@ impl ModelsManager for OpenAiModelsManager {
 
 impl OpenAiModelsManager {
     /// Selects the catalog available under the current provider and auth identity.
-    fn models_for_entry<'a>(&self, entry: &'a ModelsCacheEntry) -> SelectedCatalog<'a> {
-        if !self.api_key_discovery_disabled()
+    fn models_for_entry<'a>(&self, state: &'a CatalogState) -> SelectedCatalog<'a> {
+        let entry = &state.entry;
+        let selected = if !self.api_key_discovery_disabled()
             && entry.identity.is_some()
             && entry.identity == self.endpoint_client.identity()
         {
@@ -863,6 +892,37 @@ impl OpenAiModelsManager {
             SelectedCatalog::Fallback(Cow::Owned(
                 self.catalog_source.fallback_models().unwrap_or_default(),
             ))
+        };
+        if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
+            return selected;
+        }
+        let prefer_high = |models: Cow<'a, [ModelInfo]>, current: bool| {
+            Cow::Owned(
+                models
+                    .into_owned()
+                    .into_iter()
+                    .map(|model| {
+                        // The shared picker carries bundled OpenAI rows even
+                        // when a local provider owns the current session.
+                        if self.prefer_high_reasoning_default
+                            || !current
+                            || !state.provider_model_ids.contains(&model.slug)
+                        {
+                            model_info::prefer_high_reasoning_default(model)
+                        } else {
+                            model
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        match selected {
+            SelectedCatalog::CurrentSnapshot(models) => {
+                SelectedCatalog::CurrentSnapshot(prefer_high(models, true))
+            }
+            SelectedCatalog::Fallback(models) => {
+                SelectedCatalog::Fallback(prefer_high(models, false))
+            }
         }
     }
 
@@ -1235,7 +1295,11 @@ impl ModelsManager for StaticModelsManager {
 }
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
-    Ok(crate::bundled_models_response()?.models)
+    Ok(crate::bundled_models_response()?
+        .models
+        .into_iter()
+        .map(model_info::prefer_high_reasoning_default)
+        .collect())
 }
 
 fn default_model_from_available(available: Vec<ModelPreset>) -> String {

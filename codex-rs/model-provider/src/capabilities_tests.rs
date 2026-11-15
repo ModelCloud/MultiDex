@@ -83,6 +83,22 @@ fn multidex_provider_enables_v2_remote_compaction() {
 }
 
 #[test]
+fn deepinfra_uses_portable_function_tools_without_remote_compaction() {
+    let capabilities = create_model_provider(
+        ModelProviderInfo::create_deepinfra_provider(),
+        /*auth_manager*/ None,
+    )
+    .capabilities();
+    assert!(!capabilities.namespace_tools);
+    assert!(!capabilities.web_search);
+    assert!(!capabilities.image_generation);
+    assert_eq!(
+        capabilities.remote_compaction,
+        RemoteCompactionSupport::Unsupported
+    );
+}
+
+#[test]
 fn multidex_remote_compaction_override_wins() {
     let info = ModelProviderInfo {
         multidex_compatibility: true,

@@ -1255,6 +1255,48 @@ fn wafer_provider_is_us_only_and_uses_configured_token() {
 }
 
 #[test]
+fn deepinfra_provider_uses_responses_and_exact_endpoint() {
+    let configured: ModelProviderInfo = toml::from_str(
+        "base_url = \"https://api.deepinfra.com/v1/openai\"\nexperimental_bearer_token = \"test-token\"",
+    )
+    .unwrap();
+    let merged = merge_configured_model_providers(
+        built_in_model_providers(None),
+        HashMap::from([(DEEPINFRA_PROVIDER_ID.to_string(), configured)]),
+    )
+    .unwrap();
+    let provider = merged.get(DEEPINFRA_PROVIDER_ID).unwrap();
+    assert_eq!(provider.base_url.as_deref(), Some(DEEPINFRA_BASE_URL));
+    assert!(!provider.supports_responses_continuation);
+    assert_eq!(
+        provider
+            .experimental_bearer_token
+            .clone()
+            .map(|token| token.into_inner())
+            .as_deref(),
+        Some("test-token")
+    );
+    assert_eq!(
+        deepinfra_service_tier(DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID),
+        Some("flex")
+    );
+    assert_eq!(
+        deepinfra_service_tier(DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID),
+        Some("priority")
+    );
+
+    let wrong_endpoint: ModelProviderInfo =
+        toml::from_str("base_url = \"https://example.com/v1\"").unwrap();
+    assert!(
+        merge_configured_model_providers(
+            built_in_model_providers(None),
+            HashMap::from([(DEEPINFRA_PROVIDER_ID.to_string(), wrong_endpoint)]),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn test_openrouter_override_rejects_unsupported_fields() {
     let configured: ModelProviderInfo = toml::from_str(
         r#"

@@ -2855,12 +2855,18 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         .properties
         .as_ref()
         .expect("spawn_agent should use object params");
-    for property in ["model", "reasoning_effort"] {
+    for property in [
+        "agent_type",
+        "provider",
+        "model",
+        "reasoning_effort",
+        "review_repository",
+        "review_ref",
+        "review_pull_request",
+    ] {
         assert!(spawn_agent_properties.contains_key(property));
     }
-    for property in ["agent_type", "service_tier"] {
-        assert!(!spawn_agent_properties.contains_key(property));
-    }
+    assert!(!spawn_agent_properties.contains_key("service_tier"));
     let spawn_agent_description = spawn_agent.description.as_str();
     assert!(!spawn_agent_description.contains("max_concurrent_threads_per_session"));
     assert!(spawn_agent_description.contains(
@@ -2950,7 +2956,14 @@ async fn openai_multi_agent_v2_uses_reserved_collaboration_schemas() {
             .properties
             .as_ref()
             .expect("tool should use object params");
-        for extension in ["provider", "model", "reasoning_effort"] {
+        for extension in [
+            "provider",
+            "model",
+            "reasoning_effort",
+            "review_repository",
+            "review_ref",
+            "review_pull_request",
+        ] {
             assert!(
                 !properties.contains_key(extension),
                 "{tool_name} must not expose {extension} to OpenAI"
@@ -2973,6 +2986,32 @@ async fn non_openai_multi_agent_v2_keeps_provider_overrides() {
         plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
             .contains(&"set_agent_settings".to_string())
     );
+    let Some(ResponsesApiNamespaceTool::Function(spawn_agent)) =
+        namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent")
+        })
+    else {
+        panic!("expected spawn_agent in {MULTI_AGENT_V2_NAMESPACE} namespace");
+    };
+    let spawn_properties = spawn_agent
+        .parameters
+        .properties
+        .as_ref()
+        .expect("spawn_agent should use object params");
+    for field in [
+        "agent_type",
+        "provider",
+        "model",
+        "reasoning_effort",
+        "review_repository",
+        "review_ref",
+        "review_pull_request",
+    ] {
+        assert!(
+            spawn_properties.contains_key(field),
+            "non-OpenAI spawn_agent should expose {field} with default config"
+        );
+    }
     for tool_name in ["spawn_agent", "send_message", "followup_task"] {
         let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
             matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name)
@@ -3005,6 +3044,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
             "followup_task".to_string(),
             "interrupt_agent".to_string(),
             "list_agents".to_string(),
+            "resolve_model".to_string(),
             "send_message".to_string(),
             "set_agent_settings".to_string(),
             "spawn_agent".to_string(),
