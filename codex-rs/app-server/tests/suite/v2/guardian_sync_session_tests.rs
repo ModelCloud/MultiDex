@@ -434,10 +434,17 @@ async fn managed_reviewers_reuse_fork_and_resume_after_parent_shutdown(
     assert_ne!(concurrent_ids[0], concurrent_ids[1]);
     assert!(concurrent_ids.contains(&&seed["client_metadata"]["thread_id"]));
     for review in [&seed, &first, &second] {
-        assert_eq!(
-            review["prompt_cache_key"],
-            format!("guardian:{}", parent.id)
+        // Parent-scoped so reviews of one thread can share the parent link, but
+        // each review thread has its own suffix: a parent-only key made the
+        // concurrent reviews overwrite one another's continuation record.
+        let key = review["prompt_cache_key"]
+            .as_str()
+            .expect("guardian prompt cache key");
+        assert!(
+            key.starts_with(&format!("guardian:{}:", parent.id)),
+            "unexpected guardian prompt cache key {key}"
         );
+        assert!(key.len() <= 64);
         let metadata: Value = serde_json::from_str(
             review["client_metadata"]["x-codex-turn-metadata"]
                 .as_str()
@@ -450,6 +457,8 @@ async fn managed_reviewers_reuse_fork_and_resume_after_parent_shutdown(
                 .contains("Keep this project private.")
         );
     }
+    assert_ne!(seed["prompt_cache_key"], first["prompt_cache_key"]);
+    assert_ne!(first["prompt_cache_key"], second["prompt_cache_key"]);
     for review in [&first, &second] {
         assert!(
             review["input"]
