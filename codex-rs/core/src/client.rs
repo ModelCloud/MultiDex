@@ -1279,7 +1279,17 @@ impl ModelClient {
             return format!("{source}:{parent_thread_id}");
         }
 
-        metadata.session_id.clone()
+        // A session can host several interleaved threads (windows, forks,
+        // spawned subagents). A session-wide key made those threads overwrite
+        // each other's continuation record on servers that retain one record
+        // per `prompt_cache_key`, so every turn re-prefilled a very large
+        // prompt. Disambiguate with the thread's random tail: the Responses
+        // API caps the key at 64 bytes and a second full UUID does not fit.
+        format!(
+            "{}:{}",
+            metadata.session_id,
+            thread_cache_tag(&metadata.thread_id)
+        )
     }
 
     // ChatGPT derives cache affinity from the Responses session-id header. Keep the
@@ -4213,6 +4223,19 @@ impl WebsocketTelemetry for ApiTelemetry {
         self.session_telemetry
             .record_websocket_event(result, duration);
     }
+}
+
+/// Stable, compact disambiguator for a thread id.
+///
+/// `prompt_cache_key` is capped at 64 bytes by the Responses API and a session
+/// id is already 36, so a second full UUID does not fit. Thread ids are UUIDv7:
+/// the leading segment is time-ordered and nearly identical for threads created
+/// in the same session, while the trailing eight hex characters are the random
+/// part. Those are stable for the life of the thread.
+fn thread_cache_tag(thread_id: &str) -> &str {
+    thread_id
+        .get(thread_id.len().saturating_sub(8)..)
+        .unwrap_or(thread_id)
 }
 
 #[cfg(test)]

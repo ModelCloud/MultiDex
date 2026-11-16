@@ -2050,6 +2050,7 @@ impl Session {
                 crate::guardian::prompt_cache_key_override_for_review_session(
                     &session_configuration.session_source,
                     session_configuration.parent_thread_id,
+                    Some(thread_id),
                 )
                 .or(fork_cache_key),
                 tx_event.clone(),

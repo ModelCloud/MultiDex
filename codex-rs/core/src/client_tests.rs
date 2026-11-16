@@ -2052,6 +2052,43 @@ fn internal_session_prompt_cache_key_is_scoped_to_parent_thread() {
 }
 
 #[test]
+fn session_prompt_cache_key_is_scoped_to_the_thread() {
+    let client = test_model_client(SessionSource::Cli);
+    let session_id = "01a1d90c-33f4-7be3-9499-643c63ab1430";
+    let thread_a = "01a1e2a4-6bca-7bc2-b8b1-7dd8ae0ce7c8";
+    let thread_b = "01a1e2a9-1111-2222-3333-444455556666";
+    let metadata = |thread_id: &str| {
+        test_responses_metadata(
+            TEST_INSTALLATION_ID,
+            session_id,
+            thread_id,
+            Some("turn-123"),
+            "window-1".to_string(),
+            &client.state.session_source,
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        )
+    };
+
+    let key = client
+        .prompt_cache_key(&metadata(thread_a))
+        .expect("session-derived prompt cache key");
+    let tag = &thread_a[thread_a.len() - 8..];
+    assert_eq!(key, format!("{session_id}:{tag}"));
+    assert!(
+        key.len() <= 64,
+        "prompt_cache_key must fit the Responses API limit: {key}"
+    );
+    // A second thread in the same session must not reuse the record.
+    assert_ne!(
+        key,
+        client
+            .prompt_cache_key(&metadata(thread_b))
+            .expect("other thread key")
+    );
+}
+
+#[test]
 fn build_subagent_headers_sets_internal_memory_consolidation_label() {
     let client = test_model_client(SessionSource::Internal(
         InternalSessionSource::MemoryConsolidation,
