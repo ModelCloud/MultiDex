@@ -156,6 +156,7 @@ use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::tool_contract::ToolContract;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -610,6 +611,8 @@ struct ModelClientState {
     cached_http_session: StdMutex<HttpSession>,
     /// Last full tool list used for sampling, retained across turns and connection resets.
     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
+    /// Tool declarations this thread has advertised to a prefix-cached provider.
+    tool_contract: StdMutex<ToolContract>,
 }
 
 impl std::fmt::Debug for ModelClientState {
@@ -1114,6 +1117,8 @@ impl ModelClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
             ),
+            // Another provider keeps no cached prefix from this one.
+            tool_contract: StdMutex::new(ToolContract::default()),
         });
         client
     }
@@ -1186,6 +1191,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 cached_http_session: StdMutex::new(HttpSession::default()),
                 last_inference_tools: StdMutex::new(None),
+                tool_contract: StdMutex::new(ToolContract::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_policy: PromptCacheKey::default(),
@@ -2130,6 +2136,28 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    /// Returns the thread's stable tool declarations for providers that cache the prompt
+    /// prefix, or `None` when `tools` should be advertised as captured.
+    pub(crate) fn stable_inference_tools(
+        &self,
+        model: &str,
+        window_id: &str,
+        tools: &Arc<[ToolSpec]>,
+    ) -> Option<Arc<[ToolSpec]>> {
+        let provider = self.client.provider_info();
+        if tools.is_empty() || !(provider.multidex_compatibility || provider.is_deepinfra()) {
+            return None;
+        }
+        Some(
+            self.client
+                .state
+                .tool_contract
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .advertise(model, window_id, tools),
+        )
+    }
+
     pub(crate) fn inference_tools_changed(&self, tools: &Arc<[ToolSpec]>) -> bool {
         let previous = self
             .client
