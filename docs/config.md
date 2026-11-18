@@ -78,13 +78,13 @@ model_reasoning_effort = "max"
 The canonical display name across providers is **DeepSeek v4.1 Flash**.
 Provider-specific wire IDs remain distinct:
 
-| Provider | Speed | Wire model ID |
-| --- | --- | --- |
-| Local | Regular | `DS v4.1 Flash 1017` |
-| OpenRouter | Regular | `deepseek/deepseek-v4.1-flash-1017` |
-| Lithos | Regular | `deepseek-ai/DeepSeek-V4.1-Flash` |
-| Lithos | Fast | `deepseek-ai/DeepSeek-V4.1-Flash-fast` |
-| Lithos | Ultra | `deepseek-ai/DeepSeek-V4.1-Flash-ultra` |
+| Provider   | Speed   | Wire model ID                           |
+| ---------- | ------- | --------------------------------------- |
+| Local      | Regular | `DS v4.1 Flash 1017`                    |
+| OpenRouter | Regular | `deepseek/deepseek-v4.1-flash-1017`     |
+| Lithos     | Regular | `deepseek-ai/DeepSeek-V4.1-Flash`       |
+| Lithos     | Fast    | `deepseek-ai/DeepSeek-V4.1-Flash-fast`  |
+| Lithos     | Ultra   | `deepseek-ai/DeepSeek-V4.1-Flash-ultra` |
 
 All entries select the 1017 revision. Lithos's IDs omit the revision suffix;
 do not invent an extra suffix in API requests. Reasoning is `off`, `low`,

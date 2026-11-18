@@ -9,6 +9,43 @@ use crossterm::event::KeyCode;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn multidex_model_selection_switches_provider_with_model() {
+    let mut app = make_test_app().await;
+    app.config.model = Some("DS v4.1 Flash 1017".to_string());
+    app.config.model_provider_id = "multidex".to_string();
+    app.active_thread_id = Some(ThreadId::new());
+
+    let official = app
+        .active_thread_model_setting_update_params("gpt-5.6-sol".to_string())
+        .expect("active thread should produce update params");
+    assert_eq!(official.model_provider, Some("openai".to_string()));
+
+    app.config.model_provider_id = "omnigent-multidex-test".to_string();
+    let official_from_omnigent = app
+        .active_thread_model_setting_update_params("gpt-6-sol".to_string())
+        .expect("active thread should produce update params");
+    assert_eq!(
+        official_from_omnigent.model_provider,
+        Some("openai".to_string())
+    );
+
+    let local = app
+        .active_thread_model_setting_update_params("DS v4.1 Flash 1017".to_string())
+        .expect("active thread should produce update params");
+    assert_eq!(local.model_provider, Some("multidex".to_string()));
+
+    app.config.model = Some("gpt-5.6-sol".to_string());
+    app.config.model_provider_id = "openai".to_string();
+    let local_from_openai = app
+        .active_thread_model_setting_update_params("DS v4.1 Flash 1017".to_string())
+        .expect("active thread should produce update params");
+    assert_eq!(
+        local_from_openai.model_provider,
+        Some("multidex".to_string())
+    );
+}
+
+#[tokio::test]
 async fn session_model_selection_preserves_defaults_and_updates_active_thread() -> Result<()> {
     for mode in [ModeKind::Default, ModeKind::Plan] {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;

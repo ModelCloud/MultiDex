@@ -2,11 +2,11 @@
 
 ### System requirements
 
-| Requirement                 | Details                                                         |
-| --------------------------- | --------------------------------------------------------------- |
+| Requirement                 | Details                                                                  |
+| --------------------------- | ------------------------------------------------------------------------ |
 | Operating systems           | Linux x86_64/ARM64 (Ubuntu 20.04+/Debian 10+ or compatible), macOS ARM64 |
-| Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
-| RAM                         | 4-GB minimum (8-GB recommended)                                 |
+| Git (optional, recommended) | 2.23+ for built-in PR helpers                                            |
+| RAM                         | 4-GB minimum (8-GB recommended)                                          |
 
 ### Install the MultiDex release
 
