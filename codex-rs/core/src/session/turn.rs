@@ -3461,6 +3461,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
+    let settlement_started = Arc::clone(&stream.settlement_started);
     let mut multidex_preempted = false;
     // Sending the request starts the first item, even before the first stream event arrives.
     let mut between_items = false;
@@ -3512,7 +3513,10 @@ async fn try_run_sampling_request(
                 completed_tools.push(output);
                 continue;
             }
-            () = multidex_preemption(), if !multidex_preempted && !stream.settlement_started.load(Ordering::Acquire) => {
+            () = multidex_preemption(), if !multidex_preempted && !settlement_started.load(Ordering::Acquire) => {
+                if settlement_started.load(Ordering::Acquire) {
+                    continue;
+                }
                 // The replacement request reuses the last stored response. Let the
                 // mapper finish accounting for any terminal event it already owns.
                 multidex_preempted = true;
