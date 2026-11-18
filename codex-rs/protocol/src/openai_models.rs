@@ -591,6 +591,7 @@ impl ModelInfo {
                 | "deepseek/deepseek-v4.1-flash-1017"
                 | "deepinfra/deepseek-v4.1-flash-1017-flex"
                 | "deepinfra/deepseek-v4.1-flash-1017-priority"
+                | "deepinfra/deepseek-v4.1-flash-1017-auto"
                 | "deepseek-ai/DeepSeek-V4.1-Flash"
                 | "deepseek-ai/DeepSeek-V4.1-Flash-fast"
                 | "deepseek-ai/DeepSeek-V4.1-Flash-ultra"

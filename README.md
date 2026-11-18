@@ -45,6 +45,10 @@ OpenRouter is built in: set `experimental_bearer_token` under
 for Wafer-only routing. Both the local and OpenRouter DS v4.1 Flash entries
 default to Max reasoning and use the DeepSeek Harness prompt adapted to MultiDex's tools.
 
+For DeepInfra, choose **Auto** in `/model` to start each request on lower-cost Flex
+and fall back to Priority after three 5-second Flex retries for capacity errors
+(HTTP 429/529), timeouts, or dropped connections. See [DeepInfra configuration](docs/config.md#deepinfra).
+
 MultiDex keeps the built-in `openai` provider and its normal ChatGPT/API-key
 authentication. Add custom providers by name in `CODEX_HOME/config.toml`; each
 provider has its own endpoint and bearer-token environment variable:

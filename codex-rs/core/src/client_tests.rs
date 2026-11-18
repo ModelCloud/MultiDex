@@ -6,6 +6,7 @@ use super::ModelClient;
 use super::NonIncrementalReason;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::SamplingOptions;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -18,6 +19,11 @@ use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::MAX_MCP_ATTRIBUTION_BYTES;
 use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
+use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
+use crate::responses_retry::handle_response_stream_error;
+use crate::session::step_context::StepContext;
+use crate::session::tests::make_session_and_context;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use base64::Engine;
@@ -41,6 +47,8 @@ use codex_model_provider::ProviderUnauthorizedRecovery;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -426,6 +434,7 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
 #[test]
 fn deepinfra_variants_use_one_wire_model_and_session_cache_key() -> anyhow::Result<()> {
     for (slug, tier) in [
+        (DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID, "flex"),
         (
             codex_model_provider_info::DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID,
             "flex",
@@ -458,10 +467,7 @@ fn deepinfra_variants_use_one_wire_model_and_session_cache_key() -> anyhow::Resu
             &metadata,
             /*include_internal*/ true,
         )?;
-        assert_eq!(
-            request.model,
-            codex_model_provider_info::DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID
-        );
+        assert_eq!(request.model, DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID);
         assert_eq!(request.service_tier.as_deref(), Some(tier));
         assert!(!request.store);
         assert!(request.prompt_cache_key.is_some());
@@ -480,6 +486,148 @@ fn deepinfra_variants_use_one_wire_model_and_session_cache_key() -> anyhow::Resu
             Some(ReasoningEffort::None)
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -> anyhow::Result<()>
+{
+    let server = MockServer::start().await;
+    let attempt = AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            match attempt.fetch_add(1, Ordering::SeqCst) {
+                0 | 3 => ResponseTemplate::new(429),
+                1 | 4 => ResponseTemplate::new(529),
+                2 => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"interrupted\"}}\n\n",
+                    ),
+                5 => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"recovered\"}}\n\n",
+                    ),
+                _ => panic!("unexpected extra attempt"),
+            }
+        })
+        .expect(6)
+        .mount(&server)
+        .await;
+
+    let (session, mut turn) = make_session_and_context().await;
+    let mut info = ModelProviderInfo::create_deepinfra_provider();
+    info.base_url = Some(format!("{}/v1", server.uri()));
+    turn.provider = create_model_provider(info, /*auth_manager*/ None);
+    let client = test_model_client(SessionSource::Cli).with_provider(Arc::clone(&turn.provider));
+    let step = StepContext::for_test(Arc::new(turn));
+    let mut client_session = client.new_session();
+    let model =
+        codex_models_manager::model_info::model_info_from_slug(DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID);
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let prompt = Arc::new(Prompt::default());
+    let trace = InferenceTraceContext::disabled();
+    let mut retry = ResponsesStreamRetryState::for_sampling(client.provider_info(), &model.slug);
+    'attempts: for (index, expected_status) in
+        [Some(429), Some(529), None, Some(429), Some(529), None]
+            .into_iter()
+            .enumerate()
+    {
+        if index == 5 {
+            // Start a new logical request on the very same client session.
+            retry = ResponsesStreamRetryState::for_sampling(client.provider_info(), &model.slug);
+        }
+        let opened = client_session
+            .open_model_response(
+                &prompt,
+                &model,
+                &step.session_telemetry,
+                SamplingOptions {
+                    reasoning_effort: None,
+                    reasoning_summary: codex_protocol::config_types::ReasoningSummary::None,
+                    service_tier: Some("priority".to_string()),
+                    deepinfra_auto_priority: retry.use_deepinfra_priority(),
+                },
+                &metadata,
+                &trace,
+            )
+            .await;
+        let error = match opened {
+            Err(error) => error,
+            Ok(opened) => {
+                let mut stream = opened.into_raw_stream()?;
+                loop {
+                    match stream.next().await.expect("response stream terminal event") {
+                        Ok(ResponseEvent::Completed { .. }) => {
+                            assert_eq!(index, 5, "only the fresh request should complete");
+                            break 'attempts;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            assert_eq!(index, 2, "only the interrupted request has a body error");
+                            assert!(matches!(error.details(), CodexErrorDetails::Stream(_)));
+                            break error;
+                        }
+                    }
+                }
+            }
+        };
+        assert_eq!(error.http_status_code_value(), expected_status);
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let result = handle_response_stream_error(
+            &mut retry,
+            /*max_retries*/ 0,
+            error,
+            &mut client_session,
+            &session,
+            &step,
+            ResponsesStreamRequest::Sampling,
+        )
+        .await;
+        let elapsed = start.elapsed();
+        tokio::time::resume();
+        if index == 4 {
+            assert_eq!(
+                result
+                    .expect_err("no retry on Priority")
+                    .http_status_code_value(),
+                Some(529)
+            );
+        } else {
+            result?;
+        }
+        if index < 3 {
+            let delay = Duration::from_secs(5);
+            assert!((delay..=delay + Duration::from_millis(1)).contains(&elapsed));
+        } else {
+            assert_eq!(elapsed, Duration::ZERO);
+        }
+    }
+
+    let received = server.received_requests().await.expect("mock requests");
+    let cache_key = client.prompt_cache_key(&metadata).expect("prompt cache key");
+    let tiers = received
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = request.body_json()?;
+            assert_eq!(body["model"], DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID);
+            assert_eq!(body["prompt_cache_key"], cache_key);
+            Ok(body["service_tier"]
+                .as_str()
+                .expect("service tier")
+                .to_owned())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(tiers, ["flex", "flex", "flex", "flex", "priority", "flex"]);
     Ok(())
 }
 

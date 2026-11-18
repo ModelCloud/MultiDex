@@ -2338,7 +2338,10 @@ async fn run_sampling_request(
         &step_context.session_telemetry,
         incremental_tools,
     );
-    let mut retry_state = ResponsesStreamRetryState::default();
+    let mut retry_state = ResponsesStreamRetryState::for_sampling(
+        turn_context.provider.info(),
+        &step_context.settings.model_info.slug,
+    );
     let mut initial_input = Some(input);
     let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
@@ -2425,6 +2428,7 @@ async fn run_sampling_request(
             sampling_step_context,
             Arc::clone(&turn_store),
             client_session,
+            retry_state.use_deepinfra_priority(),
             &responses_metadata,
             prompt,
             pending_audio,
@@ -3329,6 +3333,7 @@ async fn try_run_sampling_request(
     step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     client_session: &mut ModelClientSession,
+    deepinfra_auto_priority: bool,
     responses_metadata: &CodexResponsesMetadata,
     mut prompt: Prompt,
     mut pending_audio: Option<codex_history::AcceptedFileAudio>,
@@ -3425,6 +3430,7 @@ async fn try_run_sampling_request(
                     reasoning_effort: effort.clone(),
                     reasoning_summary: step_context.settings.reasoning_summary,
                     service_tier: step_context.settings.service_tier.clone(),
+                    deepinfra_auto_priority,
                 },
                 responses_metadata,
                 &inference_trace,

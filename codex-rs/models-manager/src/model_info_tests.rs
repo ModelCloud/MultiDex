@@ -320,7 +320,7 @@ fn deepinfra_variants_share_the_local_context_budget() {
         .iter()
         .filter(|model| DEEPINFRA_DSV41_FLASH.contains(&model.slug.as_str()))
         .collect();
-    assert_eq!(deepinfra.len(), 2);
+    assert_eq!(deepinfra.len(), 3);
     for model in deepinfra {
         assert_eq!(model.context_window, local.context_window);
         assert_eq!(
@@ -453,6 +453,7 @@ fn deepseek_provider_switches_share_local_context_and_compaction_budget() {
         WAFER_DSV41_FLASH,
         DEEPINFRA_DSV41_FLASH[0],
         DEEPINFRA_DSV41_FLASH[1],
+        DEEPINFRA_DSV41_FLASH[2],
         LITHOS_DSV41_FLASH[0],
         LITHOS_DSV41_FLASH[1],
         LITHOS_DSV41_FLASH[2],
@@ -479,6 +480,7 @@ fn deepseek_without_local_snapshot_clamps_oversized_config_override() {
         WAFER_DSV41_FLASH,
         DEEPINFRA_DSV41_FLASH[0],
         DEEPINFRA_DSV41_FLASH[1],
+        DEEPINFRA_DSV41_FLASH[2],
         OPENROUTER_DSV41_FLASH,
     ] {
         let model = with_config_overrides(model_info_from_slug(slug), &config);

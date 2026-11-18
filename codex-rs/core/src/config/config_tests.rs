@@ -1374,6 +1374,11 @@ async fn endpoint_model_selects_its_provider_and_preserves_other_routes() -> std
             "deepinfra",
         ),
         ("gpt-5.6-sol", "deepinfra", "openai"),
+        (
+            "deepinfra/deepseek-v4.1-flash-1017-auto",
+            "openai",
+            "deepinfra",
+        ),
     ] {
         let cfg = toml::from_str::<ConfigToml>(&format!(
             r#"

@@ -24,6 +24,7 @@ use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::DeepInfraAutoRetry;
 use crate::session::FileAudioDurations;
 use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
@@ -304,6 +305,10 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    let mut deepinfra_auto = DeepInfraAutoRetry::for_request(
+        turn_context.provider.info(),
+        &turn_context.model_info().slug,
+    );
     // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
     // request tracking) survives retries within this compact turn.
     let mut client_session = sess
@@ -349,6 +354,9 @@ async fn run_compact_task_inner_impl(
             &sess,
             &step_context,
             &mut client_session,
+            deepinfra_auto
+                .as_ref()
+                .is_some_and(DeepInfraAutoRetry::use_priority),
             &responses_metadata,
             &Arc::new(prompt),
             compaction_metadata.phase(),
@@ -371,6 +379,11 @@ async fn run_compact_task_inner_impl(
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 return Err(e);
+            }
+            Err(e) if let Some(auto) = &mut deepinfra_auto => {
+                auto.retry(&sess, &turn_context, e)
+                    .or_cancel(&step_context.turn_cancellation)
+                    .await??;
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ServerOverloaded) => {
                 // Capacity rejections are transient: keep retrying at a fixed
@@ -887,11 +900,13 @@ struct CompactionResponse {
     output: Vec<ResponseItem>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_to_completed(
     request: &mut crate::hook_runtime::sampling::SamplingRequest,
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
     client_session: &mut ModelClientSession,
+    deepinfra_auto_priority: bool,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Arc<Prompt>,
     phase: CompactionPhase,
@@ -918,6 +933,7 @@ async fn drain_to_completed(
                         .await,
                     reasoning_summary: turn_context.reasoning_summary(),
                     service_tier: turn_context.config.service_tier.clone(),
+                    deepinfra_auto_priority,
                 },
                 responses_metadata,
                 // Rollout tracing currently models remote compaction only; local compaction streams

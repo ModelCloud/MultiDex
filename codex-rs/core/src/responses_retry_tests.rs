@@ -1,3 +1,4 @@
+use super::DeepInfraAutoRetry;
 use super::ResponsesStreamRequest;
 use super::ResponsesStreamRetryState;
 use super::handle_response_stream_error;
@@ -6,12 +7,64 @@ use crate::realtime_history::RealtimeHistoryState;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use codex_http_client::RetryAfter;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing_test::internal::MockWriter;
+
+#[test]
+fn deepinfra_auto_retries_timeouts_but_not_unrelated_errors() {
+    let deepinfra = ModelProviderInfo::create_deepinfra_provider();
+    let mut auto = DeepInfraAutoRetry::for_request(&deepinfra, DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID)
+        .expect("Auto policy");
+    for err in [
+        CodexErr::InvalidRequest("bad input".to_string()),
+        CodexErr::QuotaExceeded,
+        CodexErr::InternalServerError,
+        CodexErr::Stream("unrelated response failure".to_string()),
+    ] {
+        assert!(auto.next(&err).is_none(), "{err}");
+    }
+    for err in [
+        CodexErr::RequestTimeout,
+        CodexErr::Stream("idle timeout waiting for SSE".to_string()),
+        CodexErr::Stream("Transport error: connection reset".to_string()),
+    ] {
+        assert_eq!(
+            auto.next(&err).expect("Flex retry").0,
+            Duration::from_secs(5)
+        );
+        assert!(!auto.use_priority());
+    }
+    assert_eq!(
+        auto.next(&CodexErr::RequestTimeout)
+            .expect("Priority fallback")
+            .0,
+        Duration::ZERO
+    );
+    assert!(auto.use_priority());
+    assert!(auto.next(&CodexErr::RequestTimeout).is_none());
+
+    for model in [
+        DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID,
+        DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID,
+    ] {
+        assert!(DeepInfraAutoRetry::for_request(&deepinfra, model).is_none());
+    }
+    assert!(
+        DeepInfraAutoRetry::for_request(
+            &ModelProviderInfo::create_openrouter_provider(),
+            DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID,
+        )
+        .is_none()
+    );
+}
 
 #[tokio::test]
 async fn sampling_retry_logs_stream_error_context() {

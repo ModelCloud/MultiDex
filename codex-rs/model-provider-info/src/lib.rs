@@ -141,18 +141,44 @@ pub fn is_wafer_model(model: &str) -> bool {
 pub const DEEPINFRA_PROVIDER_ID: &str = "deepinfra";
 pub const DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 pub const DEEPINFRA_DSV41_FLASH_WIRE_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+pub const DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID: &str = "deepinfra/deepseek-v4.1-flash-1017-auto";
 pub const DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID: &str = "deepinfra/deepseek-v4.1-flash-1017-flex";
 pub const DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID: &str =
     "deepinfra/deepseek-v4.1-flash-1017-priority";
-pub fn deepinfra_service_tier(model: &str) -> Option<&'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepInfraVariant {
+    Auto,
+    Flex,
+    Priority,
+}
+
+impl DeepInfraVariant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Flex => "Flex",
+            Self::Priority => "Priority",
+        }
+    }
+
+    pub fn initial_service_tier(self) -> &'static str {
+        match self {
+            Self::Auto | Self::Flex => "flex",
+            Self::Priority => "priority",
+        }
+    }
+}
+
+pub fn deepinfra_variant(model: &str) -> Option<DeepInfraVariant> {
     match model {
-        DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID => Some("flex"),
-        DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID => Some("priority"),
+        DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID => Some(DeepInfraVariant::Auto),
+        DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID => Some(DeepInfraVariant::Flex),
+        DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID => Some(DeepInfraVariant::Priority),
         _ => None,
     }
 }
 pub fn is_deepinfra_model(model: &str) -> bool {
-    deepinfra_service_tier(model).is_some()
+    deepinfra_variant(model).is_some()
 }
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
