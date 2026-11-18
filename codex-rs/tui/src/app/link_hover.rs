@@ -12,19 +12,28 @@ use crossterm::event::MouseEventKind::ScrollUp;
 use crossterm::event::MouseEventKind::Up;
 
 use super::App;
+use super::side_companion::SideCompanion;
+use crate::app_event::AppEvent;
+use crate::terminal_hyperlinks::ReaderLink;
 use crate::transcript_view::ViewAction;
 use crate::tui::PointerShape;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 
 impl App {
-    pub(super) fn transcript_link_at(&self, mouse: MouseEvent) -> Option<String> {
+    pub(super) fn transcript_link_at(&self, mouse: MouseEvent) -> Option<ReaderLink> {
         if !mouse.modifiers.is_empty()
             && !mouse
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             return None;
+        }
+        if let Some(area) = self.conversation_frame.panel_area()
+            && area.contains((mouse.column, mouse.row).into())
+            && let Some(pane) = self.sidebar()
+        {
+            return pane.visible_link_at(mouse.column, mouse.row);
         }
         let view = if let Some(panes) = self.conversation_frame.side_pane()
             && panes.passive.contains((mouse.column, mouse.row).into())
@@ -37,7 +46,7 @@ impl App {
         } else {
             &self.transcript_view
         };
-        view.link_at(mouse.column, mouse.row)
+        view.reader_link_at(mouse.column, mouse.row)
     }
 
     pub(super) fn handle_passive_transcript_event(
@@ -50,6 +59,7 @@ impl App {
             return false;
         };
         let view = &mut companion.view;
+        view.agent_links = self.transcript_view.agent_links;
         view.mouse_scroll_speed = self.transcript_view.mouse_scroll_speed;
         view.copy_on_select = self.transcript_view.copy_on_select;
         view.copy_on_select_clear_selection = self.transcript_view.copy_on_select_clear_selection;
@@ -73,6 +83,14 @@ impl App {
             self.transcript_view.show_copy_feedback(&result, count);
         } else if let ViewAction::OpenLink(url) = action {
             self.open_url_in_browser(url);
+        } else if let ViewAction::OpenAgent(agent) = action
+            && let Some(backend) = view.agent_links
+        {
+            self.app_event_tx.send(AppEvent::OpenSidebarAgent {
+                backend,
+                source: id,
+                agent,
+            });
         }
         tui.frame_requester().schedule_frame();
         true
@@ -101,7 +119,14 @@ impl App {
                 TuiEvent::Mouse(mouse)
                     if matches!(mouse.kind, Drag(Left) | Up(Left) | ScrollUp | ScrollDown) =>
                 {
-                    self.refresh_owned_transcript(tui)?;
+                    if !matches!(mouse.kind, ScrollUp | ScrollDown)
+                        || !self
+                            .side_companions
+                            .get(&id)
+                            .is_some_and(SideCompanion::can_scroll_without_refresh)
+                    {
+                        self.refresh_owned_transcript(tui)?;
+                    }
                     if self
                         .conversation_frame
                         .side_pane()
@@ -130,24 +155,26 @@ impl App {
         let shape = if tui
             .link_hover
             .mouse
-            .is_some_and(|mouse| self.conversation_frame.hud_contains(mouse))
+            .is_some_and(|mouse| tui.shortcut_hud_contains(mouse))
             || !tui.is_owned_screen()
             || self.overlay.is_some()
-            || !self.chat_widget.no_modal_or_popup_active()
         {
             PointerShape::Default
-        } else if self.divider_drag.is_some()
-            || tui.link_hover.mouse.is_some_and(|mouse| {
-                self.conversation_frame
-                    .side_pane()
-                    .is_some_and(|panes| panes.divider_contains(mouse))
-            })
+        } else if self.conversation_focus_available(tui)
+            && (self.divider_drag.is_some()
+                || tui.link_hover.mouse.is_some_and(|mouse| {
+                    self.conversation_frame
+                        .divider_area()
+                        .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                        && self.divider_is_settled(tui, tui.terminal.last_known_screen_size.into())
+                }))
         {
             PointerShape::Resize
-        } else if tui
-            .link_hover
-            .mouse
-            .is_some_and(|mouse| self.transcript_link_at(mouse).is_some())
+        } else if self.chat_widget.no_modal_or_popup_active()
+            && tui
+                .link_hover
+                .mouse
+                .is_some_and(|mouse| self.transcript_link_at(mouse).is_some())
         {
             PointerShape::Link
         } else {
