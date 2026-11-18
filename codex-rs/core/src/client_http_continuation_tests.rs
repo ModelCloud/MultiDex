@@ -101,7 +101,13 @@ fn http_continuation_retains_pending_completion_and_checks_reuse_boundaries(
         turn.http_session.last_response_rx = Some(receiver);
         assert!(turn.get_last_http_response().is_none());
         if scenario == "other_owner" {
-            turn.http_session.auth_owner_generation = Some(1);
+            turn.http_session.auth_owner = Some(
+                codex_login::AuthManager::from_auth_for_testing_with_home(
+                    codex_login::CodexAuth::from_api_key("different-owner"),
+                    std::path::PathBuf::from("unused"),
+                )
+                .auth_owner(),
+            );
         }
         drop(turn);
         sender

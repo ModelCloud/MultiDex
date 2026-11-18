@@ -689,6 +689,9 @@ async fn injected_cache_write_error_does_not_fail_remote_refresh() {
         .await;
 
     assert_eq!(catalog.models, remote_models);
+    manager
+        .ensure_initialized(DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
     assert_eq!(
         manager
             .model_catalog_with_origins(RefreshStrategy::InMemory, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -702,6 +705,27 @@ async fn injected_cache_write_error_does_not_fail_remote_refresh() {
             .collect::<Vec<_>>()
     );
     assert_eq!(endpoint.fetch_count(), 1);
+}
+
+#[tokio::test]
+async fn initialization_retains_loaded_catalogs_including_empty_responses() {
+    for models in [
+        Vec::new(),
+        vec![remote_model("remote", "Remote", /*priority*/ 0)],
+    ] {
+        let endpoint = TestModelsEndpoint::new(vec![models.clone()]);
+        let manager =
+            OpenAiModelsManager::new_without_cache(endpoint.clone(), /*auth_manager*/ None)
+                .with_provider_catalog();
+        manager
+            .ensure_initialized(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await;
+        manager
+            .ensure_initialized(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await;
+        assert_eq!(manager.get_remote_models().await, models);
+        assert_eq!(endpoint.fetch_count(), 1);
+    }
 }
 
 #[tokio::test]
@@ -1154,6 +1178,16 @@ async fn endpoint_overlay_preserves_remote_refresh_defaults_and_prompt_metadata(
                 .any(|entry| entry.model.slug == slug),
             expected == "remote-first",
             "the provider-only view must exclude a shared overlay unless advertised"
+        );
+        let refreshed = manager
+            .refreshed_model_catalog()
+            .expect("successful provider refresh");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected]
         );
         let presets = manager.build_available_models(catalog.models);
         assert!(

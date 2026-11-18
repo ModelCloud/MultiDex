@@ -132,6 +132,11 @@ impl ChatWidget {
         self.request_redraw();
         self.app_event_tx.send(AppEvent::StartSide {
             parent_thread_id,
+            mode: if user_message.is_some() {
+                crate::app_event::SideStartMode::New
+            } else {
+                crate::app_event::SideStartMode::Reuse
+            },
             user_message,
         });
     }
@@ -253,17 +258,7 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Feedback => {
-                if !self.config.feedback_enabled {
-                    let params = crate::bottom_pane::feedback_disabled_params();
-                    self.bottom_pane.show_selection_view(params);
-                    self.request_redraw();
-                    return;
-                }
-                // Step 1: pick a category (UI built in feedback_view)
-                let params =
-                    crate::bottom_pane::feedback_selection_params(self.app_event_tx.clone());
-                self.bottom_pane.show_selection_view(params);
-                self.request_redraw();
+                self.app_event_tx.send(AppEvent::OpenFeedback);
             }
             SlashCommand::New => {
                 self.show_session_checkout_picker(ManagedWorktreeMode::New, /*name*/ None);
@@ -305,7 +300,8 @@ impl ChatWidget {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
                     title: Some("Delete this session?".to_string()),
                     subtitle: Some(
-                        "Cannot be undone. Subagent threads will also be deleted.".to_string(),
+                        "Also deletes subagents and saved side chats. Cannot be undone."
+                            .to_string(),
                     ),
                     footer_hint: Some(standard_popup_hint_line()),
                     items: vec![
@@ -561,6 +557,9 @@ impl ChatWidget {
                 self.add_hooks_output();
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
+            SlashCommand::Rc => self.app_event_tx.send(AppEvent::RemoteControl(
+                crate::app::remote_control::Action::Menu,
+            )),
             SlashCommand::Warnings => self.app_event_tx.send(AppEvent::OpenWarnings),
             SlashCommand::Status => {
                 if self.should_prefetch_rate_limits() {
@@ -826,6 +825,9 @@ impl ChatWidget {
             return;
         }
         match cmd {
+            SlashCommand::Rc => self.add_error_message(
+                "Open /rc and choose Disable to turn off remote control.".into(),
+            ),
             SlashCommand::Model if !trimmed.is_empty() => {
                 self.handle_model_command_args(trimmed);
                 self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
@@ -896,8 +898,38 @@ impl ChatWidget {
                     && !name.trim().is_empty()
                 {
                     if let Some(thread_id) = self.thread_id {
+                        // Keep the old name-only syntax intact, including spaces and quotes.
+                        let (name, environment_id) = if name.split_whitespace().any(|word| {
+                            word == "--environment" || word.starts_with("--environment=")
+                        }) {
+                            let args = match super::slash_command_args::parse(
+                                name,
+                                &["--environment"],
+                                &[],
+                                &[],
+                            ) {
+                                Ok(args) => args,
+                                Err(error) => {
+                                    self.add_error_message(error);
+                                    return;
+                                }
+                            };
+                            if args.positionals.is_empty() {
+                                self.add_error_message(
+                                    "Usage: /mcp login <name> [--environment <id>]".to_string(),
+                                );
+                                return;
+                            }
+                            (
+                                args.positionals.join(" "),
+                                args.value("--environment").map(str::to_owned),
+                            )
+                        } else {
+                            (name.trim().to_string(), None)
+                        };
                         self.app_event_tx.send(AppEvent::StartMcpLogin {
-                            name: name.trim().to_string(),
+                            name,
+                            environment_id,
                             thread_id,
                         });
                     } else {
@@ -906,7 +938,9 @@ impl ChatWidget {
                         );
                     }
                 } else {
-                    self.add_error_message("Usage: /mcp [verbose | login <name>]".to_string());
+                    self.add_error_message(
+                        "Usage: /mcp [verbose | login <name> [--environment <id>]]".to_string(),
+                    );
                 }
             }
             SlashCommand::Keymap => match trimmed.to_ascii_lowercase().as_str() {
@@ -1315,6 +1349,7 @@ impl ChatWidget {
             SlashCommand::Ide
             | SlashCommand::Status
             | SlashCommand::Daemon
+            | SlashCommand::Rc
             | SlashCommand::Pwd
             | SlashCommand::Usage
             | SlashCommand::DebugConfig

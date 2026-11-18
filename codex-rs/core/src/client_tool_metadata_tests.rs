@@ -45,6 +45,7 @@ fn request_with_metadata_and_source(
     output.mark_tool_calls_complete();
     ResponsesApiRequest {
         provider: None,
+        request_country: Default::default(),
         model: "test".to_string(),
         max_output_tokens: None,
         input: vec![output],

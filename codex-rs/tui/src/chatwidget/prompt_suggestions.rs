@@ -17,7 +17,7 @@ impl ChatWidget {
     pub(super) fn suggest_next_prompt(&mut self, turn_id: String) {
         if !self.local_settings.tui.prompt_suggestions
             || self.is_user_turn_pending_or_running()
-            || self.external_writer_view
+            || self.is_read_only_view()
             || self.blocks_direct_input
             || self.side_conversation_active()
             || self.has_queued_follow_up_messages()

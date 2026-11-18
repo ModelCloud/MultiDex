@@ -795,6 +795,8 @@ async fn amazon_bedrock_provider_creates_static_models_manager() {
     assert_eq!(uncached_catalog, catalog);
     for slug in [
         "openai.gpt-6.1-sol",
+        "openai.gpt-6.2-astra",
+        "openai.gpt-6.2-sol",
         "openai.gpt-6.1-terra",
         "openai.gpt-6-sol",
         "openai.gpt-6-luna",
@@ -826,9 +828,11 @@ async fn amazon_bedrock_provider_creates_static_models_manager() {
     assert_eq!(
         models,
         vec![
+            ("openai.gpt-6.2-sol", "GPT-6.2 Sol"),
+            ("openai.gpt-6.2-astra", "GPT-6.2 Astra"),
+            ("openai.gpt-6.1-terra", "GPT-6.1 Terra"),
             ("openai.gpt-6.1-sol", "GPT-6.1 Sol"),
             ("openai.gpt-6-astra", "GPT-6-Astra"),
-            ("openai.gpt-6.1-terra", "GPT-6.1 Terra"),
             ("openai.gpt-6-sol", "GPT-6 Sol"),
             ("openai.gpt-6-luna", "GPT-6 Luna"),
             ("openai.gpt-5.6-sol", "GPT-5.6 Sol"),
@@ -850,9 +854,11 @@ async fn amazon_bedrock_provider_creates_static_models_manager() {
             .map(|preset| preset.model.as_str())
             .collect::<Vec<_>>(),
         vec![
+            "openai.gpt-6.2-sol",
+            "openai.gpt-6.2-astra",
+            "openai.gpt-6.1-terra",
             "openai.gpt-6.1-sol",
             "openai.gpt-6-astra",
-            "openai.gpt-6.1-terra",
             "openai.gpt-6-sol",
             "openai.gpt-6-luna",
             "openai.gpt-5.6-sol",
@@ -867,7 +873,7 @@ async fn amazon_bedrock_provider_creates_static_models_manager() {
         .find(|preset| preset.is_default)
         .expect("Bedrock catalog should have a default model");
 
-    assert_eq!(default_model.model, "openai.gpt-6.1-sol");
+    assert_eq!(default_model.model, "openai.gpt-6.2-sol");
 }
 
 #[tokio::test]
@@ -958,8 +964,8 @@ async fn configured_provider_models_manager_uses_provider_bearer_token() {
                     provider_info.clone(),
                     auth.clone().map(AuthManager::from_auth_for_testing),
                 );
-                let manager = provider
-                    .models_manager(test_codex_home(), /*config_model_catalog*/ None);
+                let manager =
+                    provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
                 manager.set_api_key_model_discovery_enabled(enabled);
                 let refresh_strategy = if enabled {
                     RefreshStrategy::Online

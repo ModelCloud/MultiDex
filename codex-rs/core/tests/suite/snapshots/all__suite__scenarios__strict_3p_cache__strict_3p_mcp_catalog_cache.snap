@@ -7,7 +7,6 @@ Scenario: Strict Code Mode Only: MCP config changes between turns, with omit-all
 ## Window 1
 Settings:
   include: ["reasoning.encrypted_content"]
-  max_output_tokens: 65536
   model: "gpt-6-astra"
   parallel_tool_calls: false
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
@@ -25,12 +24,11 @@ Settings:
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=f4cd55aaf98f2f2e
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
           - function/send_message
-          - function/set_agent_settings
           - function/spawn_agent
           - function/wait_agent
 01:message/developer:

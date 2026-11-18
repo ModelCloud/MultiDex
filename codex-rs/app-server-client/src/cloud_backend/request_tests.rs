@@ -7,7 +7,7 @@ use pretty_assertions::assert_eq;
 fn ordinary_multi_backend_resume_queries_cloud_interactive_threads_on_every_page() {
     // The mixed picker has no shared cwd/provider filter. It sends conventional
     // interactive source names, even when the connection belongs to Cloud.
-    for (cursor, state_db_only) in [(None, true), (Some("page-2"), false)] {
+    for (cursor, state_db_only, archived) in [(None, true, false), (Some("page-2"), false, true)] {
         let params = serde_json::from_value(json!({
             "currentAccountOnly": true,
             "cursor": cursor,
@@ -15,13 +15,14 @@ fn ordinary_multi_backend_resume_queries_cloud_interactive_threads_on_every_page
             "sortKey": "updated_at",
             "modelProviders": [],
             "sourceKinds": ["cli", "vscode"],
-            "archived": false,
+            "archived": archived,
             "useStateDbOnly": state_db_only,
         }))
         .unwrap();
         let query = thread_list_query(params).unwrap();
         assert_eq!(query.cursor.as_deref(), cursor);
         assert_eq!(query.limit, Some(25));
+        assert_eq!(query.archived, archived);
         assert!(matches!(query.sort_key, cloud::ThreadSortKey::UpdatedAt));
         assert!(matches!(
             query.sort_direction,
@@ -34,7 +35,6 @@ fn ordinary_multi_backend_resume_queries_cloud_interactive_threads_on_every_page
 #[test]
 fn unsupported_filters_do_not_return_unrelated_cloud_rows() {
     for filter in [
-        json!({"archived": true}),
         json!({"sourceKinds": ["exec"]}),
         json!({"attachedToThreadId": "other"}),
         json!({"modelProviders": ["other"]}),
@@ -63,13 +63,30 @@ fn user_input_uses_stable_id_and_the_existing_cloud_configuration() {
     let request = cloud_message(message()).unwrap();
     assert_eq!(request.thread_id, "thread-a");
     assert_eq!(request.client_user_message_id, "submission-a");
-    assert_eq!(request.text, "one\ntwo");
+    assert_eq!(
+        request.input,
+        vec![cloud::UserMessageInput::Text {
+            text: "one\ntwo".into(),
+            text_elements: Vec::new(),
+        }]
+    );
     assert_eq!(
         request.turn_trigger.as_deref(),
         Some("safety_recourse_follow_up")
     );
     assert!(matches!(request.mode, cloud::SubmissionMode::StartIfIdle));
     assert!(!request.shared_access);
+    assert_eq!(request.service_tier, None);
+
+    for (tier, expected) in [("ultrafast", Some("ultrafast")), ("default", None)] {
+        let request = cloud_message(protocol::TurnStartParams {
+            turn_trigger: Some("user".into()),
+            service_tier: Some(Some(tier.into())),
+            ..message()
+        })
+        .unwrap();
+        assert_eq!(request.service_tier, Some(expected.map(str::to_owned)));
+    }
 
     for tier in ["default", "priority"] {
         assert!(
@@ -86,6 +103,51 @@ fn user_input_uses_stable_id_and_the_existing_cloud_configuration() {
             ..message()
         })
         .is_err()
+    );
+}
+
+#[test]
+fn image_submission_keeps_attachment_markers_and_input_order() {
+    let label = "[Image #1]";
+    let request = cloud_message(protocol::TurnStartParams {
+        input: vec![
+            protocol::UserInput::Image {
+                image: protocol::ImageReference::File {
+                    file_id: "file-synthetic".into(),
+                },
+                detail: Some(ImageDetail::High),
+            },
+            protocol::UserInput::Text {
+                text: format!("{label} describe"),
+                text_elements: vec![protocol::TextElement::new(
+                    protocol::ByteRange {
+                        start: 0,
+                        end: label.len(),
+                    },
+                    Some(label.into()),
+                )],
+            },
+        ],
+        ..message()
+    })
+    .unwrap();
+
+    assert_eq!(
+        request.input,
+        vec![
+            cloud::UserMessageInput::Image {
+                image: cloud::ImageReference::FileId("file-synthetic".into()),
+                detail: Some(cloud::ImageDetail::High),
+            },
+            cloud::UserMessageInput::Text {
+                text: format!("{label} describe"),
+                text_elements: vec![cloud::UserMessageTextElement {
+                    start: 0,
+                    end: label.len(),
+                    placeholder: Some(label.into()),
+                }],
+            },
+        ]
     );
 }
 

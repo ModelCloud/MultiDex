@@ -129,8 +129,13 @@ impl App {
             return;
         };
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.temporary_structured_requests
-            .insert(temporary_thread_id, sender);
+        self.temporary_structured_requests.insert(
+            temporary_thread_id,
+            (
+                crate::temporary_structured_request::TemporaryThreadKind::PromptSuggestion,
+                sender,
+            ),
+        );
         let events = self.app_event_tx.clone();
         tokio::spawn(async move {
             // Retain the inherited tools and settings. Await the turn ID before interrupting.

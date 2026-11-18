@@ -40,11 +40,13 @@ use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::ModelsManagerFuture;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::RefreshedModelCatalog;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::openai_models::ModelInfo;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout_trace::ThreadTraceContext;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -54,6 +56,7 @@ use codex_thread_store::ThreadStore;
 use codex_utils_git_discovery::GitRootDiscovery;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 
 pub(crate) struct SessionServices {
     /// The single owner of live MCP connections for this thread.
@@ -99,6 +102,7 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_thread_init: ExtensionDataInit,
     pub(crate) agent_control: Arc<dyn AgentControl>,
     pub(crate) local_agent_runtime: LocalAgentRuntime,
+    pub(crate) budget_policy: crate::rollout_budget::ThreadBudgetPolicy,
     pub(crate) network_proxy: ArcSwapOption<StartedNetworkProxy>,
     pub(crate) network_proxy_audit_metadata: NetworkProxyAuditMetadata,
     pub(crate) managed_network_requirements_configured: bool,
@@ -125,6 +129,7 @@ pub(crate) struct SessionServices {
 pub(crate) struct SwappableModelsManager {
     inner: ArcSwap<SharedModelsManager>,
     auth_manager: Arc<AuthManager>,
+    swaps: watch::Sender<()>,
 }
 
 impl SwappableModelsManager {
@@ -132,12 +137,18 @@ impl SwappableModelsManager {
         Self {
             inner: ArcSwap::from_pointee(manager),
             auth_manager,
+            swaps: watch::Sender::new(()),
         }
     }
 
     /// Point this handle at a manager built for the session's new provider.
     pub(crate) fn swap(&self, manager: SharedModelsManager) {
         self.inner.store(Arc::new(manager));
+        self.swaps.send_replace(());
+    }
+
+    pub(crate) fn swaps(&self) -> watch::Receiver<()> {
+        self.swaps.subscribe()
     }
 }
 
@@ -150,6 +161,35 @@ impl fmt::Debug for SwappableModelsManager {
 }
 
 impl ModelsManager for SwappableModelsManager {
+    fn ensure_initialized(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        let manager = self.inner.load_full();
+        Box::pin(async move { manager.ensure_initialized(http_client_factory).await })
+    }
+
+    fn model_catalog_updates(&self) -> Option<watch::Receiver<Option<Arc<RefreshedModelCatalog>>>> {
+        self.inner.load().model_catalog_updates()
+    }
+
+    fn refreshed_model_catalog(&self) -> Option<Arc<[ModelInfo]>> {
+        self.inner.load().refreshed_model_catalog()
+    }
+
+    fn provider_catalog_with_origins(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<CatalogModel>> {
+        let manager = self.inner.load_full();
+        Box::pin(async move {
+            manager
+                .provider_catalog_with_origins(refresh_strategy, http_client_factory)
+                .await
+        })
+    }
+
     fn for_originator(&self, originator: &str) -> Option<SharedModelsManager> {
         self.inner.load().for_originator(originator)
     }
@@ -222,6 +262,21 @@ impl ModelsManager for SwappableModelsManager {
 }
 
 impl SessionServices {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned grants must not authorize discovery"
+    )]
+    pub(crate) fn granted_permissions(
+        &self,
+        environment_id: &str,
+    ) -> Option<AdditionalPermissionProfile> {
+        self.granted_permissions_by_environment_id
+            .lock()
+            .expect("session permission grants lock poisoned")
+            .get(environment_id)
+            .cloned()
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "poisoned grant state must not authorize further operations"

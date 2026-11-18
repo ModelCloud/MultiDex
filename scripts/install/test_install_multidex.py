@@ -16,9 +16,7 @@ INSTALLER_ARCH = {"amd64": "x86_64", "arm64": "aarch64"}.get(
     INSTALLER_MACHINE, INSTALLER_MACHINE
 )
 INSTALLER_OS = subprocess.check_output(["uname", "-s"], text=True).strip()
-INSTALLER_SUFFIX = (
-    "apple-darwin" if INSTALLER_OS == "Darwin" else "unknown-linux-gnu"
-)
+INSTALLER_SUFFIX = "apple-darwin" if INSTALLER_OS == "Darwin" else "unknown-linux-gnu"
 INSTALLER_TARGET = f"{INSTALLER_ARCH}-{INSTALLER_SUFFIX}"
 
 
@@ -110,9 +108,7 @@ class MultiDexInstallerTest(InstallerTestCase):
             self.assertEqual(
                 (standalone / "current").resolve(),
                 (
-                    standalone
-                    / "releases"
-                    / f"0.155.1-multidex-{INSTALLER_TARGET}"
+                    standalone / "releases" / f"0.155.1-multidex-{INSTALLER_TARGET}"
                 ).resolve(),
             )
 
@@ -147,8 +143,7 @@ class MultiDexInstallerTest(InstallerTestCase):
                             {"name": asset},
                             {
                                 "name": (
-                                    "multidex-package-aarch64-unknown-linux-gnu"
-                                    ".tar.gz"
+                                    "multidex-package-aarch64-unknown-linux-gnu.tar.gz"
                                 )
                             },
                         ],

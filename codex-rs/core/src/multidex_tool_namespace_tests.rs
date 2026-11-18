@@ -26,6 +26,7 @@ fn request(tools: Vec<Value>, input: Vec<ResponseItem>) -> ResponsesApiRequest {
         text: None,
         client_metadata: None,
         access_programs: None,
+        request_country: codex_protocol::RequestCountry::UNKNOWN,
     }
 }
 
@@ -446,6 +447,7 @@ async fn interceptor_preserves_unknown_names_deltas_completion_and_errors() {
             response_id: "resp_1".into(),
             token_usage: None,
             usage_metadata: None,
+            reasoning_removals: None,
             end_turn: Some(false),
         }),
         Err(ModelResponseError::Stream("upstream failure".into())),
