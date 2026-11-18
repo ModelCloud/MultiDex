@@ -1993,7 +1993,7 @@ async fn run_auto_compact(
             }
             let fallback = if has_candidate && matches!(reason, CompactionReason::ContextLimit) {
                 let status =
-                    super::context_window::context_window_token_status(sess, &turn_context).await;
+                    super::context_window::context_window_token_status(sess, turn_context).await;
                 let required = match phase {
                     CompactionPhase::PostTurn => status.turn_end_compaction_threshold_reached,
                     CompactionPhase::PreTurn
@@ -2053,7 +2053,7 @@ async fn run_auto_compact(
                     );
                     run_inline_auto_compact_task(
                         Arc::clone(sess),
-                        step_context,
+                        Arc::clone(&step_context),
                         replacement_step_context,
                         world_state,
                         reason,
@@ -2073,7 +2073,7 @@ async fn run_auto_compact(
         );
         run_inline_auto_compact_task(
             Arc::clone(sess),
-            step_context,
+            Arc::clone(&step_context),
             replacement_step_context,
             world_state,
             reason,

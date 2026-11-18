@@ -511,6 +511,7 @@ fn dsv41_flash_model_info(
         tool_mode: Some(ToolMode::Direct),
         multi_agent_version: None,
         multi_agent_reasoning_effort: None,
+        multi_agent_tools_in_code_mode: None,
     }
 }
 

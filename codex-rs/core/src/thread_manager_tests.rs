@@ -3825,7 +3825,12 @@ async fn multi_agent_v2_override_regression_swappable_manager_preserves_discover
         let replacement_manager =
             build_models_manager(&config, auth_manager.clone(), /*runtime*/ None);
         let swappable = crate::state::SwappableModelsManager::new(initial_manager, auth_manager);
+        let swaps = swappable.swaps();
         swappable.swap(replacement_manager);
+        assert!(swaps.has_changed().expect("manager remains live"));
+        let updates = swappable
+            .model_catalog_updates()
+            .expect("provider manager publishes catalog updates");
 
         let catalog = swappable
             .model_catalog_with_origins(
@@ -3856,6 +3861,11 @@ async fn multi_agent_v2_override_regression_swappable_manager_preserves_discover
         assert_eq!(
             server.received_requests().await.unwrap_or_default().len(),
             usize::from(discovery_enabled)
+        );
+        assert_eq!(
+            updates.borrow().is_some(),
+            discovery_enabled,
+            "the replacement manager publishes discovery only when enabled",
         );
     }
 }

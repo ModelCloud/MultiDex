@@ -395,6 +395,28 @@ impl ModelsManagerOverlay {
 }
 
 impl ModelsManager for ModelsManagerOverlay {
+    fn ensure_initialized(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        self.inner.ensure_initialized(http_client_factory)
+    }
+
+    fn model_catalog_updates(&self) -> Option<watch::Receiver<Option<Arc<RefreshedModelCatalog>>>> {
+        self.inner.model_catalog_updates()
+    }
+
+    fn refreshed_model_catalog(&self) -> Option<Arc<[ModelInfo]>> {
+        self.inner.refreshed_model_catalog()
+    }
+
+    fn refresh_originator_catalogs(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        self.inner.refresh_originator_catalogs(http_client_factory)
+    }
+
     fn provider_catalog_with_origins(
         &self,
         refresh_strategy: RefreshStrategy,

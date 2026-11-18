@@ -394,7 +394,7 @@ impl ChatState {
             response_id: self.id,
             token_usage: self.usage,
             usage_metadata: None,
-            reasoning_removals: Default::default(),
+            reasoning_removals: None,
             end_turn: Some(self.finish.as_deref() == Some("stop")),
         });
         Ok(events)

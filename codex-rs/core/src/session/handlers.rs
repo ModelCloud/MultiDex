@@ -526,6 +526,7 @@ pub(super) async fn submission_loop(
 ) {
     // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;
+    let mut catalog_swaps = sess.services.models_manager_swappable.swaps();
     let mut catalog_updates = sess.services.models_manager.model_catalog_updates();
     if let Some(updates) = &mut catalog_updates {
         // A resumed chat must also consume a catalog fetched before it was opened.
@@ -563,6 +564,13 @@ pub(super) async fn submission_loop(
                 }
                 shutdown_received = super::turn_suspension::stop_tree_member(&sess).await;
                 break;
+            }
+            Ok(()) = catalog_swaps.changed() => {
+                catalog_updates = sess.services.models_manager.model_catalog_updates();
+                if let Some(updates) = &mut catalog_updates {
+                    updates.mark_changed();
+                }
+                continue;
             }
             update = async {
                 match &mut catalog_updates {

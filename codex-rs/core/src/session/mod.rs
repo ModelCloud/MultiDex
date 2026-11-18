@@ -2234,7 +2234,14 @@ impl Session {
                     }
                 };
 
-            if let Some(catalog) = self.services.models_manager.refreshed_model_catalog() {
+            let provider_changed = updated.original_config_do_not_use.model_provider_id
+                != state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .model_provider_id;
+            if !provider_changed
+                && let Some(catalog) = self.services.models_manager.refreshed_model_catalog()
+            {
                 model_catalog_settings::normalize(&mut updated.step_settings, &catalog);
             }
 
@@ -2281,12 +2288,7 @@ impl Session {
             }
             // A provider change also changes which catalog serves context windows, reasoning
             // ladders, and model instructions; swap the manager alongside the provider.
-            if updated.original_config_do_not_use.model_provider_id
-                != state
-                    .session_configuration
-                    .original_config_do_not_use
-                    .model_provider_id
-            {
+            if provider_changed {
                 let manager = crate::thread_manager::build_models_manager(
                     &updated.original_config_do_not_use,
                     Arc::clone(&self.services.auth_manager),
