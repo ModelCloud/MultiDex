@@ -72,7 +72,6 @@ async fn model_picker_refresh_updates_app_catalog_from_app_server() -> Result<()
     let (mut app, mut rx, _op_rx) = make_test_app_with_channels().await;
     let mut app_server = start_config_write_test_app_server(&app).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    let fast = Some(ServiceTier::Fast.request_value());
     let thread_id = ThreadId::new();
     let mut session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
     session.model = "gpt-5.5".to_string();
@@ -144,7 +143,6 @@ async fn model_picker_refresh_updates_app_catalog_from_app_server() -> Result<()
     app.chat_widget.open_model_popup();
     assert!(!app.chat_widget.no_modal_or_popup_active());
 
-    session.service_tier = fast.map(str::to_string);
     let channel = &app.thread_event_channels[&thread_id];
     let cached = channel.store.lock().await.session.clone();
     assert_eq!(
@@ -156,7 +154,7 @@ async fn model_picker_refresh_updates_app_catalog_from_app_server() -> Result<()
         test_path_buf("/tmp/other"),
     ));
     app.chat_widget.handle_thread_session(cached.unwrap());
-    assert_eq!(app.chat_widget.current_service_tier(), fast);
+    assert_eq!(app.chat_widget.current_service_tier(), None);
     let stale = AppEvent::ModelsLoaded {
         request_id: uuid::Uuid::new_v4(),
         result: Ok(all_model_presets()),
@@ -196,10 +194,10 @@ async fn model_picker_refresh_updates_app_catalog_from_app_server() -> Result<()
     let mut config = app.config.clone();
     config.service_tier = None;
     config.features.enable(Feature::FastMode)?;
-    for (model, expected_tier) in [(None, fast), (Some("gpt-5.6-terra"), Some("default"))] {
+    for model in [None, Some("gpt-5.6-terra")] {
         config.model = model.map(str::to_string);
         let started = app_server.start_thread(&config).await?;
-        assert_eq!(started.session.service_tier.as_deref(), expected_tier);
+        assert_eq!(started.session.service_tier.as_deref(), Some("default"));
     }
     app_server.shutdown().await?;
     Ok(())

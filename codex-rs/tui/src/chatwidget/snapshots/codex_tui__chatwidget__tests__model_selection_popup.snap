@@ -6,7 +6,8 @@ expression: popup
   Select Model and Effort
 
 ↑
-  4. GPT-6.1-Sol         Previous generation model for coding and everyday work.
+  4. GPT-6.1-Sol         Previous generation model for coding and everyday
+                         work.
   5. GPT-6-Astra         Previous generation model for complex coding and
                          professional work.
   6. GPT-6-Sol           Legacy model for coding and everyday work.

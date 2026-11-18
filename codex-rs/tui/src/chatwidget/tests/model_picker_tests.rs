@@ -99,7 +99,12 @@ async fn multi_provider_family_collapses_and_drills_into_variant_then_reasoning(
     // variant → reasoning chain.
     chat.open_reasoning_popup(selected);
     chat.handle_key_event(KeyCode::Enter.into());
-    assert_matches!(events.try_recv(), Ok(AppEvent::UpdateModel(_)));
+    let (model, effort) = assert_matches!(
+        events.try_recv(),
+        Ok(AppEvent::ApplyModelSelection { model, effort }) => (model, effort)
+    );
+    assert_eq!(model, "deepseek-ai/DeepSeek-V4.1-Flash");
+    assert_eq!(effort, Some(ReasoningEffortConfig::High));
     assert!(chat.no_modal_or_popup_active());
 }
 
