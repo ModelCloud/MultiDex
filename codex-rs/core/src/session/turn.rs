@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -43,6 +44,8 @@ use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_response_stream_error;
 use crate::responses_retry::is_terminal_sampling_outcome;
+use crate::rollout_budget::ResponseWork;
+use crate::rollout_budget::TurnWork;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
@@ -547,6 +550,13 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &first_step_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut work = TurnWork::new(
+        &sess.services.budget_policy,
+        sess.thread_id(),
+        &turn_context.sub_id,
+        &turn_context.session_source,
+    );
+    let mut completion_hooks = TurnCompletionHooks::default();
     let mut stop_hook_active = false;
     // A steer can reopen sampling within the same turn. Keep its aggregate until the turn ends.
     let turn_diff_tracker = turn_context
@@ -693,12 +703,14 @@ pub(crate) async fn run_turn(
         .await;
         let sampling_request_result =
             sampling_request_result.and_then(|(output, notifications)| {
-                sess.check_rollout_budget()?;
-                Ok((output, notifications))
+                let has_final_answer = !output.mailbox_preempted
+                    && !output.multidex_preempted
+                    && output.last_agent_message.final_answer.is_some();
+                let next = work.accept_response(has_final_answer)?;
+                Ok((output, notifications, next))
             });
         match sampling_request_result {
-            Ok(result) => {
-                let (sampling_request_output, notify_messages) = result;
+            Ok((sampling_request_output, notify_messages, next)) => {
                 context_overflow_compacted = false;
 
                 let SamplingRequestResult {
@@ -720,13 +732,13 @@ pub(crate) async fn run_turn(
                     final_answer,
                     trailing_commentary,
                 } = sampling_request_last_agent_message;
-                let sampling_request_last_agent_message = trailing_commentary.or(final_answer);
-                let hooks = TurnCompletionHooks {
+                let sampling_request_last_agent_message =
+                    work.assistant_message(final_answer, trailing_commentary);
+                completion_hooks = TurnCompletionHooks {
                     last_assistant_message: sampling_request_last_agent_message,
                     notify_messages: Some(notify_messages),
                     stop_ran: false,
                 };
-                let mut completion_hooks = hooks;
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -738,6 +750,14 @@ pub(crate) async fn run_turn(
                 can_drain_pending_input = true;
                 // Process async hooks only after sampling and its tools have finished.
                 drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ false).await;
+                if next.should_retry(model_needs_follow_up) {
+                    continue;
+                }
+                if next.is_finished() {
+                    return completion_hooks
+                        .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                        .await;
+                }
                 let (has_pending_input, token_status) = async {
                     // Tool output can add audio without a queued user input. Resolve its
                     // duration before checking the continuation's compaction threshold.
@@ -873,6 +893,15 @@ pub(crate) async fn run_turn(
                     let stop_outcome = completion_hooks
                         .run_stop(&sess, &step_context, stop_hook_active)
                         .await;
+                    let after_stop = work.after_stop_hook()?;
+                    if after_stop.is_finished() {
+                        return completion_hooks
+                            .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                            .await;
+                    }
+                    if after_stop.should_return(&stop_outcome) {
+                        return Ok(work.take_answer());
+                    }
                     if matches!(
                         turn_context.session_source,
                         SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
@@ -980,6 +1009,9 @@ pub(crate) async fn run_turn(
                             }
                         }
                     }
+                    if work.should_finish_after_compaction()? {
+                        return Ok(work.take_answer());
+                    }
                     break;
                 }
                 continue;
@@ -1053,6 +1085,17 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(e) => {
+                let e = match work.on_error(e)? {
+                    ControlFlow::Break(next) => {
+                        if next.is_finished() {
+                            return completion_hooks
+                                .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                                .await;
+                        }
+                        continue;
+                    }
+                    ControlFlow::Continue(e) => e,
+                };
                 info!("Turn error: {e:#}");
                 if matches!(
                     e.details(),
@@ -1127,6 +1170,21 @@ impl TurnCompletionHooks {
             return false;
         };
         run_legacy_after_agent_hook(sess, turn, messages, self.last_assistant_message.clone()).await
+    }
+    async fn finish(
+        mut self,
+        sess: &Arc<Session>,
+        step_context: &Arc<StepContext>,
+        stop_hook_active: bool,
+        answer: Option<String>,
+    ) -> CodexResult<Option<String>> {
+        if !self.stop_ran {
+            self.run_stop(sess, step_context, stop_hook_active).await;
+        }
+        if self.run_after_agent(sess, &step_context.turn).await {
+            return Ok(None);
+        }
+        Ok(answer)
     }
 }
 
@@ -3433,6 +3491,7 @@ async fn try_run_sampling_request(
         == codex_config::config_toml::ResponseProcessMode::Streaming;
     let mut wait_for_bill_only = false;
     let mut in_flight = FuturesOrdered::new();
+    let mut response_work = ResponseWork::default();
     let mut needs_follow_up = false;
     let mut last_agent_message = AssistantMessages::default();
     let mut active_item: Option<TurnItem> = None;
@@ -4007,6 +4066,8 @@ async fn try_run_sampling_request(
                     usage_metadata.as_ref(),
                 )
                 .await;
+                let mut hook_output = hook_output;
+                response_work.accept_charge(&mut hook_output);
                 let budget_result = sess
                     .record_token_usage_info(
                         &turn_context,
@@ -4256,6 +4317,7 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
 
+    response_work.finish(&sess.services.budget_policy)?;
     outcome
 }
 
