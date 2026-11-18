@@ -3200,7 +3200,7 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
-    prompt: Prompt,
+    mut prompt: Prompt,
     mut pending_audio: Option<codex_history::AcceptedFileAudio>,
     input_item_count: usize,
     cancellation_token: CancellationToken,
@@ -3226,7 +3226,19 @@ async fn try_run_sampling_request(
         step_context.settings.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
-    if client_session.inference_tools_changed(&step_context.tool_router.model_visible_specs()) {
+    // Catalog drift between steps must not rewrite a cached prompt prefix.
+    let advertised_tools = match client_session.stable_inference_tools(
+        &step_context.settings.model_info.slug,
+        &responses_metadata.window_id,
+        &prompt.tools,
+    ) {
+        Some(tools) => {
+            prompt.tools = Arc::clone(&tools);
+            tools
+        }
+        None => step_context.tool_router.model_visible_specs(),
+    };
+    if client_session.inference_tools_changed(&advertised_tools) {
         turn_context.turn_timing_state.record_tools_change();
     }
     // Do not enter this span: overlapping tools must not retain it past sampling.

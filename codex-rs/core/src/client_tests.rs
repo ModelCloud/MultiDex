@@ -2904,6 +2904,95 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
     Ok(())
 }
 
+#[test]
+fn multidex_tool_contract_keeps_continuation_through_catalog_drift() -> anyhow::Result<()> {
+    let generic = test_model_client(SessionSource::Cli);
+    let mut local_provider = generic.provider_info().clone();
+    local_provider.multidex_compatibility = true;
+    let local = generic.with_provider(create_model_provider(
+        local_provider,
+        /*auth_manager*/ None,
+    ));
+    let model_info = test_model_info();
+    let tool = |name: &str, description: &str| {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.into(),
+            description: description.into(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::default(),
+            output_schema: None,
+        })
+    };
+    let first: Arc<[ToolSpec]> = vec![
+        tool("exec_command", "Runs a command."),
+        tool("generate_token", "The new token can be used immediately."),
+        tool("sys_os_read", "Read a file."),
+    ]
+    .into();
+    // Another server revision, with one MCP server still reconnecting.
+    let drifted: Arc<[ToolSpec]> = vec![
+        tool("exec_command", "Runs a command."),
+        tool(
+            "generate_token",
+            "If the new token is rejected, retry it shortly.",
+        ),
+    ]
+    .into();
+
+    assert_eq!(
+        generic
+            .new_session()
+            .stable_inference_tools(&model_info.slug, "window-1", &first),
+        None
+    );
+    let session = local.new_session();
+    let advertised = session
+        .stable_inference_tools(&model_info.slug, "window-1", &first)
+        .expect("multidex providers keep a tool contract");
+    let readvertised = session
+        .stable_inference_tools(&model_info.slug, "window-1", &drifted)
+        .expect("multidex providers keep a tool contract");
+    assert_eq!(readvertised, first);
+    // A later turn reuses the contract recorded by the thread, not the turn.
+    assert_eq!(
+        local
+            .new_session()
+            .stable_inference_tools(&model_info.slug, "window-1", &drifted),
+        Some(Arc::clone(&first))
+    );
+
+    let metadata = test_responses_metadata_for_client(
+        &local,
+        /*turn_id*/ None,
+        format!("{}:0", local.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let request = |tools: Arc<[ToolSpec]>| {
+        local.build_responses_request(
+            &Prompt {
+                tools,
+                ..Prompt::default()
+            },
+            &model_info,
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &metadata,
+            /*include_internal*/ true,
+        )
+    };
+    assert_eq!(
+        super::responses_request_properties_mismatch(
+            &request(advertised)?,
+            &request(readvertised)?
+        ),
+        None
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn inference_tools_changes_follow_full_specs_across_turns() {
     let client = test_model_client(SessionSource::Cli);
