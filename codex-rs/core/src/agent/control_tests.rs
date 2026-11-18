@@ -1049,6 +1049,7 @@ async fn send_input_submits_user_message() {
             caller: ThreadId::new(),
             target: AgentTarget::Id(thread_id),
             resume_config: harness.config.clone(),
+            settings: None,
             input: AgentInput::UserInput(text_input("hello from tests")),
             start_options: Default::default(),
         })
@@ -1999,7 +2000,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
             Arc::make_mut(&mut Arc::make_mut(&mut issuing_step).settings),
             |selected| selected.request_country = issuing_country,
         );
-        SendMessageHandler
+        SendMessageHandler::new(/*expose_model_overrides*/ false)
             .handle(ToolInvocation {
                 session: Arc::clone(session),
                 turn,

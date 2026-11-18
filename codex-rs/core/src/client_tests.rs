@@ -1599,7 +1599,7 @@ async fn responses_http_sets_local_output_budget_and_continuation_opt_in() -> an
     let mut session = client.new_session();
     let mut stream = session
         .stream(
-            &Prompt::default(),
+            &Arc::new(Prompt::default()),
             &test_model_info(),
             &test_session_telemetry(),
             /*effort*/ None,

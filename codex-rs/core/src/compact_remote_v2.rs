@@ -1763,6 +1763,7 @@ mod tests {
                 response_id: "resp-lite-compact".to_string(),
                 token_usage: None,
                 usage_metadata: None,
+                reasoning_removals: None,
                 end_turn: Some(true),
             }));
             let (sess, turn_context, _rx) =
@@ -1776,7 +1777,7 @@ mod tests {
                 &sess,
                 &turn_context,
                 response_stream(events),
-                CompactionRequestKind::Foreground,
+                CompactionRequestKind::Foreground(&CancellationToken::new()),
             )
             .await
             .expect("Lite summary should be accepted");

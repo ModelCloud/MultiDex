@@ -1051,10 +1051,7 @@ async fn steer_preempts_only_an_armed_multidex_sampling_request() {
 
     let submission = submit_steer_only(
         &session,
-        vec![UserInput::Text {
-            text: "steer immediately".to_string(),
-            text_elements: Vec::new(),
-        }],
+        vec![ResolvedUserInput::text("steer immediately".to_string())],
         &turn_context.sub_id,
     )
     .await;
