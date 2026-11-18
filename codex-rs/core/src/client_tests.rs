@@ -2798,10 +2798,13 @@ async fn websocket_handshake_includes_attestation_for_chatgpt_codex_responses(
         Some("v1.header-1"),
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        headers["session-id"],
-        session_id_override.unwrap_or(&responses_metadata.session_id)
+    let thread_id = &responses_metadata.thread_id;
+    let thread_tag = &thread_id[thread_id.len() - 8..];
+    let expected_session_id = session_id_override.map_or_else(
+        || format!("{}:{thread_tag}", responses_metadata.session_id),
+        str::to_owned,
     );
+    assert_eq!(headers["session-id"], expected_session_id);
     assert_eq!(headers["thread-id"], responses_metadata.thread_id);
 }
 
