@@ -53,6 +53,8 @@
 //!
 //! Plain Left opens agents from an empty, active composer connected to a local daemon or remote App Server.
 //! Explicit editor remaps take precedence.
+//! Tab accepts a visible prompt suggestion unless an active binding reserves the key for another
+//! action. The same runtime keymap updates draft editing, submission, and footer hints together.
 //! Most key handling goes through [`ChatComposer::handle_key_event`], which dispatches to a
 //! popup-specific handler if a popup is visible and otherwise to
 //! [`ChatComposer::handle_key_event_without_popup`]. After every handled key, we call
@@ -1119,55 +1121,6 @@ impl ChatComposer {
     #[allow(dead_code, reason = "Used by later layers of the TUI refresh stack.")]
     pub(crate) fn set_app_event_sender(&mut self, app_event_tx: AppEventSender) {
         self.app_event_tx = app_event_tx;
-    }
-
-    /// Replace composer, editor, and footer-hint key bindings from one runtime snapshot.
-    ///
-    /// Submit and queue bindings are cached here because composer dispatch must
-    /// check them before generic textarea editing. The embedded textarea receives
-    /// the same snapshot's editor bindings so a live remap cannot leave submit
-    /// keys updated while cursor/editing keys still use old defaults.
-    pub(crate) fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
-        self.submit_keys = keymap.composer.submit.clone();
-        self.queue_keys = keymap.composer.queue.clone();
-        self.toggle_shortcuts_keys = keymap.composer.toggle_shortcuts.clone();
-        self.history_search_previous_keys = keymap.composer.history_search_previous.clone();
-        self.history_search_next_keys = keymap.composer.history_search_next.clone();
-        self.undo_keys = keymap.composer.undo.clone();
-        self.redo_keys = keymap.composer.redo.clone();
-        self.editor_keymap = keymap.editor.clone();
-        self.vim_normal_keymap = keymap.vim_normal.clone();
-        self.draft.textarea.set_keymap_bindings(keymap);
-        self.footer.external_editor_key =
-            keymap.primary_hint(KeymapContext::Global, "open_external_editor");
-        self.footer.show_warnings_key = keymap.primary_hint(KeymapContext::Global, "open_warnings");
-        self.footer.show_transcript_key =
-            keymap.primary_hint(KeymapContext::Global, "open_transcript");
-        self.footer.find_transcript_key =
-            keymap.primary_hint(KeymapContext::Global, "find_transcript");
-        self.footer.focus_activity_key =
-            keymap.primary_hint(KeymapContext::Global, "focus_activity");
-        self.footer.insert_newline_key =
-            match keymap.primary_hint(KeymapContext::Editor, "insert_newline") {
-                hint @ Some(ShortcutHint::Chord { .. }) => hint,
-                _ => footer_insert_newline_key(
-                    &keymap.editor.insert_newline,
-                    self.footer.use_shift_enter_hint,
-                )
-                .map(ShortcutHint::from),
-            };
-        self.footer.queue_key = keymap.primary_hint(KeymapContext::Composer, "queue");
-        self.footer.toggle_shortcuts_key =
-            keymap.primary_hint(KeymapContext::Composer, "toggle_shortcuts");
-        self.footer.shortcut_guide_keys =
-            super::shortcut_overlay::ShortcutGuideKeys::from_keymap(keymap);
-        self.footer.history_search_key =
-            keymap.primary_hint(KeymapContext::Composer, "history_search_previous");
-        self.footer.reasoning_down_key =
-            keymap.primary_hint(KeymapContext::Chat, "decrease_reasoning_effort");
-        self.footer.reasoning_up_key =
-            keymap.primary_hint(KeymapContext::Chat, "increase_reasoning_effort");
-        self.footer.toggle_voice_key = keymap.primary_hint(KeymapContext::Chat, "toggle_voice");
     }
 
     /// Return the contexts whose handlers can consume the next composer key.

@@ -703,8 +703,8 @@ impl App {
                     message:
                         "temporary structured threads cannot request tools or user interaction"
                             .to_string(),
-                    data: None,
                 },
+                &buffered_request,
             )
             .await;
             return;
