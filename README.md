@@ -83,14 +83,14 @@ official and custom models together:
 [model_providers.dsv41]
 name = "DSV4.1 endpoint"
 base_url = "http://10.0.13.33:2120/v1"
-env_key = "DSV41_BEARER_TOKEN"
+experimental_bearer_token = "<dsv41-token>"
 wire_api = "responses"
 requires_openai_auth = false
 
 [model_providers.lab]
 name = "Lab endpoint"
 base_url = "https://models.example/v1"
-env_key = "LAB_BEARER_TOKEN"
+experimental_bearer_token = "<lab-token>"
 wire_api = "responses"
 requires_openai_auth = false
 ```
@@ -107,9 +107,8 @@ provider = "lab"
 display_name = "Lab Coder 32B"
 ```
 
-Export the named bearer variables in the Omnigent host service environment.
-Only models with their configured bearer variable present are offered as
-routable; selecting one routes to its named provider. Official Codex models
+Set each bearer token in its provider's configuration table. Selecting a
+registered model routes to its named provider. Official Codex models
 continue to use the normal ChatGPT login and OpenAI endpoints. Installation and
 upgrade never contact or validate a model endpoint.
 
@@ -154,7 +153,7 @@ python3 scripts/test_lithos_provider_handoff.py --binary /path/to/multidex
 
 When the provider reports the selected model is at capacity ("Selected model is
 at capacity. Please try a different model."), MultiDex waits and resumes the
-request automatically — no user interaction and no retry budget is consumed;
+request automatically without user interaction or use of the retry budget;
 the request retries indefinitely until capacity frees up. A `Retry-After` hint
 from the provider is honored; otherwise the delay defaults to 1 second and is
 configurable per provider or globally:
