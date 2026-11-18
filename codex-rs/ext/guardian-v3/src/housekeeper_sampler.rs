@@ -209,7 +209,10 @@ impl HousekeeperSampler {
         ResponsesApiRequest {
             request_country: Default::default(),
             model: self.model.slug.clone(),
+            provider: None,
+            max_output_tokens: None,
             input,
+            previous_response_id: None,
             tools: None,
             tool_choice: "none".to_owned(),
             parallel_tool_calls: false,
