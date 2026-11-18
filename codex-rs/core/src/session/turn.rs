@@ -4029,6 +4029,7 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         mailbox_preempted: *draining_for_mailbox,
+                        multidex_preempted,
                         last_agent_message,
                     });
                 }

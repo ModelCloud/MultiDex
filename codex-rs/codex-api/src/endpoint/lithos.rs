@@ -2,16 +2,24 @@
 //! Only the final HTTP payload and incoming Chat Completions events are translated.
 
 use super::session::EndpointSession;
-use crate::common::{ResponseEvent, ResponseStream, ResponseStreamReceiver, ResponsesApiRequest};
+use crate::common::ResponseEvent;
+use crate::common::ResponseStream;
+use crate::common::ResponseStreamReceiver;
+use crate::common::ResponsesApiRequest;
 use crate::error::ApiError;
-use codex_client::{EncodedJsonBody, HttpTransport};
+use codex_client::EncodedJsonBody;
+use codex_client::HttpTransport;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use http::{HeaderMap, HeaderValue, Method};
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use http::HeaderMap;
+use http::HeaderValue;
+use http::Method;
+use serde_json::Value;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -808,10 +816,9 @@ mod tests {
 
     #[tokio::test]
     async fn lithos_dropping_the_response_releases_the_upstream_stream() -> Result<()> {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
         struct DropProbe(Arc<AtomicBool>);
         impl Drop for DropProbe {
             fn drop(&mut self) {
