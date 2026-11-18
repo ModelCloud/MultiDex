@@ -300,6 +300,8 @@ allow_fallbacks = false
                 )
                 thread_id = started["thread"]["id"]
                 local_windows = iter((131_072, 524_288))
+                # Every DeepSeek route shares the bundled budget until a local snapshot exists.
+                deepseek_window = 262_144
                 for provider, model, prompt in [
                     (
                         "openai",
@@ -347,20 +349,18 @@ allow_fallbacks = false
                         "Keep the original secret word. Acknowledge only.",
                     ),
                 ]:
-                    expected_window = {"openrouter": 262_144, "lithos": 1_000_000}.get(
-                        provider
-                    )
                     if provider == "multidex":
-                        expected_window = next(local_windows)
+                        deepseek_window = next(local_windows)
                         (home / "multidex-runtime-capabilities.json").write_text(
                             json.dumps(
                                 {
                                     "model": model,
-                                    "context_window": expected_window,
-                                    "max_prompt_tokens": expected_window - 2,
+                                    "context_window": deepseek_window,
+                                    "max_prompt_tokens": deepseek_window - 2,
                                 }
                             )
                         )
+                    expected_window = deepseek_window if provider != "openai" else None
                     if provider != "openai" or requests:
                         # Model-only selection must infer the provider, as /model does.
                         rpc(
