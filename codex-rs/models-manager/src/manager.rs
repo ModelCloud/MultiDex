@@ -407,7 +407,21 @@ impl ModelsManager for ModelsManagerOverlay {
     }
 
     fn refreshed_model_catalog(&self) -> Option<Arc<[ModelInfo]>> {
-        self.inner.refreshed_model_catalog()
+        let models = self.inner.refreshed_model_catalog()?;
+        if models
+            .iter()
+            .any(|model| self.is_additional_model(&model.slug))
+        {
+            // Provider metadata must not normalize settings for a shadowing endpoint model.
+            return Some(
+                models
+                    .iter()
+                    .filter(|model| !self.is_additional_model(&model.slug))
+                    .cloned()
+                    .collect(),
+            );
+        }
+        Some(models)
     }
 
     fn refresh_originator_catalogs(

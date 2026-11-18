@@ -1179,6 +1179,16 @@ async fn endpoint_overlay_preserves_remote_refresh_defaults_and_prompt_metadata(
             expected == "remote-first",
             "the provider-only view must exclude a shared overlay unless advertised"
         );
+        let refreshed = manager
+            .refreshed_model_catalog()
+            .expect("successful provider refresh");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected]
+        );
         let presets = manager.build_available_models(catalog.models);
         assert!(
             presets
