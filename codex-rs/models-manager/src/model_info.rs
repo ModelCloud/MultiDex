@@ -362,7 +362,7 @@ fn deepinfra_dsv41_flash_model_info(slug: &str) -> ModelInfo {
         _ => "Auto",
     };
     let description = if variant == "Auto" {
-        "Starts on Flex and falls back to Priority after repeated capacity or connection failures."
+        "Starts on Flex. On transient errors, switches to Priority immediately before streaming, or after Flex retries if streaming already started."
     } else {
         "DeepSeek v4.1 Flash 1017 served through DeepInfra Responses."
     };
