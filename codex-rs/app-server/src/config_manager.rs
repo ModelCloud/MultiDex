@@ -472,7 +472,7 @@ impl ConfigManager {
     ) -> std::io::Result<()> {
         self.check_thread_model_provider(current).await?;
         // Still fail closed when the ambient configuration cannot be resolved.
-        // An unparseable or unreadable config can be hiding a provider change,
+        // A malformed or unreadable config can be hiding a provider change,
         // so input is refused until it loads — but the *selection* it resolves
         // is deliberately not compared: the thread's own route wins.
         self.load_latest_config(Some(current.cwd.to_path_buf()))
