@@ -614,7 +614,9 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
     }
 
     let received = server.received_requests().await.expect("mock requests");
-    let cache_key = client.prompt_cache_key(&metadata).expect("prompt cache key");
+    let cache_key = client
+        .prompt_cache_key(&metadata)
+        .expect("prompt cache key");
     let tiers = received
         .iter()
         .map(|request| {
