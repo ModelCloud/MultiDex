@@ -438,6 +438,7 @@ async fn read_only_resume_reconciles_receipts_before_writable_retry() -> Result<
                 turns: vec![test_turn("resumed", status, items)],
                 blocks_direct_input: false,
                 task_tools_available: true,
+                reasoning_summary: None,
             },
             restored_blank_session: false,
             read_only,

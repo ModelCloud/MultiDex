@@ -1794,6 +1794,7 @@ async fn fresh_session_saves_input_restored_by_a_late_interrupt() -> Result<()> 
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
+            reasoning_summary: None,
         },
         config: app.config.clone(),
         local_settings: app.local_settings.clone(),

@@ -271,6 +271,7 @@ async fn cycling_from_a_blank_cloud_task_releases_its_page_before_unsubscribe() 
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
+            reasoning_summary: None,
         },
     );
     app.refresh_agents_overview_threads(&cloud);
