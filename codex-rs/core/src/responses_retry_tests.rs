@@ -6,6 +6,7 @@ use super::log_retry;
 use crate::realtime_history::RealtimeHistoryState;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use codex_api::ResponseEvent;
 use codex_http_client::RetryAfter;
 use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID;
 use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID;
@@ -31,6 +32,9 @@ fn deepinfra_auto_retries_timeouts_but_not_unrelated_errors() {
     ] {
         assert!(auto.next(&err).is_none(), "{err}");
     }
+    auto.observe_response_event(&ResponseEvent::Created {
+        response_id: Some("response".to_string()),
+    });
     for err in [
         CodexErr::RequestTimeout,
         CodexErr::Stream("idle timeout waiting for SSE".to_string()),
@@ -41,6 +45,7 @@ fn deepinfra_auto_retries_timeouts_but_not_unrelated_errors() {
             Duration::from_secs(5)
         );
         assert!(!auto.use_priority());
+        auto.observe_response_event(&ResponseEvent::OutputTextDelta("partial".to_string()));
     }
     assert_eq!(
         auto.next(&CodexErr::RequestTimeout)
@@ -64,6 +69,24 @@ fn deepinfra_auto_retries_timeouts_but_not_unrelated_errors() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn deepinfra_auto_switches_immediately_if_flex_times_out_before_sse() {
+    let mut auto = DeepInfraAutoRetry::for_request(
+        &ModelProviderInfo::create_deepinfra_provider(),
+        DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID,
+    )
+    .expect("Auto policy");
+    auto.observe_response_event(&ResponseEvent::ServerReasoningIncluded(true));
+    assert_eq!(
+        auto.next(&CodexErr::RequestTimeout)
+            .expect("Priority fallback")
+            .0,
+        Duration::ZERO,
+    );
+    assert!(auto.use_priority());
+    assert!(auto.next(&CodexErr::RequestTimeout).is_none());
 }
 
 #[tokio::test]

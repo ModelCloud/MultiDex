@@ -67,9 +67,11 @@ experimental_bearer_token = "<deepinfra-api-key>"
 ```
 
 Auto starts each request on Flex. For HTTP 429/529 capacity errors, timeouts,
-or dropped connections, it retries Flex three times, waiting 5 seconds before
-each retry. If Flex still fails, MultiDex tries Priority once. The next request
-starts on Flex again. Other errors do not trigger failover. Select **Flex** or
+or dropped connections before the first valid SSE response event, MultiDex
+tries Priority immediately. If valid SSE data already arrived on that request,
+Auto retries Flex three times, waiting 5 seconds before each retry, then tries
+Priority once if Flex still fails. The next request starts on Flex again.
+Other errors do not trigger failover. Select **Flex** or
 **Priority** directly to use a fixed tier instead.
 
 ### Lithos

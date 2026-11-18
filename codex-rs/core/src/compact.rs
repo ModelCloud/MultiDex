@@ -354,9 +354,7 @@ async fn run_compact_task_inner_impl(
             &sess,
             &step_context,
             &mut client_session,
-            deepinfra_auto
-                .as_ref()
-                .is_some_and(DeepInfraAutoRetry::use_priority),
+            &mut deepinfra_auto,
             &responses_metadata,
             &Arc::new(prompt),
             compaction_metadata.phase(),
@@ -906,7 +904,7 @@ async fn drain_to_completed(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
     client_session: &mut ModelClientSession,
-    deepinfra_auto_priority: bool,
+    deepinfra_auto: &mut Option<DeepInfraAutoRetry>,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Arc<Prompt>,
     phase: CompactionPhase,
@@ -933,7 +931,9 @@ async fn drain_to_completed(
                         .await,
                     reasoning_summary: turn_context.reasoning_summary(),
                     service_tier: turn_context.config.service_tier.clone(),
-                    deepinfra_auto_priority,
+                    deepinfra_auto_priority: deepinfra_auto
+                        .as_ref()
+                        .is_some_and(DeepInfraAutoRetry::use_priority),
                 },
                 responses_metadata,
                 // Rollout tracing currently models remote compaction only; local compaction streams
@@ -951,6 +951,11 @@ async fn drain_to_completed(
                 "stream closed before response.completed".into(),
             ));
         };
+        if let Ok(event) = &event
+            && let Some(auto) = &mut *deepinfra_auto
+        {
+            auto.observe_response_event(event);
+        }
         match event {
             // Keep each attempt isolated until the response completes successfully.
             Ok(ResponseEvent::OutputItemDone(item)) => output.push(item),

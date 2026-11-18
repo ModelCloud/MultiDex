@@ -490,22 +490,25 @@ fn deepinfra_variants_use_one_wire_model_and_session_cache_key() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -> anyhow::Result<()>
-{
+async fn deepinfra_auto_backs_off_only_after_valid_sse() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let attempt = AtomicUsize::new(0);
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .respond_with(move |_: &wiremock::Request| {
             match attempt.fetch_add(1, Ordering::SeqCst) {
-                0 | 3 => ResponseTemplate::new(429),
-                1 | 4 => ResponseTemplate::new(529),
+                0 | 5 | 7 => ResponseTemplate::new(429),
+                6 | 8 => ResponseTemplate::new(529),
                 2 => ResponseTemplate::new(200)
+                    .insert_header("openai-model", "metadata-only")
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(": keepalive\n\ndata: malformed\n\n"),
+                4 => ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(
                         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"interrupted\"}}\n\n",
                     ),
-                5 => ResponseTemplate::new(200)
+                1 | 3 | 9 => ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(
                         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"recovered\"}}\n\n",
@@ -513,7 +516,7 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
                 _ => panic!("unexpected extra attempt"),
             }
         })
-        .expect(6)
+        .expect(10)
         .mount(&server)
         .await;
 
@@ -536,13 +539,20 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
     let prompt = Arc::new(Prompt::default());
     let trace = InferenceTraceContext::disabled();
     let mut retry = ResponsesStreamRetryState::for_sampling(client.provider_info(), &model.slug);
-    'attempts: for (index, expected_status) in
-        [Some(429), Some(529), None, Some(429), Some(529), None]
-            .into_iter()
-            .enumerate()
-    {
-        if index == 5 {
-            // Start a new logical request on the very same client session.
+    'attempts: for (index, expected_status, delay) in [
+        (0, Some(429), 0), // Capacity before the stream: switch straight to Priority.
+        (1, None, 0),
+        (2, None, 0), // Headers and malformed SSE do not establish a stream.
+        (3, None, 0),
+        (4, None, 5), // Valid SSE then EOF: begin the Flex backoff.
+        (5, Some(429), 5),
+        (6, Some(529), 5),
+        (7, Some(429), 0), // The Flex retry budget is exhausted.
+        (8, Some(529), 0), // A failed Priority request is not retried.
+        (9, None, 0),
+    ] {
+        if matches!(index, 2 | 4 | 9) {
+            // Each new logical request uses Flex even on the same client session.
             retry = ResponsesStreamRetryState::for_sampling(client.provider_info(), &model.slug);
         }
         let opened = client_session
@@ -564,15 +574,20 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
             Err(error) => error,
             Ok(opened) => {
                 let mut stream = opened.into_raw_stream()?;
+                let mut saw_header_metadata = false;
                 loop {
                     match stream.next().await.expect("response stream terminal event") {
-                        Ok(ResponseEvent::Completed { .. }) => {
-                            assert_eq!(index, 5, "only the fresh request should complete");
-                            break 'attempts;
+                        Ok(event) => {
+                            saw_header_metadata |= matches!(event, ResponseEvent::ServerModel(_));
+                            retry.observe_response_event(&event);
+                            if matches!(event, ResponseEvent::Completed { .. }) {
+                                assert!(matches!(index, 1 | 3 | 9));
+                                continue 'attempts;
+                            }
                         }
-                        Ok(_) => {}
                         Err(error) => {
-                            assert_eq!(index, 2, "only the interrupted request has a body error");
+                            assert!(matches!(index, 2 | 4), "unexpected SSE failure");
+                            assert_eq!(saw_header_metadata, index == 2);
                             assert!(matches!(error.details(), CodexErrorDetails::Stream(_)));
                             break error;
                         }
@@ -595,7 +610,7 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
         .await;
         let elapsed = start.elapsed();
         tokio::time::resume();
-        if index == 4 {
+        if index == 8 {
             assert_eq!(
                 result
                     .expect_err("no retry on Priority")
@@ -605,11 +620,11 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
         } else {
             result?;
         }
-        if index < 3 {
-            let delay = Duration::from_secs(5);
-            assert!((delay..=delay + Duration::from_millis(1)).contains(&elapsed));
-        } else {
+        if delay == 0 {
             assert_eq!(elapsed, Duration::ZERO);
+        } else {
+            let delay = Duration::from_secs(delay);
+            assert!((delay..=delay + Duration::from_millis(1)).contains(&elapsed));
         }
     }
 
@@ -629,7 +644,13 @@ async fn deepinfra_auto_retries_flex_then_uses_priority_for_only_one_request() -
                 .to_owned())
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    assert_eq!(tiers, ["flex", "flex", "flex", "flex", "priority", "flex"]);
+    assert_eq!(
+        tiers,
+        [
+            "flex", "priority", "flex", "priority", "flex", "flex", "flex", "flex", "priority",
+            "flex",
+        ]
+    );
     Ok(())
 }
 

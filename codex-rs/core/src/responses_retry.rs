@@ -11,6 +11,7 @@ use crate::context::ContextualUserFragment;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use codex_api::ResponseEvent;
 use codex_client::RetryOperation;
 use codex_features::Feature;
 use codex_http_client::RetryAfter;
@@ -30,24 +31,46 @@ const DEEPINFRA_FLEX_MAX_RETRIES: u64 = 3;
 const DEEPINFRA_FLEX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub(crate) enum DeepInfraAutoRetry {
-    Flex { retries: u64 },
+    FlexStarting,
+    FlexStreaming { retries: u64 },
     Priority,
 }
 
 impl DeepInfraAutoRetry {
     pub(crate) fn for_request(provider: &ModelProviderInfo, model: &str) -> Option<Self> {
         (provider.is_deepinfra() && model == DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID)
-            .then_some(Self::Flex { retries: 0 })
+            .then_some(Self::FlexStarting)
     }
 
     pub(crate) fn use_priority(&self) -> bool {
         matches!(self, Self::Priority)
     }
 
+    pub(crate) fn observe_response_event(&mut self, event: &ResponseEvent) {
+        // Header-derived events don't prove that the SSE body has started.
+        if matches!(self, Self::FlexStarting)
+            && matches!(
+                event,
+                ResponseEvent::Created { .. }
+                    | ResponseEvent::OutputItemAdded(_)
+                    | ResponseEvent::OutputItemDone(_)
+                    | ResponseEvent::OutputTextDelta(_)
+                    | ResponseEvent::ToolCallInputDelta { .. }
+                    | ResponseEvent::ReasoningSummaryDelta { .. }
+                    | ResponseEvent::ReasoningSummaryDone { .. }
+                    | ResponseEvent::ReasoningContentDelta { .. }
+                    | ResponseEvent::ReasoningSummaryPartAdded { .. }
+                    | ResponseEvent::Completed { .. }
+            )
+        {
+            *self = Self::FlexStreaming { retries: 0 };
+        }
+    }
+
     fn next(&mut self, error: &CodexErr) -> Option<(Duration, String)> {
-        let Self::Flex { retries } = self else {
+        if self.use_priority() {
             return None;
-        };
+        }
         let transient = match error.details() {
             CodexErrorDetails::RetryLimit(_) | CodexErrorDetails::UnexpectedStatus(_) => {
                 matches!(
@@ -73,17 +96,21 @@ impl DeepInfraAutoRetry {
         if !transient {
             return None;
         }
-        if *retries == DEEPINFRA_FLEX_MAX_RETRIES {
-            *self = Self::Priority;
+        if let Self::FlexStreaming { retries } = self
+            && *retries < DEEPINFRA_FLEX_MAX_RETRIES
+        {
+            *retries += 1;
             return Some((
-                Duration::ZERO,
-                "DeepInfra Auto: switching to Priority".to_string(),
+                DEEPINFRA_FLEX_RETRY_DELAY,
+                format!(
+                    "DeepInfra Auto: retrying Flex ({retries}/{DEEPINFRA_FLEX_MAX_RETRIES}) in 5s"
+                ),
             ));
         }
-        *retries += 1;
+        *self = Self::Priority;
         Some((
-            DEEPINFRA_FLEX_RETRY_DELAY,
-            format!("DeepInfra Auto: retrying Flex ({retries}/{DEEPINFRA_FLEX_MAX_RETRIES}) in 5s"),
+            Duration::ZERO,
+            "DeepInfra Auto: switching to Priority".to_string(),
         ))
     }
 
@@ -147,6 +174,12 @@ impl ResponsesStreamRetryState {
         self.deepinfra_auto
             .as_ref()
             .is_some_and(DeepInfraAutoRetry::use_priority)
+    }
+
+    pub(crate) fn observe_response_event(&mut self, event: &ResponseEvent) {
+        if let Some(auto) = &mut self.deepinfra_auto {
+            auto.observe_response_event(event);
+        }
     }
 }
 

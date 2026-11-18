@@ -2428,7 +2428,7 @@ async fn run_sampling_request(
             sampling_step_context,
             Arc::clone(&turn_store),
             client_session,
-            retry_state.use_deepinfra_priority(),
+            &mut retry_state,
             &responses_metadata,
             prompt,
             pending_audio,
@@ -3333,7 +3333,7 @@ async fn try_run_sampling_request(
     step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     client_session: &mut ModelClientSession,
-    deepinfra_auto_priority: bool,
+    retry_state: &mut ResponsesStreamRetryState,
     responses_metadata: &CodexResponsesMetadata,
     mut prompt: Prompt,
     mut pending_audio: Option<codex_history::AcceptedFileAudio>,
@@ -3420,6 +3420,7 @@ async fn try_run_sampling_request(
     let mut resampling = crate::guardian::ResponseResampling::new(&sess);
     let prompt = Arc::new(prompt);
     let interrupt_at_boundary = SamplingInterrupt::enabled(&turn_context);
+    let deepinfra_auto_priority = retry_state.use_deepinfra_priority();
     let mut stream_request = async |prompt: &Arc<Prompt>| {
         let send = client_session
             .open_model_response(
@@ -3669,6 +3670,8 @@ async fn try_run_sampling_request(
                 break Err(err);
             }
         };
+
+        retry_state.observe_response_event(&event);
 
         // A steer can cut off unread items on an HTTP stream while the owner posts its bill.
         // Consume the terminal accounting decision before opening the follow-up request.
