@@ -782,6 +782,49 @@ struct HttpSession {
     /// Wire tool contract of `last_request`. Cleared whenever the chain may have lost the
     /// referenced response, so the next request sends the full tool list.
     last_wire_tools: Option<WireToolsHash>,
+    /// The response to `last_request` advertised tool inheritance.
+    last_response_inherits_tools: bool,
+    /// Verification of the last request that omitted `tools`: the provider must echo the
+    /// omitted tools in that response's `response.completed`.
+    pending_tools_echo: Option<PendingToolsEcho>,
+}
+
+/// The tools a tool-less continuation relied on the provider to inherit.
+#[derive(Debug)]
+struct PendingToolsEcho {
+    echo: codex_api::CompletedToolsEcho,
+    expected: u64,
+}
+
+/// Checks the `tools` echoed by the response to a tool-less continuation. Returns `false` when
+/// the response completed without echoing exactly the omitted tools.
+fn tools_echo_matches(pending: &PendingToolsEcho) -> bool {
+    match pending.echo.get() {
+        Some(Some(digest)) => *digest == pending.expected,
+        Some(None) => false,
+        // The stream never completed, so no stored response depends on the inherited tools.
+        None => true,
+    }
+}
+
+/// Whether a continuation to `endpoint` may omit unchanged tools.
+///
+/// `continued_response_inherits_tools` is whether the response being continued advertised
+/// tool inheritance.
+fn tools_inheritance_allowed(
+    configured: codex_model_provider_info::ToolInheritance,
+    endpoint: &str,
+    continued_response_inherits_tools: bool,
+) -> bool {
+    use codex_model_provider_info::ToolInheritance;
+    if crate::endpoint_capabilities::tools_inheritance_disabled(endpoint) {
+        return false;
+    }
+    match configured {
+        ToolInheritance::Disabled => false,
+        ToolInheritance::Enabled => true,
+        ToolInheritance::Auto => continued_response_inherits_tools,
+    }
 }
 
 /// A resumable HTTP continuation: the stored response and the exact request
@@ -797,6 +840,8 @@ struct HttpResumePoint {
     /// Wire tool contract of `request`, used to decide whether a resumed continuation may
     /// rely on the provider inheriting the stored tools.
     wire_tools: Option<WireToolsHash>,
+    /// The response advertised tool inheritance.
+    inherits_tools: bool,
 }
 
 /// Fingerprint of the exact `tools` JSON sent on the wire.
@@ -2417,6 +2462,7 @@ impl<'a> ResponsesHttpExecutor<'a> {
             },
             compression,
             turn_state: Some(Arc::clone(turn_state)),
+            completed_tools: None,
         }
     }
 }
@@ -3071,6 +3117,7 @@ impl ResponsesHttpExecutor<'_> {
                         request: last_request.clone(),
                         response: last_response.clone(),
                         wire_tools: http_session.last_wire_tools,
+                        inherits_tools: http_session.last_response_inherits_tools,
                     }),
                     _ => None,
                 };
@@ -3126,11 +3173,40 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = wire.input;
                 interceptors.insert(0, interceptor);
             }
+            if let Some(pending) = http_session.pending_tools_echo.take()
+                && !tools_echo_matches(&pending)
+            {
+                // The provider did not keep the tools MultiDex omitted. Send full tools to this
+                // endpoint for the rest of the process.
+                crate::endpoint_capabilities::disable_tools_inheritance(&compression_endpoint);
+                http_session.last_wire_tools = None;
+                warn!(
+                    "Responses provider did not echo the inherited tools; sending full tools from now on"
+                );
+            }
+            let sent_tools = request.tools.clone();
             let (wire_tools, tools_omitted) = omit_inherited_tools(
-                self.client.provider_info().inherits_tools_on_continuation,
+                tools_inheritance_allowed(
+                    self.client.provider_info().inherits_tools_on_continuation,
+                    &compression_endpoint,
+                    http_session.last_response_inherits_tools,
+                ),
                 &mut request,
                 http_session.last_wire_tools,
             );
+            let pending_tools_echo = if tools_omitted
+                && let Some(tools) = sent_tools.as_ref()
+                && let Ok(tools) = serde_json::to_value(tools)
+            {
+                let echo = codex_api::CompletedToolsEcho::default();
+                options.completed_tools = Some(Arc::clone(&echo));
+                Some(PendingToolsEcho {
+                    echo,
+                    expected: codex_api::tools_digest(&tools),
+                })
+            } else {
+                None
+            };
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -3154,11 +3230,17 @@ impl ResponsesHttpExecutor<'_> {
 
             match stream_result {
                 Ok(stream) => {
+                    let capabilities = crate::endpoint_capabilities::Capabilities::parse(
+                        stream.capabilities.as_deref(),
+                    );
+                    http_session.pending_tools_echo =
+                        pending_tools_echo.filter(|_| capabilities.echoes_completed_tools());
                     if negotiated_compression {
                         crate::request_compression::record_accepted(
                             &compression_endpoint,
                             compression,
                             stream.accept_encoding.as_deref(),
+                            capabilities.request_zstd,
                         );
                     }
                     if is_continuation_request {
@@ -3176,6 +3258,7 @@ impl ResponsesHttpExecutor<'_> {
                         };
                     http_session.last_request = Some(full_request);
                     http_session.last_wire_tools = wire_tools;
+                    http_session.last_response_inherits_tools = capabilities.tools_inheritance;
                     http_session.last_response_rx = last_response_rx;
                     http_session.last_response = None;
                     http_session.resume_point = resume_point;
@@ -4005,6 +4088,7 @@ impl ModelClientSession {
         };
         self.http_session.last_request = Some(resume_point.request);
         self.http_session.last_wire_tools = resume_point.wire_tools;
+        self.http_session.last_response_inherits_tools = resume_point.inherits_tools;
         self.http_session.last_response = Some(resume_point.response);
         self.http_session.last_response_rx = None;
         true

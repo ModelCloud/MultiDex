@@ -9,6 +9,7 @@ mod apply_patch;
 mod apps;
 mod client;
 mod client_common;
+mod endpoint_capabilities;
 mod model_request;
 mod multidex_tool_namespace;
 mod realtime_context;

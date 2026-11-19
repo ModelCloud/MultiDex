@@ -3329,8 +3329,12 @@
           "type": "object"
         },
         "inherits_tools_on_continuation": {
-          "description": "Whether this provider reuses the stored `tools` of the response referenced by `previous_response_id` when a continuation request omits `tools`.\n\nWhen enabled, a continuation whose tool declarations are identical to the request that produced the referenced response omits `tools`. First requests, changed tools, and requests after any failure always send the full tool list. It has no effect unless the provider uses `previous_response_id` continuation (`supports_responses_continuation`).",
-          "type": "boolean"
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolInheritance"
+            }
+          ],
+          "description": "Whether continuation requests may omit `tools` and rely on the provider reusing the stored `tools` of the response referenced by `previous_response_id`.\n\n`\"auto\"` (the default) omits them only for an endpoint whose latest response advertised the `responses.tools-inheritance/1` capability. `true` always allows omission and `false` never does. Even when allowed, only a continuation whose tool declarations are identical to the request that produced the referenced response omits `tools`; first requests, changed tools, and requests after any failure send the full list. If a response to a tool-less continuation does not echo the same tools, omission stops for that endpoint. It has no effect unless the provider uses `previous_response_id` continuation (`supports_responses_continuation`)."
         },
         "location": {
           "description": "Google Cloud location for the built-in GCP provider. Takes precedence over `GOOGLE_CLOUD_LOCATION`; defaults to `global` when neither is set.",
@@ -5377,6 +5381,23 @@
           "type": "string"
         }
       ]
+    },
+    "ToolInheritance": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ToolInheritanceMode"
+        }
+      ],
+      "description": "`\"auto\"`, `true`, or `false`."
+    },
+    "ToolInheritanceMode": {
+      "enum": [
+        "auto"
+      ],
+      "type": "string"
     },
     "ToolRegistryConfigToml": {
       "additionalProperties": false,

@@ -90,7 +90,7 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
         supports_responses_continuation: false,
         multidex_compatibility: false,
         request_compression: None,
-        inherits_tools_on_continuation: false,
+        inherits_tools_on_continuation: Default::default(),
         provider: None,
     }
 }

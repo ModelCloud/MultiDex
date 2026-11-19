@@ -140,24 +140,41 @@ default.
     for the rest of the process. The turn does not fail because of the
     fallback. A later response advertising `zstd` turns compression back on.
   - `"zstd"` always compresses and `"none"` never does.
-- `inherits_tools_on_continuation = true` (off by default): when a request
-  continues a stored response with `previous_response_id` and its tool list is
-  byte-identical to the one recorded for that response, MultiDex omits `tools`
-  and the endpoint reuses the stored list. `tool_choice` and
-  `parallel_tool_calls` are still sent. First requests, changed tools, and the
-  request after any failure send the full list. If the endpoint rejects a
-  continuation without `tools`, MultiDex retries once with the full tool list,
-  and resends the full history when the stored response no longer exists.
-  This needs `supports_responses_continuation`, which the `multidex` provider
-  enables automatically. It stays opt-in because a server that does not
-  inherit stored tools would silently run the turn without tools.
+- `inherits_tools_on_continuation = "auto" | true | false` (default
+  `"auto"`, every Responses provider) lets a `previous_response_id`
+  continuation omit `tools` so the endpoint reuses the stored list.
+  - `"auto"` omits `tools` only when the response being continued carried
+    `responses.tools-inheritance/1` in its `X-Inference-Ultra-Capabilities`
+    header (Lite sends it on every `/v1/` response). OpenAI and other servers
+    never send it, so their requests are unchanged. The first request on an
+    endpoint always declares tools, and a response without the token stops
+    omission for the next continuation.
+  - `true` always allows omission; `false` never omits.
+  - Even when allowed, `tools` is omitted only when the tool list is identical
+    to the one sent (or inherited) on the continued turn. First requests,
+    changed tools, and the request after any failure send the full list.
+    `tool_choice` and `parallel_tool_calls` are always sent.
+  - Safety net: when `tools` was omitted, the tools echoed in that response's
+    `response.completed` must match the omitted list. A missing or different
+    echo stops omission for that endpoint for the rest of the process. The
+    check is skipped when the response advertises
+    `responses.stream-tools/1;mode=omit`, which carries no echo.
+  - If the endpoint rejects a tool-less continuation, MultiDex retries once
+    with the full tool list. A `response_not_found` error resends the full
+    history and tools without `previous_response_id`.
+  - It needs `supports_responses_continuation`, which the `multidex` provider
+    enables automatically.
 
-For Lite (Inference-Ultra's Responses server), compression needs no
-configuration. To also skip resending unchanged tools:
+`request_compression = "auto"` also treats a `request-encoding/1` capability
+whose `codings` include `zstd` as support for zstd request bodies.
+
+For Lite (Inference-Ultra's Responses server), neither option needs
+configuration once Lite advertises its capabilities (Inference-Ultra main at
+or after a418c0f9, after a restart). Optional overrides:
 
 ```toml
 [model_providers.multidex]
 # ...existing fields...
-inherits_tools_on_continuation = true # Lite inherits stored tools on previous_response_id
-# request_compression = "zstd"        # optional: skip negotiation once Lite runs Inference-Ultra >= 293d043f
+# inherits_tools_on_continuation = true # omit unchanged tools even without the capability header
+# request_compression = "zstd"          # skip negotiation once Lite decodes zstd request bodies
 ```
