@@ -3675,22 +3675,22 @@ fn multidex_tool_contract_keeps_continuation_through_catalog_drift() -> anyhow::
     assert_eq!(
         generic
             .new_session()
-            .stable_inference_tools(&model_info.slug, "window-1", &first),
+            .stable_inference_tools(&model_info.slug, "window-1", &first, || 0),
         None
     );
     let session = local.new_session();
     let advertised = session
-        .stable_inference_tools(&model_info.slug, "window-1", &first)
+        .stable_inference_tools(&model_info.slug, "window-1", &first, || 0)
         .expect("multidex providers keep a tool contract");
     let readvertised = session
-        .stable_inference_tools(&model_info.slug, "window-1", &drifted)
+        .stable_inference_tools(&model_info.slug, "window-1", &drifted, || 0)
         .expect("multidex providers keep a tool contract");
     assert_eq!(readvertised, first);
     // A later turn reuses the contract recorded by the thread, not the turn.
     assert_eq!(
         local
             .new_session()
-            .stable_inference_tools(&model_info.slug, "window-1", &drifted),
+            .stable_inference_tools(&model_info.slug, "window-1", &drifted, || 0),
         Some(Arc::clone(&first))
     );
 
@@ -3723,6 +3723,61 @@ fn multidex_tool_contract_keeps_continuation_through_catalog_drift() -> anyhow::
         None
     );
     Ok(())
+}
+
+#[test]
+fn multidex_tool_contract_withholds_new_tools_until_renewed() {
+    let generic = test_model_client(SessionSource::Cli);
+    let mut local_provider = generic.provider_info().clone();
+    local_provider.multidex_compatibility = true;
+    let local = generic.with_provider(create_model_provider(
+        local_provider,
+        /*auth_manager*/ None,
+    ));
+    let model_info = test_model_info();
+    let tool = |name: &str| {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.into(),
+            description: format!("{name} tool."),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::default(),
+            output_schema: None,
+        })
+    };
+    let declared: Arc<[ToolSpec]> = vec![tool("exec_command"), tool("_edit_page")].into();
+    let published: Arc<[ToolSpec]> = vec![
+        tool("exec_command"),
+        tool("_edit_page"),
+        tool("_create_template"),
+    ]
+    .into();
+    let long_conversation = || 340_000;
+    let advertise = |tools: &Arc<[ToolSpec]>| {
+        local
+            .new_session()
+            .stable_inference_tools(&model_info.slug, "window-1", tools, long_conversation)
+            .expect("multidex providers keep a tool contract")
+    };
+
+    assert_eq!(advertise(&declared), declared);
+    assert_eq!(advertise(&published), declared);
+
+    // A provider without a cached prefix keeps advertising the live catalog.
+    generic.renew_tool_contract("explicit MCP server reconnect");
+    assert_eq!(
+        generic.new_session().stable_inference_tools(
+            &model_info.slug,
+            "window-1",
+            &published,
+            long_conversation
+        ),
+        None
+    );
+
+    local.renew_tool_contract("explicit MCP server reconnect");
+    assert_eq!(advertise(&published), published);
+    assert_eq!(advertise(&declared), published);
 }
 
 #[tokio::test]

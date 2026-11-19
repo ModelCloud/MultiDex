@@ -60,3 +60,27 @@ fn plugin_install_elicitation_telemetry_metadata_requires_install_tool_suggestio
         None
     );
 }
+
+#[test]
+fn only_requested_mcp_changes_renew_a_thread_tool_contract() {
+    for reason in [
+        McpRefreshReason::ExplicitServerReconnect,
+        McpRefreshReason::McpConfigReloaded,
+        McpRefreshReason::PluginInstalled,
+    ] {
+        assert!(
+            deliberate_tool_catalog_change(reason).is_some(),
+            "{reason:?}"
+        );
+    }
+    // Background catalog refreshes are the drift the contract exists to hold back.
+    for reason in [
+        McpRefreshReason::CodexAppsToolRefresh,
+        McpRefreshReason::HardRefreshCodexAppsTools,
+        McpRefreshReason::ExtensionCatalogChanged,
+        McpRefreshReason::RuntimeAuthChanged,
+        McpRefreshReason::EnvironmentBindingsChanged,
+    ] {
+        assert_eq!(deliberate_tool_catalog_change(reason), None, "{reason:?}");
+    }
+}

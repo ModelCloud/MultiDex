@@ -454,8 +454,29 @@ impl Session {
     }
 
     pub(super) fn mark_mcp_runtime_dirty(&self, reason: McpRefreshReason) {
+        if let Some(change) = deliberate_tool_catalog_change(reason) {
+            self.renew_tool_contracts(change);
+        }
         self.mcp_refresh.invalidate(reason);
         self.services.mcp_runtime.invalidate_apps_tool_refresh();
+    }
+
+    /// Lets this thread's next tool catalog change reach prefix-cached providers once, for a
+    /// change the user or client asked for. Background catalog drift stays held back.
+    pub(super) fn renew_tool_contracts(&self, reason: &'static str) {
+        self.services.model_client.renew_tool_contract(reason);
+        // A turn on another provider keeps its own contract; renew it too when reachable.
+        match self.services.alternate_model_clients.try_lock() {
+            Ok(clients) => {
+                for client in clients.iter() {
+                    client.renew_tool_contract(reason);
+                }
+            }
+            Err(_) => debug!(
+                reason,
+                "alternate model clients busy; tool contract not renewed"
+            ),
+        }
     }
 
     #[tracing::instrument(
@@ -943,6 +964,7 @@ impl Session {
             }
             state.session_configuration.original_config_do_not_use = Arc::new(config);
         }
+        self.renew_tool_contracts("skill MCP dependencies added");
         // Claim after config mutation, before capturing the state this forced refresh handles.
         let mut refresh_invalidation = self
             .mcp_refresh
@@ -1431,6 +1453,21 @@ fn plugin_install_elicitation_telemetry_metadata(
         tool_id: metadata_owned_string(meta, TOOL_SUGGESTION_TOOL_ID_KEY)?,
         tool_name: metadata_owned_string(meta, MCP_ELICITATION_TOOL_NAME_KEY)?,
     })
+}
+
+/// Names MCP refreshes that the user or client requested and that are meant to change the
+/// tools of running threads. Other refreshes (catalog polling, auth or environment churn) must
+/// not rewrite a prefix-cached thread's tool declarations.
+fn deliberate_tool_catalog_change(reason: McpRefreshReason) -> Option<&'static str> {
+    match reason {
+        McpRefreshReason::ExplicitServerReconnect => Some("explicit MCP server reconnect"),
+        McpRefreshReason::McpConfigReloaded => Some("MCP configuration reloaded"),
+        McpRefreshReason::McpOAuthLoginCompleted => Some("MCP OAuth login completed"),
+        McpRefreshReason::PluginInstalled => Some("plugin installed"),
+        McpRefreshReason::PluginUninstalled => Some("plugin uninstalled"),
+        McpRefreshReason::PluginOAuthLoginCompleted => Some("plugin OAuth login completed"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
