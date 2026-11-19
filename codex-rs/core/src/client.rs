@@ -1054,6 +1054,8 @@ pub(crate) struct SamplingOptions {
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) service_tier: Option<String>,
+    /// Internal fallback for the current Auto request, independent of user-configured tiers.
+    pub(crate) deepinfra_auto_priority: bool,
 }
 
 enum WebsocketStreamOutcome {
@@ -1915,8 +1917,9 @@ impl ModelClient {
             .provider
             .info()
             .is_deepinfra()
-            .then(|| codex_model_provider_info::deepinfra_service_tier(&model_info.slug))
-            .flatten();
+            .then(|| codex_model_provider_info::deepinfra_variant(&model_info.slug))
+            .flatten()
+            .map(codex_model_provider_info::DeepInfraVariant::initial_service_tier);
         let service_tier = if let Some(tier) = deepinfra_tier {
             Some(tier.to_string())
         } else {
@@ -2909,6 +2912,16 @@ impl ResponsesHttpExecutor<'_> {
                 responses_metadata,
                 include_internal,
             )?;
+            let deepinfra_auto = self.client.provider_info().is_deepinfra()
+                && model_info.slug
+                    == codex_model_provider_info::DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID;
+            if deepinfra_auto && sampling.deepinfra_auto_priority {
+                request.service_tier = Some(
+                    codex_model_provider_info::DeepInfraVariant::Priority
+                        .initial_service_tier()
+                        .to_string(),
+                );
+            }
             if is_local_responses_endpoint(&client_setup.api_provider.base_url) {
                 request.max_output_tokens = Some(LOCAL_RESPONSES_MAX_OUTPUT_TOKENS);
                 options.extra_headers.insert(
@@ -3172,7 +3185,15 @@ impl ResponsesHttpExecutor<'_> {
                     }
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
-                    let err = self.client.state.provider.map_api_error(err);
+                    let err = match err {
+                        ApiError::Transport(error @ TransportError::Network(_))
+                            if deepinfra_auto =>
+                        {
+                            // Keep the transport marker used for SSE body failures as well.
+                            CodexErr::Stream(format!("Transport error: {error}"))
+                        }
+                        error => self.client.state.provider.map_api_error(error),
+                    };
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),
@@ -3633,6 +3654,7 @@ impl ModelClientSession {
                     reasoning_effort: effort,
                     reasoning_summary: summary,
                     service_tier,
+                    deepinfra_auto_priority: false,
                 },
                 responses_metadata,
                 /*warmup*/ true,
@@ -3700,6 +3722,7 @@ impl ModelClientSession {
                 reasoning_effort: effort,
                 reasoning_summary: summary,
                 service_tier,
+                deepinfra_auto_priority: false,
             },
             responses_metadata,
             inference_trace,

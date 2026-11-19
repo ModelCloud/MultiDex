@@ -54,6 +54,26 @@ The adaptation replaces Harness-only file, background-job, goal, and delegation
 tools with MultiDex equivalents; it is not a byte-for-byte copy. Explicit
 user-configured instructions can still override the model's default prompt.
 
+### DeepInfra
+
+Choose **Auto** in MultiDex's `/model` picker, or set:
+
+```toml
+model = "deepinfra/deepseek-v4.1-flash-1017-auto"
+model_provider = "deepinfra"
+
+[model_providers.deepinfra]
+experimental_bearer_token = "<deepinfra-api-key>"
+```
+
+Auto starts each request on Flex. For HTTP 429/529 capacity errors, timeouts,
+or dropped connections before the first valid SSE response event, MultiDex
+tries Priority immediately. If valid SSE data already arrived on that request,
+Auto retries Flex three times, waiting 5 seconds before each retry, then tries
+Priority once if Flex still fails. The next request starts on Flex again.
+Other errors do not trigger failover. Select **Flex** or
+**Priority** directly to use a fixed tier instead.
+
 ### Lithos
 
 The built-in provider ID is `lithos`. Its credential also comes only from

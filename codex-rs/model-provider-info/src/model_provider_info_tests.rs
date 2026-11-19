@@ -1277,12 +1277,16 @@ fn deepinfra_provider_uses_responses_and_exact_endpoint() {
         Some("test-token")
     );
     assert_eq!(
-        deepinfra_service_tier(DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID),
-        Some("flex")
+        deepinfra_variant(DEEPINFRA_DSV41_FLASH_FLEX_MODEL_ID),
+        Some(DeepInfraVariant::Flex)
     );
     assert_eq!(
-        deepinfra_service_tier(DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID),
-        Some("priority")
+        deepinfra_variant(DEEPINFRA_DSV41_FLASH_PRIORITY_MODEL_ID),
+        Some(DeepInfraVariant::Priority)
+    );
+    assert_eq!(
+        deepinfra_variant(DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID),
+        Some(DeepInfraVariant::Auto)
     );
 
     let wrong_endpoint: ModelProviderInfo =

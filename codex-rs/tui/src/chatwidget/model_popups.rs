@@ -117,9 +117,8 @@ fn group_picker_rows(presets: Vec<ModelPreset>) -> Vec<PickerRow> {
 /// Derive a variant label from the slug suffix relative to the family's base
 /// slug; the base preset is the Regular variant.
 fn variant_label(preset: &ModelPreset, base_slug: &str) -> String {
-    if let Some(tier) = codex_model_provider_info::deepinfra_service_tier(&preset.model) {
-        let mut chars = tier.chars();
-        return chars.next().unwrap().to_uppercase().collect::<String>() + chars.as_str();
+    if let Some(variant) = codex_model_provider_info::deepinfra_variant(&preset.model) {
+        return variant.label().to_string();
     }
     let Some(suffix) = preset
         .model

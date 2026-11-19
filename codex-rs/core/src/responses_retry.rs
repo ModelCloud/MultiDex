@@ -11,9 +11,12 @@ use crate::context::ContextualUserFragment;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use codex_api::ResponseEvent;
 use codex_client::RetryOperation;
 use codex_features::Feature;
 use codex_http_client::RetryAfter;
+use codex_model_provider_info::DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
@@ -24,6 +27,111 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const DEEPINFRA_FLEX_MAX_RETRIES: u64 = 3;
+const DEEPINFRA_FLEX_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+pub(crate) enum DeepInfraAutoRetry {
+    FlexStarting,
+    FlexStreaming { retries: u64 },
+    Priority,
+}
+
+impl DeepInfraAutoRetry {
+    pub(crate) fn for_request(provider: &ModelProviderInfo, model: &str) -> Option<Self> {
+        (provider.is_deepinfra() && model == DEEPINFRA_DSV41_FLASH_AUTO_MODEL_ID)
+            .then_some(Self::FlexStarting)
+    }
+
+    pub(crate) fn use_priority(&self) -> bool {
+        matches!(self, Self::Priority)
+    }
+
+    pub(crate) fn observe_response_event(&mut self, event: &ResponseEvent) {
+        // Header-derived events don't prove that the SSE body has started.
+        if matches!(self, Self::FlexStarting)
+            && matches!(
+                event,
+                ResponseEvent::Created { .. }
+                    | ResponseEvent::OutputItemAdded(_)
+                    | ResponseEvent::OutputItemDone(_)
+                    | ResponseEvent::OutputTextDelta(_)
+                    | ResponseEvent::ToolCallInputDelta { .. }
+                    | ResponseEvent::ReasoningSummaryDelta { .. }
+                    | ResponseEvent::ReasoningSummaryDone { .. }
+                    | ResponseEvent::ReasoningContentDelta { .. }
+                    | ResponseEvent::ReasoningSummaryPartAdded { .. }
+                    | ResponseEvent::Completed { .. }
+            )
+        {
+            *self = Self::FlexStreaming { retries: 0 };
+        }
+    }
+
+    fn next(&mut self, error: &CodexErr) -> Option<(Duration, String)> {
+        if self.use_priority() {
+            return None;
+        }
+        let transient = match error.details() {
+            CodexErrorDetails::RetryLimit(_) | CodexErrorDetails::UnexpectedStatus(_) => {
+                matches!(
+                    error.http_status_code_value(),
+                    Some(408 | 429 | 504 | 524 | 529)
+                )
+            }
+            CodexErrorDetails::RequestTimeout
+            | CodexErrorDetails::ConnectionFailed(_)
+            | CodexErrorDetails::FlexUnavailable
+            | CodexErrorDetails::RateLimitExceeded(_)
+            | CodexErrorDetails::ServerOverloaded => true,
+            // The Responses SSE decoder reports idle timeouts, premature EOF and body
+            // transport errors as Stream(String). Do not retry arbitrary provider messages.
+            CodexErrorDetails::Stream(message) => {
+                matches!(
+                    message.as_str(),
+                    "idle timeout waiting for SSE" | "stream closed before response.completed"
+                ) || message.starts_with("Transport error: ")
+            }
+            _ => false,
+        };
+        if !transient {
+            return None;
+        }
+        if let Self::FlexStreaming { retries } = self
+            && *retries < DEEPINFRA_FLEX_MAX_RETRIES
+        {
+            *retries += 1;
+            return Some((
+                DEEPINFRA_FLEX_RETRY_DELAY,
+                format!(
+                    "DeepInfra Auto: retrying Flex ({retries}/{DEEPINFRA_FLEX_MAX_RETRIES}) in 5s"
+                ),
+            ));
+        }
+        *self = Self::Priority;
+        Some((
+            Duration::ZERO,
+            "DeepInfra Auto: switching to Priority".to_string(),
+        ))
+    }
+
+    pub(crate) async fn retry(
+        &mut self,
+        sess: &Session,
+        turn: &TurnContext,
+        error: CodexErr,
+    ) -> Result<(), CodexErr> {
+        let Some((delay, message)) = self.next(&error) else {
+            return Err(error);
+        };
+        let retry_at = Instant::now() + delay;
+        warn!(turn_id = %turn.sub_id, %error, "{message}");
+        sess.notify_stream_error(turn, message, error).await;
+        if !delay.is_zero() {
+            tokio::time::sleep_until(retry_at).await;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -45,6 +153,7 @@ pub(crate) fn is_terminal_sampling_outcome(error: &CodexErr) -> bool {
 }
 
 pub(crate) struct ResponsesStreamRetryState {
+    deepinfra_auto: Option<DeepInfraAutoRetry>,
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
@@ -53,9 +162,31 @@ pub(crate) struct ResponsesStreamRetryState {
     overloaded_retries: u64,
 }
 
+impl ResponsesStreamRetryState {
+    pub(crate) fn for_sampling(provider: &ModelProviderInfo, model: &str) -> Self {
+        Self {
+            deepinfra_auto: DeepInfraAutoRetry::for_request(provider, model),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn use_deepinfra_priority(&self) -> bool {
+        self.deepinfra_auto
+            .as_ref()
+            .is_some_and(DeepInfraAutoRetry::use_priority)
+    }
+
+    pub(crate) fn observe_response_event(&mut self, event: &ResponseEvent) {
+        if let Some(auto) = &mut self.deepinfra_auto {
+            auto.observe_response_event(event);
+        }
+    }
+}
+
 impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
+            deepinfra_auto: None,
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
@@ -115,6 +246,9 @@ pub(crate) async fn handle_response_stream_error(
     {
         warn!("Responses provider cannot replay stored context; retrying with full history");
         return Ok(());
+    }
+    if let Some(auto) = &mut retry_state.deepinfra_auto {
+        return auto.retry(sess, turn_context, err).await;
     }
     let operation = match request {
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,

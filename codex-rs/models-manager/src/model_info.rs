@@ -31,9 +31,10 @@ const MULTIDEX_DSV41_FLASH: &str = "DS v4.1 Flash 1017";
 /// The same DS v4.1 Flash model routed through OpenRouter's aggregate API.
 const OPENROUTER_DSV41_FLASH: &str = "deepseek/deepseek-v4.1-flash-1017";
 const WAFER_DSV41_FLASH: &str = "DeepSeek-V4.1-Flash-1017";
-const DEEPINFRA_DSV41_FLASH: [&str; 2] = [
+const DEEPINFRA_DSV41_FLASH: [&str; 3] = [
     "deepinfra/deepseek-v4.1-flash-1017-flex",
     "deepinfra/deepseek-v4.1-flash-1017-priority",
+    "deepinfra/deepseek-v4.1-flash-1017-auto",
 ];
 const LITHOS_DSV41_FLASH: [&str; 3] = [
     "deepseek-ai/DeepSeek-V4.1-Flash",
@@ -355,15 +356,20 @@ fn wafer_dsv41_flash_model_info() -> ModelInfo {
 }
 
 fn deepinfra_dsv41_flash_model_info(slug: &str) -> ModelInfo {
-    let variant = if slug == DEEPINFRA_DSV41_FLASH[0] {
-        "Flex"
+    let variant = match slug {
+        slug if slug == DEEPINFRA_DSV41_FLASH[0] => "Flex",
+        slug if slug == DEEPINFRA_DSV41_FLASH[1] => "Priority",
+        _ => "Auto",
+    };
+    let description = if variant == "Auto" {
+        "Starts on Flex. On transient errors, switches to Priority immediately before streaming, or after Flex retries if streaming already started."
     } else {
-        "Priority"
+        "DeepSeek v4.1 Flash 1017 served through DeepInfra Responses."
     };
     let mut model = dsv41_flash_model_info(
         slug,
         &format!("DeepSeek v4.1 Flash (DeepInfra {variant})"),
-        "DeepSeek v4.1 Flash 1017 served through DeepInfra Responses.",
+        description,
         ReasoningEffort::High,
         false,
         ReasoningSummary::None,
