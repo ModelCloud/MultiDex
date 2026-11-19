@@ -86,6 +86,8 @@ async fn continue_after_stream_error() {
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: false,
         capabilities: None,
         project_id: None,

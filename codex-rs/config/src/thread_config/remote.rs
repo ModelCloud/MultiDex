@@ -198,6 +198,8 @@ fn model_provider_from_proto(
         supports_websockets: provider.supports_websockets,
         supports_responses_continuation: provider.supports_responses_continuation,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: provider.supports_standalone_web_search,
         capabilities: provider
             .capabilities
@@ -247,6 +249,8 @@ fn model_provider_to_proto(
         include_internal_metadata: _,
         credential_file,
         multidex_compatibility: _,
+        request_compression: _,
+        inherits_tools_on_continuation: _,
         capabilities,
         provider: _,
     } = provider;
@@ -640,6 +644,8 @@ mod tests {
             supports_websockets: true,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: true,
             gateway_oauth: None,
             aws: None,

@@ -427,6 +427,9 @@ fn local_plaintext_compaction_is_sent_as_text_after_provider_switch() -> anyhow:
 #[path = "client_http_continuation_tests.rs"]
 mod http_continuation;
 
+#[path = "client_tool_inheritance_tests.rs"]
+mod tool_inheritance;
+
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }
@@ -3601,6 +3604,7 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
                 tokio_util::sync::CancellationToken::new(),
             ),
             upstream_request_id: None,
+            accept_encoding: None,
             interrupt: None,
         },
         telemetry: test_session_telemetry(),

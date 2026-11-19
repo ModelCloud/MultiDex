@@ -89,6 +89,8 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
         server_overloaded_retry_delay_ms: None,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         provider: None,
     }
 }

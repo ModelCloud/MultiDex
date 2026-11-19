@@ -241,6 +241,19 @@ impl<'de> Deserialize<'de> for WireApi {
     }
 }
 
+/// Request-body compression configured for a provider's Responses requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestCompression {
+    /// Negotiate: use zstd while the endpoint accepts it, and fall back to plain bodies when it
+    /// advertises or demonstrates that it cannot decode them.
+    Auto,
+    /// Send uncompressed request bodies.
+    None,
+    /// Compress request bodies with zstd (`Content-Encoding: zstd`).
+    Zstd,
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -348,6 +361,27 @@ pub struct ModelProviderInfo {
     #[serde(skip)]
     #[schemars(skip)]
     pub multidex_compatibility: bool,
+    /// Request-body compression for Responses requests sent to this provider.
+    ///
+    /// When unset, the built-in OpenAI provider keeps its existing behavior (zstd only with
+    /// ChatGPT authentication and request compression enabled), MultiDex providers (`multidex`
+    /// and `omnigent-multidex-*`, served by Lite) use `"auto"`, and every other provider sends
+    /// plain bodies. `"auto"` sends zstd
+    /// until the endpoint advertises (via an `Accept-Encoding` response header) or demonstrates
+    /// (HTTP 400, 415, or 422) that it cannot decode it, then resends that request uncompressed
+    /// and keeps plain bodies for that endpoint. `"zstd"` always compresses and `"none"` never
+    /// does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_compression: Option<RequestCompression>,
+    /// Whether this provider reuses the stored `tools` of the response referenced by
+    /// `previous_response_id` when a continuation request omits `tools`.
+    ///
+    /// When enabled, a continuation whose tool declarations are identical to the request that
+    /// produced the referenced response omits `tools`. First requests, changed tools, and
+    /// requests after any failure always send the full tool list. It has no effect unless the
+    /// provider uses `previous_response_id` continuation (`supports_responses_continuation`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherits_tools_on_continuation: bool,
     /// OpenRouter provider-routing preferences, forwarded verbatim as the
     /// request's top-level `provider` object. Only meaningful for providers
     /// that implement OpenRouter's extended Responses API.
@@ -741,6 +775,8 @@ other non-default provider fields are not supported"
             supports_websockets: true,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: true,
             capabilities: None,
             project_id: None,
@@ -788,6 +824,8 @@ other non-default provider fields are not supported"
             supports_websockets: false,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: false,
             capabilities: None,
             project_id: None,
@@ -832,6 +870,8 @@ other non-default provider fields are not supported"
             supports_websockets: false,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: false,
             project_id: None,
             location: None,
@@ -871,6 +911,8 @@ other non-default provider fields are not supported"
             supports_websockets: false,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: false,
             project_id: None,
             location: None,
@@ -1286,6 +1328,8 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: false,
         capabilities: None,
         project_id: None,

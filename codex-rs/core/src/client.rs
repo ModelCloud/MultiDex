@@ -779,6 +779,9 @@ struct HttpSession {
     /// cost for providers that keep rejecting, so a stale-pointer recovery cannot degrade into a
     /// full-history retry on every request.
     continuation_resets: u8,
+    /// Wire tool contract of `last_request`. Cleared whenever the chain may have lost the
+    /// referenced response, so the next request sends the full tool list.
+    last_wire_tools: Option<WireToolsHash>,
 }
 
 /// A resumable HTTP continuation: the stored response and the exact request
@@ -791,6 +794,58 @@ struct HttpSession {
 struct HttpResumePoint {
     request: ResponsesApiRequest,
     response: LastResponse,
+    /// Wire tool contract of `request`, used to decide whether a resumed continuation may
+    /// rely on the provider inheriting the stored tools.
+    wire_tools: Option<WireToolsHash>,
+}
+
+/// Fingerprint of the exact `tools` JSON sent on the wire.
+///
+/// Providers that inherit stored tools on `previous_response_id` continuations only see the
+/// omitted declarations through the referenced response, so omission is allowed only when the
+/// current wire contract is identical to the one recorded for that response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireToolsHash {
+    len: usize,
+    hash: u64,
+}
+
+impl WireToolsHash {
+    fn of(tools: &codex_api::ResponsesApiTools) -> Option<Self> {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+
+        let json = serde_json::to_string(tools).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        json.hash(&mut hasher);
+        Some(Self {
+            len: json.len(),
+            hash: hasher.finish(),
+        })
+    }
+}
+
+/// Omits `tools` from a `previous_response_id` continuation when the provider inherits the
+/// stored tools and the wire tool contract is unchanged from the request that produced the
+/// referenced response.
+///
+/// Returns the wire tool contract of the full request, which becomes the baseline for the next
+/// continuation once this request is accepted. `tool_choice` and `parallel_tool_calls` are
+/// per-request controls and are always sent.
+fn omit_inherited_tools(
+    inherits_tools_on_continuation: bool,
+    request: &mut ResponsesApiRequest,
+    previous_wire_tools: Option<WireToolsHash>,
+) -> (Option<WireToolsHash>, bool) {
+    let wire_tools = request.tools.as_ref().and_then(WireToolsHash::of);
+    let omit = inherits_tools_on_continuation
+        && request.previous_response_id.is_some()
+        && wire_tools.is_some()
+        && wire_tools == previous_wire_tools;
+    if omit {
+        request.tools = None;
+    }
+    (wire_tools, omit)
 }
 
 /// Maximum consecutive confirmed stale-response recoveries before surfacing the error.
@@ -2566,6 +2621,7 @@ impl HttpSession {
         self.last_response_rx = None;
         self.last_response = None;
         self.resume_point = None;
+        self.last_wire_tools = None;
     }
 }
 
@@ -2772,7 +2828,37 @@ impl ModelClientSession {
 }
 
 impl ResponsesHttpExecutor<'_> {
-    fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
+    /// Whether request compression for `endpoint` is negotiated (`auto`).
+    ///
+    /// Unset keeps OpenAI's behavior and every other provider's plain bodies; MultiDex providers,
+    /// which are served by Lite, negotiate by default.
+    fn negotiates_request_compression(&self) -> bool {
+        use codex_model_provider_info::RequestCompression;
+        let provider = self.client.state.provider.info();
+        match provider.request_compression {
+            Some(RequestCompression::Auto) => true,
+            Some(RequestCompression::Zstd | RequestCompression::None) => false,
+            None => {
+                provider.multidex_compatibility
+                    && !provider.is_openai()
+                    && !provider.uses_chat_completions()
+            }
+        }
+    }
+
+    fn responses_request_compression(
+        &self,
+        auth: Option<&CodexAuth>,
+        endpoint: &str,
+    ) -> Compression {
+        match self.client.state.provider.info().request_compression {
+            Some(codex_model_provider_info::RequestCompression::Zstd) => return Compression::Zstd,
+            Some(codex_model_provider_info::RequestCompression::None) => return Compression::None,
+            Some(codex_model_provider_info::RequestCompression::Auto) | None => {}
+        }
+        if self.negotiates_request_compression() {
+            return crate::request_compression::negotiated(endpoint);
+        }
         if self.client.state.enable_request_compression
             && auth.is_some_and(CodexAuth::uses_codex_backend)
             && self.client.state.provider.info().is_openai()
@@ -2853,6 +2939,11 @@ impl ResponsesHttpExecutor<'_> {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         let mut continuation_probe_retries = 0;
+        let mut omitted_tools_retried = false;
+        // Set after a negotiated zstd request was rejected for its coding: the same request is
+        // resent uncompressed, and the probe status tells whether compression was the cause.
+        let mut compression_probe_status: Option<StatusCode> = None;
+        let mut force_uncompressed = false;
         loop {
             let client_setup = self
                 .client
@@ -2893,7 +2984,16 @@ impl ResponsesHttpExecutor<'_> {
                 RequestRouteTelemetry::for_endpoint("/responses"),
                 self.client.state.auth_env_telemetry.clone(),
             );
-            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+            let compression_endpoint = client_setup.api_provider.base_url.clone();
+            let negotiated_compression = self.negotiates_request_compression();
+            let compression = if force_uncompressed {
+                Compression::None
+            } else {
+                self.responses_request_compression(
+                    client_setup.auth.as_ref(),
+                    &compression_endpoint,
+                )
+            };
             let mut options = self
                 .build_responses_options(
                     turn_state,
@@ -2970,6 +3070,7 @@ impl ResponsesHttpExecutor<'_> {
                     (Some(last_request), Some(last_response)) => Some(HttpResumePoint {
                         request: last_request.clone(),
                         response: last_response.clone(),
+                        wire_tools: http_session.last_wire_tools,
                     }),
                     _ => None,
                 };
@@ -3025,6 +3126,11 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = wire.input;
                 interceptors.insert(0, interceptor);
             }
+            let (wire_tools, tools_omitted) = omit_inherited_tools(
+                self.client.provider_info().inherits_tools_on_continuation,
+                &mut request,
+                http_session.last_wire_tools,
+            );
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -3048,6 +3154,13 @@ impl ResponsesHttpExecutor<'_> {
 
             match stream_result {
                 Ok(stream) => {
+                    if negotiated_compression {
+                        crate::request_compression::record_accepted(
+                            &compression_endpoint,
+                            compression,
+                            stream.accept_encoding.as_deref(),
+                        );
+                    }
                     if is_continuation_request {
                         // The provider accepted the continuation, so the chain is healthy again.
                         http_session.continuation_resets = 0;
@@ -3062,6 +3175,7 @@ impl ResponsesHttpExecutor<'_> {
                             (None, None)
                         };
                     http_session.last_request = Some(full_request);
+                    http_session.last_wire_tools = wire_tools;
                     http_session.last_response_rx = last_response_rx;
                     http_session.last_response = None;
                     http_session.resume_point = resume_point;
@@ -3081,6 +3195,7 @@ impl ResponsesHttpExecutor<'_> {
                         .provider
                         .is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    http_session.last_wire_tools = None;
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
                     inference_trace_attempt.record_failed(
@@ -3103,6 +3218,75 @@ impl ResponsesHttpExecutor<'_> {
                     continue;
                 }
                 Err(err) => {
+                    if negotiated_compression
+                        && let ApiError::Transport(TransportError::Http {
+                            status, headers, ..
+                        }) = &err
+                    {
+                        if let Some(probe_status) = compression_probe_status.take() {
+                            crate::request_compression::record_uncompressed_resend_failure(
+                                &compression_endpoint,
+                                probe_status,
+                                *status,
+                            );
+                        } else if crate::request_compression::record_rejection(
+                            &compression_endpoint,
+                            compression,
+                            *status,
+                            headers.as_ref(),
+                        ) {
+                            // The endpoint cannot decode zstd bodies. It rejected the request
+                            // before processing it, so resend the identical body uncompressed.
+                            let advertised = headers.as_ref().is_some_and(|headers| {
+                                headers.contains_key(http::header::ACCEPT_ENCODING)
+                            });
+                            force_uncompressed = true;
+                            compression_probe_status = Some(if advertised {
+                                StatusCode::UNSUPPORTED_MEDIA_TYPE
+                            } else {
+                                *status
+                            });
+                            inference_trace_attempt.record_failed(
+                                &err,
+                                /*upstream_request_id*/ None,
+                                /*output_items*/ &[],
+                            );
+                            warn!(
+                                status = %status,
+                                "Responses endpoint rejected a zstd request body; resending uncompressed"
+                            );
+                            continue;
+                        }
+                    }
+                    // The failed request may have lost the referenced response, so the next
+                    // request must declare its tools in full.
+                    http_session.last_wire_tools = None;
+                    if tools_omitted
+                        && !omitted_tools_retried
+                        && let ApiError::Transport(TransportError::Http { status, body, .. }) = &err
+                        && matches!(
+                            *status,
+                            StatusCode::BAD_REQUEST
+                                | StatusCode::NOT_FOUND
+                                | StatusCode::CONFLICT
+                                | StatusCode::GONE
+                                | StatusCode::UNPROCESSABLE_ENTITY
+                        )
+                    {
+                        omitted_tools_retried = true;
+                        if is_stale_continuation(*status, body.as_deref()) {
+                            // The provider no longer has the response whose tools were
+                            // inherited: resend full history with full tools.
+                            http_session.last_request = None;
+                            http_session.last_response_rx = None;
+                            http_session.last_response = None;
+                        }
+                        warn!(
+                            status = %status,
+                            "Responses continuation without tools was rejected; resending full tools"
+                        );
+                        continue;
+                    }
                     if let Some(continuation_id) = continuation_id.as_deref() {
                         if let ApiError::Transport(TransportError::Http { status, body, .. }) = &err
                             && is_unsupported_persisted_item_context(*status, body.as_deref())
@@ -3166,6 +3350,7 @@ impl ResponsesHttpExecutor<'_> {
                                 {
                                     http_session.continuation_resets += 1;
                                     http_session.last_request = None;
+                                    http_session.last_wire_tools = None;
                                     http_session.last_response_rx = None;
                                     http_session.last_response = None;
                                     warn!(
@@ -3819,6 +4004,7 @@ impl ModelClientSession {
             return false;
         };
         self.http_session.last_request = Some(resume_point.request);
+        self.http_session.last_wire_tools = resume_point.wire_tools;
         self.http_session.last_response = Some(resume_point.response);
         self.http_session.last_response_rx = None;
         true

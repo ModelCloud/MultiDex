@@ -14,6 +14,7 @@ mod multidex_tool_namespace;
 mod realtime_context;
 mod realtime_conversation;
 mod realtime_history;
+mod request_compression;
 mod responses_headers;
 mod tool_contract;
 pub use responses_headers::CodexResponsesHeaders;

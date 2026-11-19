@@ -212,6 +212,7 @@ fn http_continuation_resumes_from_last_stored_response_after_steer_preemption(
             response_id: "resp-stored".to_string(),
             items_added: vec![stored_answer],
         },
+        wire_tools: None,
     });
     // The preempted request replaced the live continuation state and its
     // response never resolved.
