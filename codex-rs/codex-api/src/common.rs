@@ -497,6 +497,9 @@ pub struct ResponseStream {
     pub rx_event: ResponseStreamReceiver,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
+    /// Request content codings advertised by the `Accept-Encoding` response header
+    /// (RFC 7694), when present.
+    pub accept_encoding: Option<String>,
     /// Requests a graceful interrupt. Keep consuming events through completion.
     /// Only `Cancel` validates and waits for an interruption acknowledgement.
     pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,

@@ -1039,6 +1039,8 @@ impl TestCodexBuilder {
             supports_websockets: false,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             ..built_in_model_providers(/*openai_base_url*/ None)["openai"].clone()
         };
         let cwd = Arc::new(TempDir::new()?);

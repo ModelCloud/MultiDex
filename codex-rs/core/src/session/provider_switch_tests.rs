@@ -142,6 +142,8 @@ async fn session_switches_between_openrouter_multidex_and_openai() {
             name: "MultiDex".to_string(),
             base_url: Some("http://127.0.0.1:2120/v1".to_string()),
             multidex_compatibility: true,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             ..Default::default()
         },
     );

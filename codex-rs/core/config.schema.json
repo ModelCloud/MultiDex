@@ -3328,6 +3328,10 @@
           "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
           "type": "object"
         },
+        "inherits_tools_on_continuation": {
+          "description": "Whether this provider reuses the stored `tools` of the response referenced by `previous_response_id` when a continuation request omits `tools`.\n\nWhen enabled, a continuation whose tool declarations are identical to the request that produced the referenced response omits `tools`. First requests, changed tools, and requests after any failure always send the full tool list. It has no effect unless the provider uses `previous_response_id` continuation (`supports_responses_continuation`).",
+          "type": "boolean"
+        },
         "location": {
           "description": "Google Cloud location for the built-in GCP provider. Takes precedence over `GOOGLE_CLOUD_LOCATION`; defaults to `global` when neither is set.",
           "type": "string"
@@ -3359,6 +3363,14 @@
           },
           "description": "Optional query parameters to append to the base URL.",
           "type": "object"
+        },
+        "request_compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RequestCompression"
+            }
+          ],
+          "description": "Request-body compression for Responses requests sent to this provider.\n\nWhen unset, the built-in OpenAI provider keeps its existing behavior (zstd only with ChatGPT authentication and request compression enabled), MultiDex providers (`multidex` and `omnigent-multidex-*`, served by Lite) use `\"auto\"`, and every other provider sends plain bodies. `\"auto\"` sends zstd until the endpoint advertises (via an `Accept-Encoding` response header) or demonstrates (HTTP 400, 415, or 422) that it cannot decode it, then resends that request uncompressed and keeps plain bodies for that endpoint. `\"zstd\"` always compresses and `\"none\"` never does."
         },
         "request_max_retries": {
           "description": "Maximum number of times to retry a failed HTTP request to this provider.",
@@ -4834,6 +4846,32 @@
         "url"
       ],
       "type": "object"
+    },
+    "RequestCompression": {
+      "description": "Request-body compression configured for a provider's Responses requests.",
+      "oneOf": [
+        {
+          "description": "Negotiate: use zstd while the endpoint accepts it, and fall back to plain bodies when it advertises or demonstrates that it cannot decode them.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Send uncompressed request bodies.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Compress request bodies with zstd (`Content-Encoding: zstd`).",
+          "enum": [
+            "zstd"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ResponseProcessMode": {
       "oneOf": [

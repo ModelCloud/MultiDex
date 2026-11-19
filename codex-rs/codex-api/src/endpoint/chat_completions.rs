@@ -532,6 +532,7 @@ fn response_stream(
         routing_affinity: None,
         rx_event: ResponseStreamReceiver::new(rx, cancellation),
         upstream_request_id,
+        accept_encoding: None,
         interrupt: None,
     }
 }

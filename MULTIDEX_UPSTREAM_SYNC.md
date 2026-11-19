@@ -15,6 +15,13 @@ Compatibility points to preserve:
   when upstream changes response stream ownership.
 - Upstream Guardian context overflow recovery remains available alongside
   MultiDex context overflow recovery.
+- Provider `request_compression` overrides the upstream OpenAI-only request
+  compression gate in `responses_request_compression`. Unset, OpenAI keeps the
+  upstream gate, MultiDex providers negotiate
+  (`core/src/request_compression.rs`), and other providers stay plain.
+- Provider `inherits_tools_on_continuation` (off by default) omits `tools`
+  from HTTP continuations only when the wire tool hash matches the request
+  that produced the referenced response; any failure clears that hash.
 
 After merging upstream, inspect these paths first:
 

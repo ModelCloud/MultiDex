@@ -99,6 +99,8 @@ base_url = "http://localhost:11434/v1"
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: false,
         capabilities: None,
         project_id: None,
@@ -145,6 +147,8 @@ query_params = { api-version = "2025-04-01-preview" }
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: false,
         capabilities: None,
         project_id: None,
@@ -195,6 +199,8 @@ supports_standalone_web_search = true
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         supports_standalone_web_search: true,
         capabilities: None,
         project_id: None,
@@ -420,6 +426,8 @@ fn test_create_amazon_bedrock_provider() {
             supports_websockets: false,
             supports_responses_continuation: false,
             multidex_compatibility: false,
+            request_compression: None,
+            inherits_tools_on_continuation: false,
             supports_standalone_web_search: false,
             capabilities: None,
             project_id: None,
@@ -887,6 +895,8 @@ fn test_validate_provider_aws_rejects_conflicting_auth() {
         supports_websockets: false,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
     };
 
@@ -909,6 +919,8 @@ fn test_validate_provider_aws_rejects_websockets() {
         supports_websockets: true,
         supports_responses_continuation: false,
         multidex_compatibility: false,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
     };
 

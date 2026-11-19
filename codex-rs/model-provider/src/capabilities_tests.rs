@@ -61,6 +61,8 @@ fn generic_provider_preserves_upstream_capabilities_without_openai_auth() {
 fn multidex_provider_enables_v2_remote_compaction() {
     let info = ModelProviderInfo {
         multidex_compatibility: true,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         requires_openai_auth: false,
         ..Default::default()
     };
@@ -102,6 +104,8 @@ fn deepinfra_uses_portable_function_tools_without_remote_compaction() {
 fn multidex_remote_compaction_override_wins() {
     let info = ModelProviderInfo {
         multidex_compatibility: true,
+        request_compression: None,
+        inherits_tools_on_continuation: false,
         capabilities: Some(ModelProviderCapabilities {
             remote_compaction: Some(RemoteCompactionSupport::Unsupported),
             ..Default::default()

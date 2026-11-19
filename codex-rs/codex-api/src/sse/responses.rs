@@ -66,6 +66,11 @@ pub fn spawn_response_stream(
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let accept_encoding = stream_response
+        .headers
+        .get(http::header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let safety_buffering_treatment =
         treatment_from_headers(&stream_response.headers).unwrap_or_default();
     if let Some(turn_state) = turn_state.as_ref()
@@ -110,6 +115,7 @@ pub fn spawn_response_stream(
         routing_affinity: None,
         rx_event: ResponseStreamReceiver::new(rx_event, cancellation_token),
         upstream_request_id,
+        accept_encoding,
         interrupt: None,
     }
 }

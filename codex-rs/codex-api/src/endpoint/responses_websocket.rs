@@ -465,6 +465,7 @@ impl ResponsesWebsocketConnection {
                 tokio_util::sync::CancellationToken::new(),
             ),
             upstream_request_id: None,
+            accept_encoding: None,
             routing_affinity: self.routing_affinity.clone(),
             interrupt: Some(tx_interrupt),
         })

@@ -117,3 +117,47 @@ items produce a clear error. Chat Completions has no stored Responses-ID
 continuation; requests retain the upstream history and rely on Lithos's prefix
 cache. Generations are not automatically retried, and compaction uses upstream
 local compaction through the same adapter.
+
+### Request size for local Lite endpoints
+
+A MultiDex turn can declare hundreds of tools, and every Responses request
+normally repeats the whole tool list. Two per-provider options reduce that
+upload. OpenAI and remote providers keep their existing request bodies by
+default.
+
+- `request_compression = "auto" | "zstd" | "none"` controls request-body
+  compression (`Content-Encoding: zstd`).
+  - Unset: the built-in OpenAI provider keeps its existing behavior (zstd only
+    with ChatGPT sign-in when request compression is enabled). The MultiDex
+    providers served by Lite (`multidex` and `omnigent-multidex-*`) use
+    `"auto"`. Every other provider sends plain bodies; set
+    `request_compression = "auto"` on another provider that points at Lite.
+  - `"auto"` sends zstd while the endpoint accepts it. When the server
+    advertises its accepted request codings with an RFC 7694 `Accept-Encoding`
+    response header, that list decides. Otherwise, if a compressed request is
+    rejected with HTTP 400, 415, or 422, MultiDex resends the same request
+    uncompressed right away and keeps sending plain bodies to that endpoint
+    for the rest of the process. The turn does not fail because of the
+    fallback. A later response advertising `zstd` turns compression back on.
+  - `"zstd"` always compresses and `"none"` never does.
+- `inherits_tools_on_continuation = true` (off by default): when a request
+  continues a stored response with `previous_response_id` and its tool list is
+  byte-identical to the one recorded for that response, MultiDex omits `tools`
+  and the endpoint reuses the stored list. `tool_choice` and
+  `parallel_tool_calls` are still sent. First requests, changed tools, and the
+  request after any failure send the full list. If the endpoint rejects a
+  continuation without `tools`, MultiDex retries once with the full tool list,
+  and resends the full history when the stored response no longer exists.
+  This needs `supports_responses_continuation`, which the `multidex` provider
+  enables automatically. It stays opt-in because a server that does not
+  inherit stored tools would silently run the turn without tools.
+
+For Lite (Inference-Ultra's Responses server), compression needs no
+configuration. To also skip resending unchanged tools:
+
+```toml
+[model_providers.multidex]
+# ...existing fields...
+inherits_tools_on_continuation = true # Lite inherits stored tools on previous_response_id
+# request_compression = "zstd"        # optional: skip negotiation once Lite runs Inference-Ultra >= 293d043f
+```
