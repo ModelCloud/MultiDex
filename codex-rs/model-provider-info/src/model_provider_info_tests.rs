@@ -1255,6 +1255,18 @@ fn wafer_provider_is_us_only_and_uses_configured_token() {
 }
 
 #[test]
+fn wafer_and_lithos_use_the_chat_completions_wire() {
+    let providers = built_in_model_providers(None);
+    // Wafer returns no reasoning text on the Responses wire but streams
+    // `reasoning_content` on Chat Completions, so it shares the adapter.
+    assert!(providers[WAFER_PROVIDER_ID].uses_chat_completions());
+    assert!(providers[LITHOS_PROVIDER_ID].uses_chat_completions());
+    assert!(!providers[OPENROUTER_PROVIDER_ID].uses_chat_completions());
+    assert!(!providers[DEEPINFRA_PROVIDER_ID].uses_chat_completions());
+    assert!(!providers[OPENAI_PROVIDER_ID].uses_chat_completions());
+}
+
+#[test]
 fn deepinfra_provider_uses_responses_and_exact_endpoint() {
     let configured: ModelProviderInfo = toml::from_str(
         "base_url = \"https://api.deepinfra.com/v1/openai\"\nexperimental_bearer_token = \"test-token\"",

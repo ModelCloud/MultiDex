@@ -166,7 +166,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
         }
 
         if self.chat_completions {
-            return crate::endpoint::lithos::stream(&self.session, &request, headers).await;
+            return crate::endpoint::chat_completions::stream(&self.session, &request, headers)
+                .await;
         }
         self.stream_encoded(body, headers, compression, turn_state)
             .await

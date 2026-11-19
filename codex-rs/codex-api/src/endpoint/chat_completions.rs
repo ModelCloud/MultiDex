@@ -1,4 +1,4 @@
-//! Lithos wire adapter. Upstream owns the logical Responses request and history.
+//! Chat Completions wire adapter. Upstream owns the logical Responses request and history.
 //! Only the final HTTP payload and incoming Chat Completions events are translated.
 
 use super::session::EndpointSession;
@@ -38,7 +38,7 @@ fn text(content: &Value) -> Result<String, ApiError> {
     }
     let blocks = content
         .as_array()
-        .ok_or_else(|| invalid("Lithos message content must be text"))?;
+        .ok_or_else(|| invalid("Chat Completions message content must be text"))?;
     let mut result = String::new();
     for block in blocks {
         match block["type"].as_str() {
@@ -46,10 +46,14 @@ fn text(content: &Value) -> Result<String, ApiError> {
                 result.push_str(
                     block["text"]
                         .as_str()
-                        .ok_or_else(|| invalid("Lithos text block has no text"))?,
+                        .ok_or_else(|| invalid("Chat Completions text block has no text"))?,
                 );
             }
-            _ => return Err(invalid("Lithos DeepSeek supports text content only")),
+            _ => {
+                return Err(invalid(
+                    "Chat Completions DeepSeek supports text content only",
+                ));
+            }
         }
     }
     Ok(result)
@@ -79,12 +83,12 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
         .is_some_and(|v| !v.is_null())
     {
         return Err(invalid(
-            "Lithos Chat Completions cannot extend a stored Responses ID",
+            "Chat Completions Chat Completions cannot extend a stored Responses ID",
         ));
     }
     let input = request["input"]
         .as_array()
-        .ok_or_else(|| invalid("Lithos input must be an array"))?;
+        .ok_or_else(|| invalid("Chat Completions input must be an array"))?;
     // Input additional_tools come first so incremental tool updates resolve by
     // recency; the request's own tool list is applied last and stays
     // authoritative when a definition also survives in replayed history (e.g.
@@ -102,7 +106,7 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
         let kind = tool["type"].as_str().unwrap_or_default();
         let name = tool["name"]
             .as_str()
-            .ok_or_else(|| invalid("Lithos tool has no name"))?
+            .ok_or_else(|| invalid("Chat Completions tool has no name"))?
             .to_owned();
         match kind {
             "function" => {
@@ -126,7 +130,7 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
             }
             _ => {
                 return Err(invalid(format!(
-                    "Lithos cannot translate tool type {kind:?}"
+                    "Chat Completions cannot translate tool type {kind:?}"
                 )));
             }
         }
@@ -154,7 +158,7 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
                     .filter(|s| s.chars().any(char::is_whitespace))
                 else {
                     tracing::warn!(
-                        "Lithos dropped a compaction summary it cannot decode; \
+                        "Chat Completions dropped a compaction summary it cannot decode; \
                          the conversation continues without that summary"
                     );
                     continue;
@@ -172,15 +176,17 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
                     append(assistant(&mut pending), "reasoning_content", &reasoning);
                 } else if item.get("encrypted_content").is_some_and(|v| !v.is_null()) {
                     // Same rule as compaction: an encrypted reasoning payload
-                    // has no plaintext for Lithos to consume. Reasoning is not
+                    // has no plaintext for Chat Completions to consume. Reasoning is not
                     // required for correctness, so skip it instead of failing.
-                    tracing::debug!("Lithos dropped an encrypted reasoning item it cannot decode");
+                    tracing::debug!(
+                        "Chat Completions dropped an encrypted reasoning item it cannot decode"
+                    );
                 }
             }
             "message" => {
                 let role = item["role"]
                     .as_str()
-                    .ok_or_else(|| invalid("Lithos message has no role"))?;
+                    .ok_or_else(|| invalid("Chat Completions message has no role"))?;
                 let content = text(&item["content"])?;
                 if role == "assistant" {
                     append(assistant(&mut pending), "content", &content);
@@ -211,7 +217,7 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
             }
             kind => {
                 return Err(invalid(format!(
-                    "Lithos cannot translate input item {kind:?}"
+                    "Chat Completions cannot translate input item {kind:?}"
                 )));
             }
         }
@@ -263,26 +269,30 @@ struct ChatState {
 
 fn item(value: Value) -> Result<ResponseItem, ApiError> {
     serde_json::from_value(value)
-        .map_err(|e| ApiError::Stream(format!("Invalid Lithos output: {e}")))
+        .map_err(|e| ApiError::Stream(format!("Invalid Chat Completions output: {e}")))
 }
 
 impl ChatState {
     fn chunk(&mut self, chunk: Value) -> Result<Vec<ResponseEvent>, ApiError> {
         if let Some(error) = chunk.get("error").filter(|value| !value.is_null()) {
-            return Err(ApiError::Stream(format!("Lithos stream error: {error}")));
+            return Err(ApiError::Stream(format!(
+                "Chat Completions stream error: {error}"
+            )));
         }
         let mut events = Vec::new();
         if let Some(id) = chunk["id"].as_str() {
             if !self.id.is_empty() && self.id != id {
                 return Err(ApiError::Stream(
-                    "Lithos changed response id within a stream".into(),
+                    "Chat Completions changed response id within a stream".into(),
                 ));
             }
             self.id = id.to_owned();
         }
         if !self.created {
             if self.id.is_empty() {
-                return Err(ApiError::Stream("Lithos stream has no response id".into()));
+                return Err(ApiError::Stream(
+                    "Chat Completions stream has no response id".into(),
+                ));
             }
             events.push(ResponseEvent::Created {
                 response_id: Some(self.id.clone()),
@@ -308,7 +318,7 @@ impl ChatState {
         for choice in chunk["choices"].as_array().into_iter().flatten() {
             if choice["index"].as_u64().unwrap_or_default() != 0 {
                 return Err(ApiError::Stream(
-                    "Lithos returned more than one choice".into(),
+                    "Chat Completions returned more than one choice".into(),
                 ));
             }
             if let Some(finish) = choice["finish_reason"].as_str() {
@@ -336,16 +346,18 @@ impl ChatState {
                 events.push(ResponseEvent::OutputTextDelta(s.to_owned()));
             }
             for call in delta["tool_calls"].as_array().into_iter().flatten() {
-                let index = call["index"]
-                    .as_u64()
-                    .ok_or_else(|| ApiError::Stream("Lithos tool delta has no index".into()))?;
+                let index = call["index"].as_u64().ok_or_else(|| {
+                    ApiError::Stream("Chat Completions tool delta has no index".into())
+                })?;
                 let entry = self
                     .calls
                     .entry(index)
                     .or_insert_with(|| json!({"id":"","name":"","arguments":""}));
                 if let Some(s) = call["id"].as_str() {
                     if !entry["id"].as_str().unwrap_or_default().is_empty() && entry["id"] != s {
-                        return Err(ApiError::Stream("Lithos changed a tool call id".into()));
+                        return Err(ApiError::Stream(
+                            "Chat Completions changed a tool call id".into(),
+                        ));
                     }
                     entry["id"] = json!(s);
                 }
@@ -363,7 +375,7 @@ impl ChatState {
     fn complete(self, custom: &HashSet<String>) -> Result<Vec<ResponseEvent>, ApiError> {
         if !matches!(self.finish.as_deref(), Some("stop" | "tool_calls")) {
             return Err(ApiError::Stream(format!(
-                "Lithos generation did not complete: {:?}",
+                "Chat Completions generation did not complete: {:?}",
                 self.finish
             )));
         }
@@ -377,9 +389,11 @@ impl ChatState {
         for call in self.calls.into_values() {
             let name = call["name"]
                 .as_str()
-                .ok_or_else(|| ApiError::Stream("Lithos tool has no name".into()))?;
+                .ok_or_else(|| ApiError::Stream("Chat Completions tool has no name".into()))?;
             if call["id"].as_str().is_none_or(str::is_empty) || name.is_empty() {
-                return Err(ApiError::Stream("Incomplete Lithos tool identity".into()));
+                return Err(ApiError::Stream(
+                    "Incomplete Chat Completions tool identity".into(),
+                ));
             }
             let value = if custom.contains(name) {
                 let arguments: Value = serde_json::from_str(
@@ -425,10 +439,10 @@ pub(crate) async fn stream<T: HttpTransport>(
     }
     let fields = body
         .as_object_mut()
-        .ok_or_else(|| invalid("Invalid Lithos request"))?;
+        .ok_or_else(|| invalid("Invalid Chat Completions request"))?;
     let model = fields
         .remove("model")
-        .ok_or_else(|| invalid("Lithos request has no model"))?;
+        .ok_or_else(|| invalid("Chat Completions request has no model"))?;
     let encoded = EncodedJsonBody::encode(&RoutingFirstBody { model, fields })
         .map_err(|e| invalid(e.to_string()))?;
     let response = session
@@ -487,11 +501,17 @@ fn response_stream(
                         }
                         Err(e) => Err(e),
                     },
-                    Err(e) => Err(ApiError::Stream(format!("Invalid Lithos SSE JSON: {e}"))),
+                    Err(e) => Err(ApiError::Stream(format!(
+                        "Invalid Chat Completions SSE JSON: {e}"
+                    ))),
                 },
-                Ok(Some(Err(e))) => Err(ApiError::Stream(format!("Lithos SSE disconnected: {e}"))),
-                Ok(None) => Err(ApiError::Stream("Lithos SSE ended before [DONE]".into())),
-                Err(_) => Err(ApiError::Stream("Lithos SSE idle timeout".into())),
+                Ok(Some(Err(e))) => Err(ApiError::Stream(format!(
+                    "Chat Completions SSE disconnected: {e}"
+                ))),
+                Ok(None) => Err(ApiError::Stream(
+                    "Chat Completions SSE ended before [DONE]".into(),
+                )),
+                Err(_) => Err(ApiError::Stream("Chat Completions SSE idle timeout".into())),
             };
             match events {
                 Ok(events) => {
@@ -524,7 +544,8 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn lithos_preserves_reasoning_tools_and_input_without_mutating_history() -> Result<()> {
+    fn chat_completions_preserves_reasoning_tools_and_input_without_mutating_history() -> Result<()>
+    {
         let request = json!({"model":"deepseek-ai/DeepSeek-V4.1-Flash-fast","instructions":"system","reasoning":{"effort":"off"},"tools":[{"type":"custom","name":"patch","description":"Apply a patch","format":{"type":"grammar"}}],"input":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"prior thought"}]},{"type":"custom_tool_call","name":"patch","call_id":"c1","input":"*** Begin Patch\n*** End Patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"done"},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]});
         let before = request.clone();
         let (body, custom) = request_body(&request)?;
@@ -545,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_duplicate_tool_names_resolve_to_the_latest_definition() -> Result<()> {
+    fn chat_completions_duplicate_tool_names_resolve_to_the_latest_definition() -> Result<()> {
         let request = json!({
             "model": "test",
             "tools": [
@@ -579,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_later_additional_tools_update_earlier_definitions() -> Result<()> {
+    fn chat_completions_later_additional_tools_update_earlier_definitions() -> Result<()> {
         let request = json!({
             "model": "test",
             "input": [
@@ -599,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_redefined_tool_kind_controls_response_decoding() -> Result<()> {
+    fn chat_completions_redefined_tool_kind_controls_response_decoding() -> Result<()> {
         for (old_kind, new_kind) in [("custom", "function"), ("function", "custom")] {
             let request = json!({
                 "input": [{"type":"additional_tools","tools":[
@@ -636,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_rejects_responses_only_content_instead_of_dropping_it() {
+    fn chat_completions_rejects_responses_only_content_instead_of_dropping_it() {
         assert!(
             request_body(&json!({"model":"test","input":[],"previous_response_id":"resp_old"}))
                 .is_err()
@@ -644,9 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn lithos_drops_foreign_compaction_instead_of_failing_the_switch() -> Result<()> {
+    fn chat_completions_drops_foreign_compaction_instead_of_failing_the_switch() -> Result<()> {
         // An OpenAI-issued compaction token has no whitespace and cannot be
-        // decoded by Lithos. A provider switch must still succeed: the turn is
+        // decoded by Chat Completions. A provider switch must still succeed: the turn is
         // served without that summary rather than erroring out.
         let (body, _) = request_body(&json!({"model":"test","input":[
             {"type":"compaction","encrypted_content":"opaqueEncryptedToken"},
@@ -658,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_accepts_a_real_openai_switch_payload() -> Result<()> {
+    fn chat_completions_accepts_a_real_openai_switch_payload() -> Result<()> {
         // Byte shapes taken from a live OpenAI rollout on agent-gpu-0:
         // reasoning items carry encrypted_content with content=None.
         let (body, _) = request_body(&json!({"model":"test","input":[
@@ -677,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_still_honours_a_readable_compaction_summary() -> Result<()> {
+    fn chat_completions_still_honours_a_readable_compaction_summary() -> Result<()> {
         let summary = "## Active Objective\nContinue the previous work.";
         let (body, _) = request_body(&json!({"model":"test","input":[
             {"type":"compaction","encrypted_content":summary}
@@ -688,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_drops_encrypted_reasoning_without_failing() -> Result<()> {
+    fn chat_completions_drops_encrypted_reasoning_without_failing() -> Result<()> {
         let (body, _) = request_body(&json!({"model":"test","input":[
             {"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"},
             {"type":"message","role":"user","content":"hello"}
@@ -698,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_text_blocks_do_not_gain_unrequested_separators() -> Result<()> {
+    fn chat_completions_text_blocks_do_not_gain_unrequested_separators() -> Result<()> {
         assert_eq!(
             text(&json!([{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]))?,
             "ab"
@@ -707,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_stream_keeps_tool_arguments_and_usage_structured() -> Result<()> {
+    fn chat_completions_stream_keeps_tool_arguments_and_usage_structured() -> Result<()> {
         let mut state = ChatState::default();
         state.chunk(json!({"id":"chat_1","choices":[{"index":0,"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"c1","function":{"name":"exec_","arguments":"{\"cmd\":"}}]}}]}))?;
         state.chunk(json!({"id":"chat_1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"command","arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112,"prompt_tokens_details":{"cached_tokens":80},"completion_tokens_details":{"reasoning_tokens":5}}}))?;
@@ -735,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_rejects_truncated_calls_and_streams() -> Result<()> {
+    fn chat_completions_rejects_truncated_calls_and_streams() -> Result<()> {
         let mut state = ChatState::default();
         state.chunk(
             json!({"id":"chat_1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}),
@@ -746,7 +767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lithos_sse_handles_fragmented_utf8_and_completes() -> Result<()> {
+    async fn chat_completions_sse_handles_fragmented_utf8_and_completes() -> Result<()> {
         let wire = "data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let chunks: Vec<_> = wire
             .as_bytes()
@@ -775,7 +796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lithos_sse_idle_timeout_is_an_error() {
+    async fn chat_completions_sse_idle_timeout_is_an_error() {
         let response = codex_client::StreamResponse {
             status: http::StatusCode::OK,
             headers: HeaderMap::new(),
@@ -789,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn lithos_custom_tool_call_is_restored_as_a_custom_item() -> Result<()> {
+    fn chat_completions_custom_tool_call_is_restored_as_a_custom_item() -> Result<()> {
         let mut state = ChatState::default();
         state.chunk(json!({"id":"chat_custom","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch","function":{"name":"patch","arguments":"{\"input\":\"a\\nb\"}"}}]},"finish_reason":"tool_calls"}]}))?;
         let events = state.complete(&HashSet::from(["patch".to_owned()]))?;
@@ -798,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lithos_eof_does_not_fake_a_completed_response() {
+    async fn chat_completions_eof_does_not_fake_a_completed_response() {
         let wire=Bytes::from_static(b"data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
         let response = codex_client::StreamResponse {
             status: http::StatusCode::OK,
@@ -815,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lithos_dropping_the_response_releases_the_upstream_stream() -> Result<()> {
+    async fn chat_completions_dropping_the_response_releases_the_upstream_stream() -> Result<()> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
