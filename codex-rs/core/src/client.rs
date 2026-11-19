@@ -3030,7 +3030,7 @@ impl ResponsesHttpExecutor<'_> {
                 client_setup.api_provider,
                 client_setup.api_auth,
             )
-            .with_chat_completions(self.client.provider_info().is_lithos())
+            .with_chat_completions(self.client.provider_info().uses_chat_completions())
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let is_continuation_request = request.previous_response_id.is_some();
             let continuation_id = request.previous_response_id.clone();

@@ -940,6 +940,14 @@ other non-default provider fields are not supported"
         self.name == "Lithos"
     }
 
+    /// Whether this provider is reached through the Chat Completions wire
+    /// adapter. These providers stream `reasoning_content` on Chat Completions
+    /// but return no reasoning text at all on the Responses wire, so the
+    /// adapter carries the logical Responses request and maps reasoning back.
+    pub fn uses_chat_completions(&self) -> bool {
+        self.is_lithos() || self.is_wafer()
+    }
+
     pub fn create_lithos_provider() -> ModelProviderInfo {
         let mut provider = Self::create_openrouter_provider();
         provider.name = "Lithos".into();
