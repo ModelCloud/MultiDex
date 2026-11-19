@@ -3374,6 +3374,13 @@ async fn try_run_sampling_request(
         &step_context.settings.model_info.slug,
         &responses_metadata.window_id,
         &prompt.tools,
+        || {
+            prompt
+                .input
+                .iter()
+                .map(crate::context_manager::estimate_item_token_count)
+                .sum()
+        },
     ) {
         Some(tools) => {
             prompt.tools = Arc::clone(&tools);

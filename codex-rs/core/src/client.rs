@@ -1177,6 +1177,26 @@ pub(crate) struct RealtimeWebrtcCallStart {
 }
 
 impl ModelClient {
+    /// Whether this provider caches the prompt prefix, so the thread keeps a stable tool
+    /// contract instead of advertising each step's live catalog.
+    fn keeps_tool_contract(&self) -> bool {
+        let provider = self.provider_info();
+        provider.multidex_compatibility || provider.is_deepinfra()
+    }
+
+    /// Lets the next tool catalog change replace this thread's tool contract once, for a
+    /// deliberate change such as an explicit MCP reconnect.
+    pub(crate) fn renew_tool_contract(&self, reason: &'static str) {
+        if !self.keeps_tool_contract() {
+            return;
+        }
+        self.state
+            .tool_contract
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .renew(reason);
+    }
+
     pub(crate) fn provider_info(&self) -> &ModelProviderInfo {
         self.state.provider.info()
     }
@@ -2391,14 +2411,17 @@ impl Drop for ModelClientSession {
 impl ModelClientSession {
     /// Returns the thread's stable tool declarations for providers that cache the prompt
     /// prefix, or `None` when `tools` should be advertised as captured.
+    ///
+    /// `conversation_tokens` estimates the prompt after the tool block; it is evaluated only
+    /// when the live catalog offers tools the contract has not declared.
     pub(crate) fn stable_inference_tools(
         &self,
         model: &str,
         window_id: &str,
         tools: &Arc<[ToolSpec]>,
+        conversation_tokens: impl FnOnce() -> i64,
     ) -> Option<Arc<[ToolSpec]>> {
-        let provider = self.client.provider_info();
-        if tools.is_empty() || !(provider.multidex_compatibility || provider.is_deepinfra()) {
+        if tools.is_empty() || !self.client.keeps_tool_contract() {
             return None;
         }
         Some(
@@ -2407,7 +2430,7 @@ impl ModelClientSession {
                 .tool_contract
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .advertise(model, window_id, tools),
+                .advertise(model, window_id, tools, conversation_tokens),
         )
     }
 
