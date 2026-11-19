@@ -3187,8 +3187,7 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             if let Some((wire, interceptor)) = crate::multidex_tool_namespace::prepare(
-                self.client.provider_info().multidex_compatibility
-                    || self.client.provider_info().is_deepinfra(),
+                self.client.provider_info().needs_flat_tool_namespaces(),
                 &full_request,
                 &request.input,
             )? {
@@ -3770,8 +3769,7 @@ impl ModelClientSession {
             }
             let ResponsesWsRequest::ResponseCreate(payload) = &mut ws_request;
             let (namespace_wire, namespace_interceptor) = crate::multidex_tool_namespace::prepare(
-                self.client.provider_info().multidex_compatibility
-                    || self.client.provider_info().is_deepinfra(),
+                self.client.provider_info().needs_flat_tool_namespaces(),
                 &request,
                 payload.input,
             )?

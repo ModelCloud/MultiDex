@@ -104,10 +104,15 @@ pub(crate) fn request_body(request: &Value) -> Result<(Value, HashSet<String>), 
     let mut tools = BTreeMap::new();
     for mut tool in definitions {
         let kind = tool["type"].as_str().unwrap_or_default();
-        let name = tool["name"]
-            .as_str()
-            .ok_or_else(|| invalid("Chat Completions tool has no name"))?
-            .to_owned();
+        // Hosted Responses tools (`web_search`, `tool_search`, `image_generation`)
+        // carry no name and have no Chat Completions equivalent. A provider that
+        // advertises them through the portable capability surface cannot execute
+        // them on this wire, so drop the declaration and serve the rest of the
+        // turn instead of failing every request that carries one.
+        let Some(name) = tool["name"].as_str().map(str::to_owned) else {
+            tracing::warn!("Chat Completions dropped hosted tool type {kind:?}");
+            continue;
+        };
         match kind {
             "function" => {
                 custom.remove(&name);
@@ -564,6 +569,29 @@ mod tests {
         assert_eq!(args["input"], request["input"][1]["input"]);
         assert_eq!(body["messages"][2]["tool_call_id"], "c1");
         assert!(body.get("previous_response_id").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completions_drops_hosted_tools_without_a_chat_equivalent() -> Result<()> {
+        let (body, _) = request_body(&json!({
+            "model": "test",
+            "input": [],
+            "tools": [
+                {"type": "function", "name": "exec", "parameters": {"type": "object"}},
+                {"type": "web_search"},
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": "search deferred tools",
+                    "parameters": {"type": "object"}
+                },
+                {"type": "image_generation"}
+            ]
+        }))?;
+        let tools = body["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "exec");
         Ok(())
     }
 

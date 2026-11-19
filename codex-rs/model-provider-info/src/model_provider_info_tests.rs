@@ -1279,6 +1279,30 @@ fn wafer_and_lithos_use_the_chat_completions_wire() {
 }
 
 #[test]
+fn portable_and_chat_completions_providers_flatten_tool_namespaces() {
+    let providers = built_in_model_providers(None);
+    for provider_id in [LITHOS_PROVIDER_ID, WAFER_PROVIDER_ID, DEEPINFRA_PROVIDER_ID] {
+        assert!(
+            providers[provider_id].needs_flat_tool_namespaces(),
+            "{provider_id} must flatten namespace tools"
+        );
+    }
+    for provider_id in [OPENAI_PROVIDER_ID, OPENROUTER_PROVIDER_ID] {
+        assert!(
+            !providers[provider_id].needs_flat_tool_namespaces(),
+            "{provider_id} must keep namespace tools"
+        );
+    }
+    assert!(
+        ModelProviderInfo {
+            multidex_compatibility: true,
+            ..Default::default()
+        }
+        .needs_flat_tool_namespaces()
+    );
+}
+
+#[test]
 fn deepinfra_provider_uses_responses_and_exact_endpoint() {
     let configured: ModelProviderInfo = toml::from_str(
         "base_url = \"https://api.deepinfra.com/v1/openai\"\nexperimental_bearer_token = \"test-token\"",
