@@ -491,6 +491,50 @@ pub enum ResponseInterrupt {
     Cancel { deadline: tokio::time::Instant },
 }
 
+/// Response header in which an inference server advertises optional Responses capabilities as a
+/// comma-separated token list (for example `responses.tools-inheritance/1`).
+pub const INFERENCE_CAPABILITIES_HEADER: &str = "x-inference-ultra-capabilities";
+
+/// Receives a digest of the `tools` echoed by `response.completed`: `Some(digest)` when the
+/// completed response carried a `tools` array, `None` when it did not. Left unset when the stream
+/// never completed.
+pub type CompletedToolsEcho = std::sync::Arc<std::sync::OnceLock<Option<u64>>>;
+
+/// Order-insensitive digest of a JSON tool list: object keys are hashed in sorted order, so two
+/// serializations of the same declarations produce the same digest.
+pub fn tools_digest(tools: &Value) -> u64 {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    fn hash_value(value: &Value, hasher: &mut std::collections::hash_map::DefaultHasher) {
+        match value {
+            Value::Null => 0u8.hash(hasher),
+            Value::Bool(value) => (1u8, value).hash(hasher),
+            Value::Number(value) => (2u8, value.to_string()).hash(hasher),
+            Value::String(value) => (3u8, value).hash(hasher),
+            Value::Array(values) => {
+                (4u8, values.len()).hash(hasher);
+                for value in values {
+                    hash_value(value, hasher);
+                }
+            }
+            Value::Object(map) => {
+                (5u8, map.len()).hash(hasher);
+                let mut entries = map.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                for (key, value) in entries {
+                    key.hash(hasher);
+                    hash_value(value, hasher);
+                }
+            }
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_value(tools, &mut hasher);
+    hasher.finish()
+}
+
 pub struct ResponseStream {
     /// Routing pin from the connection that produced these responses. Never model metadata.
     pub routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
@@ -500,6 +544,9 @@ pub struct ResponseStream {
     /// Request content codings advertised by the `Accept-Encoding` response header
     /// (RFC 7694), when present.
     pub accept_encoding: Option<String>,
+    /// Endpoint capabilities advertised by the [`INFERENCE_CAPABILITIES_HEADER`] response
+    /// header, when present.
+    pub capabilities: Option<String>,
     /// Requests a graceful interrupt. Keep consuming events through completion.
     /// Only `Cancel` validates and waits for an interruption acknowledgement.
     pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,

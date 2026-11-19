@@ -62,10 +62,15 @@ fn rejected_probe_disables_until_advertised() {
     assert_eq!(negotiated(endpoint), Compression::None);
 
     // A restarted server that advertises zstd re-enables compression.
-    record_accepted(endpoint, Compression::None, Some("zstd, gzip"));
+    record_accepted(endpoint, Compression::None, Some("zstd, gzip"), false);
     assert_eq!(negotiated(endpoint), Compression::Zstd);
     // An advertisement without zstd disables it.
-    record_accepted(endpoint, Compression::Zstd, Some("gzip"));
+    record_accepted(endpoint, Compression::Zstd, Some("gzip"), false);
+    assert_eq!(negotiated(endpoint), Compression::None);
+    // A `request-encoding/1` capability listing zstd enables it.
+    record_accepted(endpoint, Compression::None, Some("gzip"), true);
+    assert_eq!(negotiated(endpoint), Compression::Zstd);
+    record_accepted(endpoint, Compression::Zstd, Some("gzip"), false);
     assert_eq!(negotiated(endpoint), Compression::None);
 }
 
@@ -102,6 +107,6 @@ fn advertisement_on_rejection_decides() {
     ));
     assert_eq!(negotiated(endpoint), Compression::None);
     // Accepted zstd proves support even without an advertisement.
-    record_accepted(endpoint, Compression::Zstd, None);
+    record_accepted(endpoint, Compression::Zstd, None, false);
     assert_eq!(negotiated(endpoint), Compression::Zstd);
 }

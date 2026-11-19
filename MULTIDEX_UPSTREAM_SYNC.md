@@ -19,9 +19,13 @@ Compatibility points to preserve:
   compression gate in `responses_request_compression`. Unset, OpenAI keeps the
   upstream gate, MultiDex providers negotiate
   (`core/src/request_compression.rs`), and other providers stay plain.
-- Provider `inherits_tools_on_continuation` (off by default) omits `tools`
-  from HTTP continuations only when the wire tool hash matches the request
-  that produced the referenced response; any failure clears that hash.
+- Provider `inherits_tools_on_continuation` (`auto` by default) omits `tools`
+  from HTTP continuations only when the wire tool hash matches the continued
+  request and, for `auto`, the continued response advertised
+  `responses.tools-inheritance/1` (`core/src/endpoint_capabilities.rs`). Any
+  failure clears the hash. The tools echoed by `response.completed` are
+  captured in `codex-api/src/sse/responses.rs` (`ResponsesOptions::completed_tools`)
+  and a mismatch disables omission for the endpoint.
 
 After merging upstream, inspect these paths first:
 

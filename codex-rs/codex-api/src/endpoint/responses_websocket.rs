@@ -466,6 +466,7 @@ impl ResponsesWebsocketConnection {
             ),
             upstream_request_id: None,
             accept_encoding: None,
+            capabilities: None,
             routing_affinity: self.routing_affinity.clone(),
             interrupt: Some(tx_interrupt),
         })

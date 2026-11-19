@@ -241,6 +241,71 @@ impl<'de> Deserialize<'de> for WireApi {
     }
 }
 
+/// Whether continuation requests may rely on the provider inheriting stored tools.
+///
+/// Configured as `"auto"`, `true`, or `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(from = "ToolInheritanceConfig", into = "ToolInheritanceConfig")]
+pub enum ToolInheritance {
+    /// Omit tools only for endpoints that advertise tool inheritance.
+    #[default]
+    Auto,
+    /// Always allow omitting unchanged tools on continuations.
+    Enabled,
+    /// Always send the full tool list.
+    Disabled,
+}
+
+impl ToolInheritance {
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ToolInheritanceMode {
+    Auto,
+}
+
+/// `"auto"`, `true`, or `false`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum ToolInheritanceConfig {
+    Enabled(bool),
+    Mode(ToolInheritanceMode),
+}
+
+impl From<ToolInheritanceConfig> for ToolInheritance {
+    fn from(value: ToolInheritanceConfig) -> Self {
+        match value {
+            ToolInheritanceConfig::Enabled(true) => Self::Enabled,
+            ToolInheritanceConfig::Enabled(false) => Self::Disabled,
+            ToolInheritanceConfig::Mode(ToolInheritanceMode::Auto) => Self::Auto,
+        }
+    }
+}
+
+impl From<ToolInheritance> for ToolInheritanceConfig {
+    fn from(value: ToolInheritance) -> Self {
+        match value {
+            ToolInheritance::Auto => Self::Mode(ToolInheritanceMode::Auto),
+            ToolInheritance::Enabled => Self::Enabled(true),
+            ToolInheritance::Disabled => Self::Enabled(false),
+        }
+    }
+}
+
+impl JsonSchema for ToolInheritance {
+    fn schema_name() -> String {
+        "ToolInheritance".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        ToolInheritanceConfig::json_schema(generator)
+    }
+}
+
 /// Request-body compression configured for a provider's Responses requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -373,15 +438,19 @@ pub struct ModelProviderInfo {
     /// does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_compression: Option<RequestCompression>,
-    /// Whether this provider reuses the stored `tools` of the response referenced by
-    /// `previous_response_id` when a continuation request omits `tools`.
+    /// Whether continuation requests may omit `tools` and rely on the provider reusing the
+    /// stored `tools` of the response referenced by `previous_response_id`.
     ///
-    /// When enabled, a continuation whose tool declarations are identical to the request that
-    /// produced the referenced response omits `tools`. First requests, changed tools, and
-    /// requests after any failure always send the full tool list. It has no effect unless the
-    /// provider uses `previous_response_id` continuation (`supports_responses_continuation`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub inherits_tools_on_continuation: bool,
+    /// `"auto"` (the default) omits them only for an endpoint whose latest response advertised
+    /// the `responses.tools-inheritance/1` capability. `true` always allows omission and `false`
+    /// never does. Even when allowed, only a continuation whose tool declarations are identical
+    /// to the request that produced the referenced response omits `tools`; first requests,
+    /// changed tools, and requests after any failure send the full list. If a response to a
+    /// tool-less continuation does not echo the same tools, omission stops for that endpoint.
+    /// It has no effect unless the provider uses `previous_response_id` continuation
+    /// (`supports_responses_continuation`).
+    #[serde(default, skip_serializing_if = "ToolInheritance::is_auto")]
+    pub inherits_tools_on_continuation: ToolInheritance,
     /// OpenRouter provider-routing preferences, forwarded verbatim as the
     /// request's top-level `provider` object. Only meaningful for providers
     /// that implement OpenRouter's extended Responses API.
@@ -776,7 +845,7 @@ other non-default provider fields are not supported"
             supports_responses_continuation: false,
             multidex_compatibility: false,
             request_compression: None,
-            inherits_tools_on_continuation: false,
+            inherits_tools_on_continuation: Default::default(),
             supports_standalone_web_search: true,
             capabilities: None,
             project_id: None,
@@ -825,7 +894,7 @@ other non-default provider fields are not supported"
             supports_responses_continuation: false,
             multidex_compatibility: false,
             request_compression: None,
-            inherits_tools_on_continuation: false,
+            inherits_tools_on_continuation: Default::default(),
             supports_standalone_web_search: false,
             capabilities: None,
             project_id: None,
@@ -871,7 +940,7 @@ other non-default provider fields are not supported"
             supports_responses_continuation: false,
             multidex_compatibility: false,
             request_compression: None,
-            inherits_tools_on_continuation: false,
+            inherits_tools_on_continuation: Default::default(),
             supports_standalone_web_search: false,
             project_id: None,
             location: None,
@@ -912,7 +981,7 @@ other non-default provider fields are not supported"
             supports_responses_continuation: false,
             multidex_compatibility: false,
             request_compression: None,
-            inherits_tools_on_continuation: false,
+            inherits_tools_on_continuation: Default::default(),
             supports_standalone_web_search: false,
             project_id: None,
             location: None,
@@ -1329,7 +1398,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         supports_responses_continuation: false,
         multidex_compatibility: false,
         request_compression: None,
-        inherits_tools_on_continuation: false,
+        inherits_tools_on_continuation: Default::default(),
         supports_standalone_web_search: false,
         capabilities: None,
         project_id: None,

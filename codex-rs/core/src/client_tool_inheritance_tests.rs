@@ -324,3 +324,61 @@ fn production_sized_continuation_savings() -> anyhow::Result<()> {
     assert_eq!(zstd::stream::decode_all(full_zstd.as_slice())?, full_body);
     Ok(())
 }
+
+#[test]
+fn tool_inheritance_follows_configuration_and_capability() {
+    use super::super::tools_inheritance_allowed;
+    use codex_model_provider_info::ToolInheritance;
+
+    let endpoint = "http://10.252.0.1:9/v1/tool-inheritance";
+    for (configured, advertised, expected) in [
+        // OpenAI and other servers never advertise the capability, so `auto` never omits.
+        (ToolInheritance::Auto, false, false),
+        (ToolInheritance::Auto, true, true),
+        (ToolInheritance::Enabled, false, true),
+        (ToolInheritance::Disabled, true, false),
+    ] {
+        assert_eq!(
+            tools_inheritance_allowed(configured, endpoint, advertised),
+            expected,
+            "{configured:?} advertised={advertised}"
+        );
+    }
+    // A failed echo verification disables even an explicit `true`.
+    crate::endpoint_capabilities::disable_tools_inheritance(endpoint);
+    for configured in [ToolInheritance::Auto, ToolInheritance::Enabled] {
+        assert!(!tools_inheritance_allowed(
+            configured, endpoint, /*continued_response_inherits_tools*/ true
+        ));
+    }
+}
+
+#[test]
+fn completed_tools_echo_verification() {
+    use super::super::PendingToolsEcho;
+    use super::super::tools_echo_matches;
+
+    let tools = json!([{"type": "function", "name": "lookup", "parameters": {"b": 1, "a": 2}}]);
+    // Key order does not matter.
+    let reordered = json!([{"parameters": {"a": 2, "b": 1}, "name": "lookup", "type": "function"}]);
+    let pending = |echo: Option<Option<u64>>| {
+        let slot = codex_api::CompletedToolsEcho::default();
+        if let Some(echo) = echo {
+            slot.set(echo).expect("unset slot");
+        }
+        PendingToolsEcho {
+            echo: slot,
+            expected: codex_api::tools_digest(&tools),
+        }
+    };
+    assert!(tools_echo_matches(&pending(Some(Some(
+        codex_api::tools_digest(&reordered)
+    )))));
+    assert!(!tools_echo_matches(&pending(Some(Some(
+        codex_api::tools_digest(&json!([]))
+    )))));
+    // Completed without echoing tools.
+    assert!(!tools_echo_matches(&pending(Some(None))));
+    // Never completed: nothing depends on the inherited tools.
+    assert!(tools_echo_matches(&pending(None)));
+}

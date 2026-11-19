@@ -1,10 +1,13 @@
 use super::responses_error::parse_failed_response;
+use crate::common::CompletedToolsEcho;
+use crate::common::INFERENCE_CAPABILITIES_HEADER;
 use crate::common::ReasoningRemovalReason;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponseStreamReceiver;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
+use crate::common::tools_digest;
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
 use crate::guardian_assessment::parse_guardian_assessment;
@@ -46,6 +49,24 @@ pub fn spawn_response_stream(
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> ResponseStream {
+    spawn_response_stream_with_tools_echo(
+        stream_response,
+        idle_timeout,
+        telemetry,
+        turn_state,
+        /*completed_tools*/ None,
+    )
+}
+
+/// Like [`spawn_response_stream`], and records a digest of the `tools` echoed by
+/// `response.completed` into `completed_tools` when provided.
+pub(crate) fn spawn_response_stream_with_tools_echo(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    turn_state: Option<Arc<OnceLock<String>>>,
+    completed_tools: Option<CompletedToolsEcho>,
+) -> ResponseStream {
     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
         .headers
@@ -69,6 +90,11 @@ pub fn spawn_response_stream(
     let accept_encoding = stream_response
         .headers
         .get(http::header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let capabilities = stream_response
+        .headers
+        .get(INFERENCE_CAPABILITIES_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let safety_buffering_treatment =
@@ -107,6 +133,7 @@ pub fn spawn_response_stream(
                 idle_timeout,
                 telemetry,
                 safety_buffering_treatment,
+                completed_tools,
             ) => {}
         }
     });
@@ -116,6 +143,7 @@ pub fn spawn_response_stream(
         rx_event: ResponseStreamReceiver::new(rx_event, cancellation_token),
         upstream_request_id,
         accept_encoding,
+        capabilities,
         interrupt: None,
     }
 }
@@ -617,6 +645,7 @@ pub async fn process_sse(
         idle_timeout,
         telemetry,
         SafetyBufferingTreatment::default(),
+        /*completed_tools*/ None,
     )
     .await;
 }
@@ -627,6 +656,7 @@ async fn process_sse_with_treatment(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
+    completed_tools: Option<CompletedToolsEcho>,
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
@@ -706,6 +736,17 @@ async fn process_sse_with_treatment(
             }
         }
 
+        if event.kind == "response.completed"
+            && let Some(completed_tools) = completed_tools.as_ref()
+        {
+            let digest = event
+                .response
+                .as_ref()
+                .and_then(|response| response.get("tools"))
+                .filter(|tools| tools.is_array())
+                .map(tools_digest);
+            let _ = completed_tools.set(digest);
+        }
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });

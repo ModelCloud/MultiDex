@@ -66,14 +66,17 @@ fn record_advertisement(endpoint: &str, accept_encoding: &str) {
     with_support(|state| state.insert(endpoint_key(endpoint), support));
 }
 
-/// Records a response the endpoint accepted. An advertisement wins; otherwise an accepted
-/// zstd body proves support.
+/// Records a response the endpoint accepted. A `request-encoding/1` capability listing zstd or an
+/// `Accept-Encoding` advertisement wins; otherwise an accepted zstd body proves support.
 pub(crate) fn record_accepted(
     endpoint: &str,
     compression: Compression,
     accept_encoding: Option<&str>,
+    capability_zstd: bool,
 ) {
-    if let Some(accept_encoding) = accept_encoding {
+    if capability_zstd {
+        with_support(|state| state.insert(endpoint_key(endpoint), Support::Supported));
+    } else if let Some(accept_encoding) = accept_encoding {
         record_advertisement(endpoint, accept_encoding);
     } else if compression == Compression::Zstd {
         with_support(|state| state.insert(endpoint_key(endpoint), Support::Supported));

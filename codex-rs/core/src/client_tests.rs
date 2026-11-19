@@ -3605,6 +3605,7 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
             ),
             upstream_request_id: None,
             accept_encoding: None,
+            capabilities: None,
             interrupt: None,
         },
         telemetry: test_session_telemetry(),

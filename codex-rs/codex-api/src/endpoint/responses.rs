@@ -1,4 +1,5 @@
 use crate::auth::SharedAuthProvider;
+use crate::common::CompletedToolsEcho;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
 use crate::endpoint::session::EndpointSession;
@@ -8,7 +9,7 @@ use crate::requests::Compression;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
-use crate::sse::spawn_response_stream;
+use crate::sse::responses::spawn_response_stream_with_tools_echo;
 use crate::telemetry::SseTelemetry;
 use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
@@ -39,6 +40,8 @@ pub struct ResponsesOptions {
     pub extra_headers: HeaderMap,
     pub compression: Compression,
     pub turn_state: Option<Arc<OnceLock<String>>>,
+    /// Receives a digest of the `tools` echoed by `response.completed`.
+    pub completed_tools: Option<CompletedToolsEcho>,
 }
 
 impl<T: HttpTransport> ResponsesClient<T> {
@@ -151,6 +154,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             extra_headers,
             compression,
             turn_state,
+            completed_tools,
         } = options;
         let body = EncodedJsonBody::encode(&request)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
@@ -169,7 +173,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             return crate::endpoint::chat_completions::stream(&self.session, &request, headers)
                 .await;
         }
-        self.stream_encoded(body, headers, compression, turn_state)
+        self.stream_encoded(body, headers, compression, turn_state, completed_tools)
             .await
     }
 
@@ -193,8 +197,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
     ) -> Result<ResponseStream, ApiError> {
         let body = EncodedJsonBody::encode(&body)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        self.stream_encoded(body, extra_headers, compression, turn_state)
-            .await
+        self.stream_encoded(
+            body,
+            extra_headers,
+            compression,
+            turn_state,
+            /*completed_tools*/ None,
+        )
+        .await
     }
 
     async fn stream_encoded(
@@ -203,6 +213,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         extra_headers: HeaderMap,
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
+        completed_tools: Option<CompletedToolsEcho>,
     ) -> Result<ResponseStream, ApiError> {
         let request_compression = match compression {
             Compression::None => RequestCompression::None,
@@ -226,11 +237,12 @@ impl<T: HttpTransport> ResponsesClient<T> {
             )
             .await?;
 
-        Ok(spawn_response_stream(
+        Ok(spawn_response_stream_with_tools_echo(
             stream_response,
             self.session.provider().stream_idle_timeout,
             self.sse_telemetry.clone(),
             turn_state,
+            completed_tools,
         ))
     }
 }

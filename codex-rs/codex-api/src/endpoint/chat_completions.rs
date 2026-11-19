@@ -533,6 +533,7 @@ fn response_stream(
         rx_event: ResponseStreamReceiver::new(rx, cancellation),
         upstream_request_id,
         accept_encoding: None,
+        capabilities: None,
         interrupt: None,
     }
 }

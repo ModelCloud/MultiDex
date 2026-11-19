@@ -199,7 +199,7 @@ fn model_provider_from_proto(
         supports_responses_continuation: provider.supports_responses_continuation,
         multidex_compatibility: false,
         request_compression: None,
-        inherits_tools_on_continuation: false,
+        inherits_tools_on_continuation: Default::default(),
         supports_standalone_web_search: provider.supports_standalone_web_search,
         capabilities: provider
             .capabilities
@@ -645,7 +645,7 @@ mod tests {
             supports_responses_continuation: false,
             multidex_compatibility: false,
             request_compression: None,
-            inherits_tools_on_continuation: false,
+            inherits_tools_on_continuation: Default::default(),
             supports_standalone_web_search: true,
             gateway_oauth: None,
             aws: None,

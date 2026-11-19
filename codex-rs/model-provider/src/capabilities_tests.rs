@@ -62,7 +62,7 @@ fn multidex_provider_enables_v2_remote_compaction() {
     let info = ModelProviderInfo {
         multidex_compatibility: true,
         request_compression: None,
-        inherits_tools_on_continuation: false,
+        inherits_tools_on_continuation: Default::default(),
         requires_openai_auth: false,
         ..Default::default()
     };
@@ -105,7 +105,7 @@ fn multidex_remote_compaction_override_wins() {
     let info = ModelProviderInfo {
         multidex_compatibility: true,
         request_compression: None,
-        inherits_tools_on_continuation: false,
+        inherits_tools_on_continuation: Default::default(),
         capabilities: Some(ModelProviderCapabilities {
             remote_compaction: Some(RemoteCompactionSupport::Unsupported),
             ..Default::default()
