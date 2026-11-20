@@ -404,6 +404,33 @@ fn openai_path_is_a_noop_even_for_unsupported_definitions() {
 }
 
 #[test]
+fn wafer_chat_completions_flattens_namespace_tools() {
+    let provider = codex_model_provider_info::ModelProviderInfo::create_wafer_provider();
+    assert!(provider.uses_chat_completions());
+    let full = request(
+        vec![namespace("app", vec![function("run")])],
+        vec![call(Some("app"), "run", false)],
+    );
+    let (wire, _) = prepare(provider.needs_flat_tool_namespaces(), &full, &full.input)
+        .unwrap()
+        .expect("Wafer must flatten namespace tools before Chat Completions");
+    let definitions = tools(&wire);
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0]["type"], "function");
+    assert!(definitions[0].get("namespace").is_none());
+    assert_ne!(definitions[0]["name"], "run");
+    for item in &wire.input {
+        assert!(
+            serde_json::to_value(item)
+                .unwrap()
+                .get("namespace")
+                .is_none(),
+            "Wafer input items must not carry a namespace"
+        );
+    }
+}
+
+#[test]
 fn http_and_websocket_wire_shapes_match_and_keep_continuation_fields() {
     let full = request(
         vec![namespace("app", vec![function("run")])],

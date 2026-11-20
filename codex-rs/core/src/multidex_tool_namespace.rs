@@ -1,5 +1,6 @@
-//! Translate namespaces only at the MultiDex provider boundary. Logical requests,
-//! tool dispatch, and persisted history continue to use upstream tool identities.
+//! Translate namespaces only at provider boundaries that cannot carry Responses
+//! namespace tools. Logical requests, tool dispatch, and persisted history
+//! continue to use upstream tool identities.
 use codex_api::ResponsesApiRequest;
 use codex_extension_api::ModelResponseInterceptor;
 use codex_extension_api::ModelResponseStream;
@@ -24,11 +25,11 @@ pub(crate) struct WireRequest {
 /// Inspect the *full* logical request, even when only a bounded continuation delta
 /// is going on the wire. Never replace the caller's continuation baseline.
 pub(crate) fn prepare(
-    multidex_compatibility: bool,
+    flatten_namespaces: bool,
     full_request: &ResponsesApiRequest,
     input: &[ResponseItem],
 ) -> Result<Option<(WireRequest, Box<dyn ModelResponseInterceptor>)>> {
-    if !multidex_compatibility {
+    if !flatten_namespaces {
         return Ok(None);
     }
     let mut names = Names::default();

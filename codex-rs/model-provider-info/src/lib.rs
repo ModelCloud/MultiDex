@@ -1059,6 +1059,17 @@ other non-default provider fields are not supported"
         self.is_lithos() || self.is_wafer()
     }
 
+    /// Whether tool definitions must be flattened out of Responses `namespace`
+    /// objects before this provider receives them.
+    ///
+    /// MultiDex/Lite and DeepInfra use the portable function-tool surface, and
+    /// the Chat Completions adapter only translates top-level `function` and
+    /// `custom` tools. A namespace tool on any of these wires is rejected
+    /// before the request leaves the client.
+    pub fn needs_flat_tool_namespaces(&self) -> bool {
+        self.multidex_compatibility || self.is_deepinfra() || self.uses_chat_completions()
+    }
+
     pub fn create_lithos_provider() -> ModelProviderInfo {
         let mut provider = Self::create_openrouter_provider();
         provider.name = "Lithos".into();
