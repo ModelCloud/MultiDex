@@ -185,6 +185,7 @@ async fn cloud_fresh_session_refreshes_account_without_project_config() -> Resul
         session.model_provider_id = provider.into();
         let prepared = PreparedFreshSession {
             started: AppServerStartedThread {
+                reasoning_summary: None,
                 session,
                 turns: Vec::new(),
                 blocks_direct_input: false,
