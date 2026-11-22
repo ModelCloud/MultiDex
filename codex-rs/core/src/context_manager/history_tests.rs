@@ -1328,6 +1328,22 @@ fn legacy_inter_agent_assistant_messages_are_not_turn_boundaries() {
     assert!(!is_user_turn_boundary(&item));
 }
 
+#[test]
+fn restored_history_without_usage_estimates_the_entire_window_once() {
+    let items = vec![
+        reasoning_with_encrypted_content(/*len*/ 2_000),
+        user_msg("continue"),
+        custom_tool_call_output("large-result", &"tool output ".repeat(10_000)),
+        assistant_msg("previous answer"),
+    ];
+    let expected = items.iter().map(estimate_item_token_count).sum::<i64>();
+    let mut history = ContextManager::default();
+    history.replace(items);
+    assert!(history.token_info().is_none());
+    assert_eq!(history.estimated_tokens_since_last_usage(), expected);
+    assert_eq!(history.get_total_token_usage(), expected);
+}
+
 #[test_case(false; "exclusive count")]
 #[test_case(true; "inclusive count")]
 fn total_token_usage_includes_all_items_since_last_usage(includes_reasoning: bool) {
