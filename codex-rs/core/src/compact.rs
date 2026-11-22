@@ -395,7 +395,11 @@ async fn run_compact_task_inner_impl(
                 if turn_input_len > 1 && history.raw_items().len() > 1 && overflow_retries < 6 {
                     // Drop a batch from the request snapshot. A single-item retry can
                     // resend a multi-megabyte payload hundreds of times.
-                    let batch = (history.raw_items().len() - 1).div_ceil(4);
+                    let batch = if overflow_retries < 2 {
+                        1
+                    } else {
+                        (history.raw_items().len() - 1).div_ceil(4)
+                    };
                     for _ in 0..batch {
                         if history.raw_items().len() <= 1 {
                             break;
