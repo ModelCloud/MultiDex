@@ -9,6 +9,7 @@ use crate::client::SamplingOptions;
 use crate::client_common::ResponseEvent;
 use crate::client_common::SamplingEvent;
 use crate::compact_pending_input::is_retained_pending_mail;
+use crate::compact_remote_history::shrink_compaction_tool_output;
 use crate::compact_remote_v2::retained_client_items;
 use crate::context::BaseInstructionsFragment;
 use crate::context::CompactionSummary;
@@ -305,6 +306,7 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    let mut overflow_retries = 0;
     let mut deepinfra_auto = DeepInfraAutoRetry::for_request(
         turn_context.provider.info(),
         &turn_context.model_info().slug,
@@ -366,12 +368,46 @@ async fn run_compact_task_inner_impl(
                 break response;
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
-                if turn_input_len > 1 {
-                    // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
-                    error!(
-                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
-                    );
-                    history.remove_first_item();
+                if overflow_retries == 0 {
+                    let mut rewritten = 0;
+                    let items = history
+                        .annotated_items()
+                        .iter()
+                        .map(|item| {
+                            if let Some(replacement) =
+                                shrink_compaction_tool_output(item, &turn_context)
+                            {
+                                rewritten += 1;
+                                replacement
+                            } else {
+                                item.clone()
+                            }
+                        })
+                        .collect();
+                    if rewritten > 0 {
+                        history.replace_annotated(items);
+                        tracing::info!(rewritten, "Retrying compaction with smaller tool results");
+                        overflow_retries += 1;
+                        retries = 0;
+                        continue;
+                    }
+                }
+                if turn_input_len > 1 && history.raw_items().len() > 1 && overflow_retries < 6 {
+                    // Drop a batch from the request snapshot. A single-item retry can
+                    // resend a multi-megabyte payload hundreds of times.
+                    let batch = if overflow_retries < 2 {
+                        1
+                    } else {
+                        (history.raw_items().len() - 1).div_ceil(4)
+                    };
+                    for _ in 0..batch {
+                        if history.raw_items().len() <= 1 {
+                            break;
+                        }
+                        history.remove_first_item();
+                    }
+                    error!("Context window exceeded while compacting; trimmed oldest history: {e}");
+                    overflow_retries += 1;
                     retries = 0;
                     continue;
                 }

@@ -14,6 +14,7 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
+use crate::compact_remote_history::shrink_compaction_tool_output;
 use crate::compact_remote_history::trim_function_call_history_to_fit_context_window;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
@@ -28,7 +29,9 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
@@ -227,6 +230,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 rejected_audio::clear_checkpoint(item, metadata.as_ref())
             }),
     );
+    let mut retried_overflow = false;
     let RemoteCompactionV2Output {
         compaction_output,
         response_id,
@@ -263,6 +267,48 @@ pub(super) async fn run_remote_compact_v2_attempt(
         );
         let rejected_id = match compaction_output_result {
             Ok(output) => break output,
+            Err(error)
+                if matches!(&transport, CompactionRequestTransport::Foreground(_))
+                    && !retried_overflow
+                    && matches!(error.details(), CodexErrorDetails::ContextWindowExceeded) =>
+            {
+                retried_overflow = true;
+                let input = &mut Arc::make_mut(&mut prompt).input;
+                input.pop(); // Remove the request-only trigger before rewriting the input.
+                let mut rewritten = 0;
+                for (item, metadata) in input.iter_mut().zip(&prompt_input_metadata) {
+                    // Move the item temporarily to avoid cloning a potentially huge tool result.
+                    let envelope = ResponseItemEnvelope {
+                        item: std::mem::replace(item, ResponseItem::CompactionTrigger {}),
+                        metadata: metadata.clone(),
+                    };
+                    *item = match shrink_compaction_tool_output(&envelope, turn_context) {
+                        Some(replacement) => {
+                            rewritten += 1;
+                            replacement.item
+                        }
+                        None => envelope.item,
+                    };
+                }
+                if rewritten == 0 {
+                    return Err(error);
+                }
+                info!(
+                    rewritten,
+                    "Retrying foreground compaction with smaller tool results"
+                );
+                submitted_audio = rejected_audio::SubmittedFileAudio::from_request(
+                    input,
+                    /*accepted*/ None,
+                    input
+                        .iter()
+                        .zip(&prompt_input_metadata)
+                        .filter_map(|(item, metadata)| {
+                            rejected_audio::clear_checkpoint(item, metadata.as_ref())
+                        }),
+                );
+                continue;
+            }
             Err(error) => submitted_audio
                 .take()
                 .and_then(|audio| audio.rejected_file_id(error.details()))

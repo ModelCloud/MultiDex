@@ -165,6 +165,23 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     (rewritten_outputs, estimated_deleted_tokens)
 }
 
+/// Shrink large tool results across the request after the provider rejects its
+/// context size. Preserve calls, recent messages, and explicitly retained items.
+pub(crate) fn shrink_compaction_tool_output(
+    envelope: &ResponseItemEnvelope,
+    turn_context: &TurnContext,
+) -> Option<ResponseItemEnvelope> {
+    if should_retain_client_item(envelope, &turn_context.config.features) {
+        return None;
+    }
+    let replacement = rewritten_output_for_context_window(envelope)?;
+    // Leave short results intact and make the rewrite idempotent.
+    let audio_durations = FileAudioDurations::default();
+    let before = estimate_item_token_count_with_audio(&envelope.item, &audio_durations);
+    let after = estimate_item_token_count_with_audio(&replacement.item, &audio_durations);
+    (before.saturating_sub(after) >= 128).then_some(replacement)
+}
+
 fn rewritten_output_for_context_window(
     envelope: &ResponseItemEnvelope,
 ) -> Option<ResponseItemEnvelope> {
