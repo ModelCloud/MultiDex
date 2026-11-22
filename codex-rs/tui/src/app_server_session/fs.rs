@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::FsCreateDirectoryParams;
 use codex_app_server_protocol::FsCreateDirectoryResponse;
@@ -27,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
 
-impl AppServerSession {
+impl AppServerFileSystem {
     pub(crate) async fn resolve_thread_file(
         &self,
         source: ThreadId,
@@ -37,7 +38,7 @@ impl AppServerSession {
         resolve_preview_path(path, &cwd)
     }
 
-    async fn preview_workspace(&self, source: ThreadId) -> Result<PathUri> {
+    pub(crate) async fn preview_workspace(&self, source: ThreadId) -> Result<PathUri> {
         // Read only the environment metadata. Other paths in thread/read may be native
         // to a different operating system from the TUI.
         #[derive(serde::Deserialize)]
@@ -50,7 +51,7 @@ impl AppServerSession {
         }
         let request_id = RequestId::String(Uuid::new_v4().to_string());
         let response: Response = self
-            .request_handle()
+            .request_handle
             .request_typed(ClientRequest::ThreadRead {
                 request_id,
                 params: codex_app_server_protocol::ThreadReadParams {
@@ -72,29 +73,6 @@ impl AppServerSession {
             })
     }
 
-    pub(crate) async fn read_document(
-        &self,
-        source: ThreadId,
-        original_path: &AppServerPath,
-        resolved_path: &PathUri,
-    ) -> Result<String> {
-        let bytes = self
-            .read_preview_file(source, original_path, resolved_path)
-            .await?;
-        Self::preview_text(bytes)
-    }
-
-    pub(crate) fn preview_text(bytes: Vec<u8>) -> Result<String> {
-        let text = String::from_utf8(bytes).wrap_err("Not a UTF-8 text file")?;
-        color_eyre::eyre::ensure!(
-            !text
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r')),
-            "Not a text file"
-        );
-        Ok(text)
-    }
-
     pub(crate) async fn read_preview_file(
         &self,
         source: ThreadId,
@@ -112,12 +90,31 @@ impl AppServerSession {
         );
         // fs/readFile follows symlinks. Only a server-side open can enforce no-follow.
         let path = AppServerPath::from_app_server(resolved_path.inferred_native_path_string());
-        let bytes = self.file_system().fs_read_file_path(&path).await?;
+        let bytes = self.fs_read_file_path(&path).await?;
         color_eyre::eyre::ensure!(
             self.preview_workspace(source).await? == workspace,
             "Workspace changed. Reopen the file to try again."
         );
         Ok(bytes)
+    }
+}
+
+impl AppServerSession {
+    pub(crate) fn supports_document_previews(&self) -> bool {
+        self.thread_params_mode() != super::ThreadParamsMode::Cloud
+            && self.app_server_platform_family() != Some("windows")
+            && (self.uses_remote_workspace() || !cfg!(windows))
+    }
+
+    pub(crate) fn preview_text(bytes: Vec<u8>) -> Result<String> {
+        let text = String::from_utf8(bytes).wrap_err("Not a UTF-8 text file")?;
+        color_eyre::eyre::ensure!(
+            !text
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r')),
+            "Not a text file"
+        );
+        Ok(text)
     }
 
     pub(crate) fn file_system(&self) -> AppServerFileSystem {
@@ -127,7 +124,7 @@ impl AppServerSession {
     }
 }
 
-fn resolve_preview_path(path: &AppServerPath, cwd: &PathUri) -> Result<PathUri> {
+pub(crate) fn resolve_preview_path(path: &AppServerPath, cwd: &PathUri) -> Result<PathUri> {
     let path = LegacyAppPathString::from_string(path.as_str())
         .resolve_against(cwd, /*user_home_dir*/ None)?;
     color_eyre::eyre::ensure!(
@@ -216,6 +213,35 @@ impl AppServerFileSystem {
         .map(drop)
     }
 
+    pub(crate) async fn watch_document(&self, path: &AppServerPath, id: Uuid) -> Result<()> {
+        // fs/changed notifications use client-native absolute paths. If we can't represent
+        // this directory, don't register a watch whose notifications we can't decode.
+        let path = AbsolutePathBuf::from_absolute_path_checked(path.as_str())?;
+        let _: codex_app_server_protocol::FsWatchResponse = self
+            .request_handle
+            .request_typed(ClientRequest::FsWatch {
+                request_id: RequestId::String(format!("tui-fs-{}", Uuid::new_v4())),
+                params: codex_app_server_protocol::FsWatchParams {
+                    watch_id: id.to_string(),
+                    path,
+                },
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn unwatch_document(&self, id: Uuid) {
+        let _: Result<codex_app_server_protocol::FsUnwatchResponse, _> = self
+            .request_handle
+            .request_typed(ClientRequest::FsUnwatch {
+                request_id: RequestId::String(format!("tui-fs-{}", Uuid::new_v4())),
+                params: codex_app_server_protocol::FsUnwatchParams {
+                    watch_id: id.to_string(),
+                },
+            })
+            .await;
+    }
+
     async fn request_fs_path<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -238,8 +264,13 @@ impl AppServerFileSystem {
                     })
                     .await
                     .wrap_err_with(|| format!("{method} failed in TUI"))?;
-                serde_json::from_value(response.map_err(|source| {
-                    color_eyre::eyre::eyre!("{method} failed in TUI: {}", source.message)
+                serde_json::from_value(response.map_err(|mut source| {
+                    // Callers log these errors. Keep raw server diagnostics out of the logs.
+                    source.data = None;
+                    TypedRequestError::Server {
+                        method: method.to_string(),
+                        source,
+                    }
                 })?)
                 .wrap_err_with(|| format!("{method} returned invalid data"))
             }

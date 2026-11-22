@@ -247,6 +247,8 @@ pub(crate) async fn run_pre_tool_use_hooks(
         };
     };
 
+    let reason = reason.trim_end_matches('.');
+
     if (tool_name.name() == "Bash" || tool_name.name() == "apply_patch")
         && let Some(command) = tool_input.get("command").and_then(Value::as_str)
     {
@@ -759,7 +761,7 @@ pub(crate) async fn record_pending_input(
     pending_input: TurnInput,
     additional_contexts: Vec<codex_hooks::HookContext>,
     persist_context: PersistContext,
-) {
+) -> std::io::Result<()> {
     match pending_input {
         TurnInput::UserInput {
             content,
@@ -774,7 +776,7 @@ pub(crate) async fn record_pending_input(
                 metadata,
                 persist_context,
             )
-            .await;
+            .await?;
         }
         TurnInput::ResponseItem(item) => {
             sess.record_annotated_conversation_items(turn_context, model_info, vec![item])
@@ -809,6 +811,7 @@ pub(crate) async fn record_pending_input(
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;
+    Ok(())
 }
 
 /// Processes finished async hook results at a safe turn boundary.

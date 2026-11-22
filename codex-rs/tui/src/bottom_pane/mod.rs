@@ -1139,6 +1139,10 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_composer_restricted_input_mode(&mut self, mode: Option<RestrictedInputMode>) {
+        self.composer.set_restricted_input_mode(mode);
+    }
+
     pub(crate) fn pre_draw_tick(&mut self) {
         self.pre_draw_tick_at(Instant::now());
     }
@@ -1408,6 +1412,10 @@ impl BottomPane {
     #[cfg(test)]
     pub(crate) fn status_indicator_visible(&self) -> bool {
         self.status_widget().is_some()
+    }
+
+    pub(crate) fn status_line_area(&self) -> ratatui::layout::Rect {
+        self.composer.status_line_area()
     }
 
     pub(crate) fn status_line_content(&self) -> Option<&StatusLine> {
@@ -2095,15 +2103,17 @@ impl BottomPane {
         let reported_repeats_only = match suppression {
             ActivationKeySuppression::ViewTransition => self.enhanced_keys_supported,
             ActivationKeySuppression::ReportedRepeats => true,
-            ActivationKeySuppression::PressOnlyFallback => {
-                self.enhanced_keys_supported && crate::tui::reports_key_releases()
-            }
+            ActivationKeySuppression::PressOnlyFallback => self.reports_key_releases(),
         };
         self.view_transition_key_guard = Some(ActivationKeyGuard::new_at(
             key,
             activated_at,
             reported_repeats_only,
         ));
+    }
+
+    pub(crate) fn reports_key_releases(&self) -> bool {
+        self.enhanced_keys_supported && crate::tui::reports_key_releases()
     }
 
     pub(crate) fn consume_view_transition_key_event(&mut self, key_event: KeyEvent) -> bool {

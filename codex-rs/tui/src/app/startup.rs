@@ -52,25 +52,39 @@ fn spawn_startup_thread_start(
     });
 }
 
-pub(super) async fn prepare_fresh_startup_config(
+pub(super) fn startup_config_cwd<'a>(
+    config: &'a Config,
+    app_server: &'a AppServerSession,
+    app_server_target: &AppServerTarget,
+    resumed_cwd: Option<&'a Path>,
+) -> &'a Path {
+    match app_server_target {
+        AppServerTarget::Embedded | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
+        AppServerTarget::Remote { .. } => app_server
+            .remote_cwd_override()
+            .or(resumed_cwd)
+            .unwrap_or(Path::new(".")),
+        AppServerTarget::Cloud => app_server.remote_cwd_override().unwrap_or(Path::new(".")),
+    }
+}
+
+pub(super) fn statusline_enabled(config: &codex_app_server_protocol::Config) -> bool {
+    config
+        .additional
+        .get("features")
+        .and_then(|features| features.get(Feature::TuiExtensionsStatusLine.key()))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(super) fn prepare_fresh_startup_config(
     config: &mut Config,
     app_server: &AppServerSession,
-    app_server_target: &AppServerTarget,
+    defaults: &crate::config_update::EffectiveConfig,
     cli_kv_overrides: &[(String, TomlValue)],
     harness_overrides: &ConfigOverrides,
     environments: &EnvironmentManager,
-) -> Result<crate::projectless::AppliedDefaults> {
-    let defaults_cwd = match app_server_target {
-        AppServerTarget::Embedded | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
-        AppServerTarget::Remote { .. } | AppServerTarget::Cloud => {
-            app_server.remote_cwd_override().unwrap_or(Path::new("."))
-        }
-    };
-    let defaults = crate::config_update::read_effective_config_with_layers(
-        &app_server.request_handle(),
-        defaults_cwd.display().to_string(),
-    )
-    .await?;
+) -> crate::projectless::AppliedDefaults {
     super::new_session::overlay_new_session_defaults(
         config,
         &defaults.config,
@@ -82,7 +96,7 @@ pub(super) async fn prepare_fresh_startup_config(
         harness_overrides,
         app_server,
         environments,
-        &defaults,
+        defaults,
     );
     apply_managed_new_thread_defaults(
         config,
@@ -90,7 +104,7 @@ pub(super) async fn prepare_fresh_startup_config(
         cli_kv_overrides,
         harness_overrides,
     );
-    Ok(projectless)
+    projectless
 }
 
 pub(super) fn startup_model(
@@ -202,7 +216,11 @@ impl App {
     /// Keep a visible modal closed to input if the terminal has not settled yet. The next input
     /// event retries the drain instead of acting on the modal; server events can continue meanwhile.
     pub(super) fn discard_startup_modal_input(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        match tui.discard_pending_input_before_interactive_screen() {
+        let drained = tui.discard_pending_input_before_interactive_screen();
+        // A press-only terminal can report the held key again after the input drain.
+        self.chat_widget
+            .protect_modal_from_held_activation_key(Instant::now());
+        match drained {
             Ok(()) => self.startup_pending_protected_request = false,
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
                 self.startup_pending_protected_request = true;
@@ -384,31 +402,51 @@ impl App {
                 config.model_reasoning_effort = None;
             }
         }
-        let startup_defaults = if fresh_start {
-            match startup_draft
-                .run_until(
-                    tui,
-                    prepare_fresh_startup_config(
-                        &mut config,
-                        &app_server,
-                        &app_server_target,
-                        &cli_kv_overrides,
-                        &harness_overrides,
-                        &environment_manager,
-                    ),
-                )
-                .await
-            {
-                Ok(Ok(defaults)) => defaults,
-                Ok(Err(err)) => {
-                    return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
+        let resumed_cwd = match &session_selection {
+            SessionSelection::Resume(target) => target.cwd.as_deref(),
+            _ => None,
+        };
+        let cwd = startup_config_cwd(&config, &app_server, &app_server_target, resumed_cwd)
+            .display()
+            .to_string();
+        let startup_config = match startup_draft
+            .run_until(tui, async {
+                let request_handle = app_server.request_handle();
+                let read_config = crate::config_update::read_effective_config_with_optional_layers(
+                    &request_handle,
+                    cwd,
+                    /*include_layers*/ fresh_start,
+                );
+                if fresh_start {
+                    read_config.await
+                } else {
+                    tokio::time::timeout(Duration::from_secs(/*secs*/ 2), read_config).await?
                 }
-                Err(err) => {
-                    return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
-                }
+            })
+            .await
+        {
+            Ok(Ok(config)) => Some(config),
+            Ok(Err(_)) if !fresh_start => None,
+            Ok(Err(err)) => {
+                return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
             }
-        } else {
-            crate::projectless::AppliedDefaults::default()
+            Err(err) => {
+                return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
+            }
+        };
+        let statusline_feature_enabled = startup_config
+            .as_ref()
+            .is_some_and(|response| statusline_enabled(&response.config));
+        let startup_defaults = match startup_config.as_ref() {
+            Some(defaults) if fresh_start => prepare_fresh_startup_config(
+                &mut config,
+                &app_server,
+                defaults,
+                &cli_kv_overrides,
+                &harness_overrides,
+                &environment_manager,
+            ),
+            _ => crate::projectless::AppliedDefaults::default(),
         };
         let mut launch_choices = crate::app_server_session::StartupLaunchChoices::from_launch(
             &cli_kv_overrides,
@@ -436,6 +474,13 @@ impl App {
                 }
             },
         };
+        if let Some(defaults) = startup_config.as_ref() {
+            super::new_session::overlay_reasoning_summary(
+                &mut config,
+                &defaults.config,
+                &cli_kv_overrides,
+            );
+        }
         launch_choices.apply_projectless_approval_policy(
             startup_defaults.approval_policy,
             bootstrap.allowed_approval_policies.as_deref(),
@@ -471,6 +516,7 @@ impl App {
                 crate::status::remote_connection::pending_server_version_notice(
                     &local_settings.tui,
                     &app_server_target,
+                    config.features.enabled(Feature::DaemonUpdates),
                     app_server.server_codex_home(),
                     CODEX_CLI_VERSION,
                     app_server.server_version(),
@@ -525,6 +571,7 @@ impl App {
         ) && let Err(error) = app_server
             .start_dynamic_tool_mcp(
                 config.clone(),
+                local_settings.workspace_enabled(&config),
                 app_event_tx.clone(),
                 dynamic_tool_status_updates.clone(),
             )
@@ -937,9 +984,11 @@ impl App {
                 .borrow_mut()
                 .continue_from(&mut startup_draft.blossom.borrow_mut());
         }
+        chat_widget.statusline_feature_enabled = statusline_feature_enabled;
         chat_widget.remote_connection = remote_connection;
         chat_widget.snapshot_local_images = app_server_target.uses_remote_workspace();
         chat_widget.thread_params_mode = app_server.thread_params_mode();
+        chat_widget.app_server_path_convention = app_server.path_convention();
         chat_widget.pending_cloud_turn_settings = app_server.pending_cloud_turn_settings();
         chat_widget.set_local_worktree_operations(!crate::uses_remote_workspace_or_environment(
             &app_server_target,
@@ -1005,6 +1054,7 @@ See the Codex keymap documentation for supported actions and examples."
             backend_preference_context,
             config,
             local_settings,
+            realtime_call_client: Arc::default(),
             launch_cwd,
             runtime_working_directory_override: None,
             state_db,
@@ -1093,6 +1143,7 @@ See the Codex keymap documentation for supported actions and examples."
             side_threads: HashMap::new(),
             saved_openings: Default::default(),
             sidebars: HashMap::new(),
+            model_preview_load: None,
             side_companions: HashMap::new(),
             zoomed_thread: None,
             exact_sidebar_width: None,
@@ -1317,6 +1368,9 @@ See the Codex keymap documentation for supported actions and examples."
         let mut last_screen_size = tui.terminal.last_known_screen_size;
         let mut settled_size_tags = crate::terminal_size_telemetry::tags(last_screen_size);
         let mut pending_resize: Option<(ratatui::layout::Size, Instant)> = None;
+        let mut cloud_inventory_poll = tokio::time::interval(Duration::from_secs(/*secs*/ 10));
+        cloud_inventory_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut cloud_inventory_owner = None;
         let mut reconnect = None;
         let mut cloud_environment_picker: Option<
             futures::future::LocalBoxFuture<'static, crate::bottom_pane::SelectionViewParams>,
@@ -1481,7 +1535,7 @@ See the Codex keymap documentation for supported actions and examples."
                         app.app_server_target.clone(),
                         app.config.clone(),
                         app.local_settings.clone(),
-                        app.current_displayed_thread_id(),
+                        app.reconnect_thread_id(),
                         backends
                             .session_at(displayed_session)
                             .remote_cwd_override()
@@ -1541,6 +1595,15 @@ See the Codex keymap documentation for supported actions and examples."
                     .chat_widget
                     .rate_limit_refresh_interval()
                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
+                let cloud_owner = (backends.is_listening(displayed_owner)
+                    && backends.session_at(displayed_session).thread_params_mode()
+                        == crate::ThreadParamsMode::Cloud
+                    && app.cloud_inventory_visible(displayed_owner))
+                .then_some(displayed_owner);
+                if cloud_inventory_owner != cloud_owner {
+                    cloud_inventory_owner = cloud_owner;
+                    cloud_inventory_poll.reset();
+                }
                 let control = select! {
                     result = async {
                         match app.daemon_restart.as_mut() {
@@ -1613,7 +1676,15 @@ See the Codex keymap documentation for supported actions and examples."
                             continue;
                         }
                         if let AppEvent::ResumeBackendSession(target) = event {
-                            match app.resume_backend_session(tui, &mut backends, target).await {
+                            let thread_id = target.thread_id;
+                            let result = app.resume_backend_session(tui, &mut backends, target).await;
+                            if app.finish_docked_task_opening(tui, thread_id)
+                                && app.chat_widget.has_active_modal()
+                                && let Err(err) = app.render_startup_frame(tui, &app_event_rx)
+                            {
+                                break Err(err);
+                            }
+                            match result {
                                 Ok(AppRunControl::Continue) => continue,
                                 Ok(AppRunControl::Exit(reason)) => break Ok(reason),
                                 Err(error) => break Err(error),
@@ -1823,6 +1894,13 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                     }, if backends.is_listening(displayed_owner) => {
                         app.refresh_rate_limits(backends.session_at(displayed_session), RateLimitRefreshOrigin::Periodic);
+                        AppRunControl::Continue
+                    }
+                    _ = cloud_inventory_poll.tick(), if cloud_owner.is_some() => {
+                        let session = backends.session_at(displayed_session);
+                        if let AppServerRequestHandle::Cloud(handle) = session.request_handle() {
+                            app.poll_cloud_inventory(session, handle.has_attachment());
+                        }
                         AppRunControl::Continue
                     }
                     () = async {

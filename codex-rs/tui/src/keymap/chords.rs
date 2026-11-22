@@ -66,10 +66,16 @@ const FOCUSED_SIDEBAR: u64 = 1 << 29;
 const TRANSCRIPT_SELECT: u64 = 1 << 30;
 const COMPOSER_EDIT_ONLY: u64 = 1 << 31;
 const CLOUD_ENVIRONMENT_SELECTION: u64 = 1 << 32;
+const COMPOSER_SUBMIT: u64 = 1 << 33;
 
 const TRANSCRIPT_BROWSING: u64 = 1 << 14;
 
 impl KeymapContextSet {
+    /// Retain submission while an argument suggestion is open.
+    pub(crate) const fn with_composer_submit(self) -> Self {
+        Self(self.0 | COMPOSER_SUBMIT)
+    }
+
     pub(crate) const fn composer_edit_only() -> Self {
         Self(COMPOSER_EDIT_ONLY)
     }
@@ -225,6 +231,12 @@ impl KeymapContextSet {
 
     /// Whether this input path can dispatch the action, including focus-specific exclusions.
     pub(crate) fn contains_action(self, action: KeymapActionId) -> bool {
+        if self.0 & COMPOSER_SUBMIT != 0
+            && action.context == KeymapContext::Composer
+            && action.action == "submit"
+        {
+            return true;
+        }
         if self.0 & COMPOSER_EDIT_ONLY != 0 && action.context == KeymapContext::Composer {
             let edit = matches!(action.action, "undo" | "redo");
             return edit != self.contains(KeymapContext::Composer);
@@ -237,6 +249,7 @@ impl KeymapContextSet {
         }
         if action.context == KeymapContext::Global {
             match action.action {
+                "open_agents" if self.0 & MAIN_COMPOSER_FOCUS != 0 => return true,
                 "change_host" => return self.0 & BACKEND_CYCLING != 0,
                 "choose_cloud_environment" => return self.0 & CLOUD_ENVIRONMENT_SELECTION != 0,
                 _ => {}
@@ -515,6 +528,9 @@ Reduce `tui.keymap.global.leader` alternatives or `leader ...` bindings."
                         && binding.action.action == "close_transcript"),
                     !(contexts.0 & TRANSCRIPT_ACTIONS != 0
                         && binding.action.context == KeymapContext::Pager),
+                    contexts.0 & MAIN_COMPOSER_FOCUS != 0
+                        && contexts.contains(KeymapContext::Agents)
+                        && binding.action.context != KeymapContext::Agents,
                     contexts.is_warnings() && binding.action.context != KeymapContext::List,
                     contexts.is_warnings() && binding.action.context == KeymapContext::Global,
                 )

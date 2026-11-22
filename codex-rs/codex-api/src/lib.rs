@@ -37,6 +37,7 @@ pub use crate::auth::auth_header_telemetry;
 pub use crate::common::AccessPrograms;
 pub use crate::common::CompletedToolsEcho;
 pub use crate::common::INFERENCE_CAPABILITIES_HEADER;
+pub use crate::common::MAX_RESPONSE_MESSAGE_BYTES;
 pub use crate::common::MemorySummarizeInput;
 pub use crate::common::MemorySummarizeOutput;
 pub use crate::common::OpenAiVerbosity;

@@ -25,47 +25,147 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
-async fn overview_cloud_discovery_uses_only_interactive_pages() {
+async fn deferred_subagent_backfill_replays_parked_request() -> Result<()> {
+    let mut app = make_test_app().await;
+    let root_id = ThreadId::new();
+    attach_thread(&mut app, root_id);
+    app.primary_thread_id = Some(root_id);
+    app.active_thread_id = Some(root_id);
+    let child_id = ThreadId::new();
+    let backend_id = BackendId::new();
+    let (mut cloud, mut commands, _events) =
+        overview_session_stub(backend_id, ThreadParamsMode::Cloud);
+    let child = overview_thread(child_id, Some(root_id), "Child task", ThreadStatus::Idle);
+    let request = ServerRequest::ToolRequestUserInput {
+        request_id: RequestId::Integer(42),
+        params: ToolRequestUserInputParams {
+            thread_id: child_id.to_string(),
+            turn_id: "turn".into(),
+            item_id: "question".into(),
+            questions: Vec::new(),
+            is_blocking: true,
+            auto_resolution_ms: None,
+        },
+    };
+    app.agents_overview.dispatched_requests.insert(
+        child_id,
+        vec![BufferedServerRequest::new(
+            request.clone(),
+            &cloud.request_handle(),
+        )],
+    );
+    app.replay_agents_overview_requests(&cloud, root_id).await;
+    assert!(
+        app.agents_overview
+            .dispatched_requests
+            .contains_key(&child_id)
+    );
+
+    let serve_backfill = async {
+        let list = commands.recv().await.expect("loaded thread list request");
+        assert!(matches!(list.operation, CloudOperation::Request(request)
+            if matches!(request.as_ref(), ClientRequest::ThreadLoadedList { .. })));
+        list.response
+            .send(Ok(Ok(json!({"data": [child_id], "nextCursor": null}))))
+            .unwrap();
+        let read = commands.recv().await.expect("child thread read request");
+        assert!(matches!(read.operation, CloudOperation::Request(request)
+            if matches!(request.as_ref(), ClientRequest::ThreadRead { params, .. }
+                if params.thread_id == child.id && !params.include_turns)));
+        read.response
+            .send(Ok(Ok(json!({"thread": child, "readState": null}))))
+            .unwrap();
+    };
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let backfill = crate::boxed_future!(app.handle_event(
+        &mut tui,
+        &mut cloud,
+        AppEvent::BackfillResumedSubagents {
+            thread_id: root_id,
+            backend_id
+        },
+    ));
+    let (result, ()) = tokio::join!(backfill, serve_backfill);
+    result?;
+    assert!(
+        app.pending_app_server_requests
+            .contains_server_request(&request)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn overview_refresh_grows_visible_history_and_preserves_the_show_more_cursor() {
     let (client, mut commands, _events) = CloudClient::channel(/*capacity*/ 1);
     let handle = AppServerClient::Cloud(client).request_handle();
-    let threads = ["First Cloud task", "Second Cloud task"].map(|name| {
-        overview_thread(
-            ThreadId::new(),
-            /*parent_thread_id*/ None,
-            name,
-            ThreadStatus::NotLoaded,
-        )
-    });
-
-    let serve_pages = async {
-        for (thread, (cursor, next_cursor)) in threads
-            .iter()
-            .zip([(None, Some("next")), (Some("next"), None)])
-        {
-            let command = commands.recv().await.unwrap();
-            let CloudOperation::Request(request) = command.operation else {
-                panic!("expected a Cloud request");
-            };
-            let ClientRequest::ThreadList { params, .. } = *request else {
-                panic!("expected thread/list");
-            };
-            assert_eq!(params.source_kinds, Some(Vec::new()));
-            assert_eq!(params.cursor.as_deref(), cursor);
-            command
+    let parent = None;
+    let threads: Vec<_> = (0..66)
+        .map(|rank| {
+            let mut thread = overview_thread(ThreadId::new(), parent, "Task", ThreadStatus::Idle);
+            thread.updated_at -= rank;
+            (thread, false)
+        })
+        .collect();
+    let (more, refill, refresh) = (Some(10), Some(2), None);
+    let pages = [
+        (more, None, Some((12..22, Some("h1")))),
+        (more, Some("h1"), Some((22..32, Some("h2")))),
+        (more, Some("h2"), Some((32..42, Some("h3")))),
+        (more, Some("h3"), Some((42..52, Some("h4")))),
+        (more, Some("h4"), Some((52..62, Some("h5")))),
+        (refresh, None, Some((0..10, Some("r1")))),
+        (refresh, Some("r1"), None),
+        (refresh, None, Some((0..10, Some("r1")))),
+        (refresh, Some("r1"), Some((10..20, Some("r2")))),
+        (refill, Some("h5"), Some((62..64, Some("h6")))),
+        (refresh, Some("r2"), Some((20..30, Some("r3")))),
+        (refresh, Some("r3"), Some((30..40, Some("r4")))),
+        (refresh, Some("r4"), Some((40..50, Some("r5")))),
+        (refresh, Some("r5"), Some((50..60, Some("r6")))),
+        (refresh, Some("r6"), Some((60..66, Some("r7")))),
+        (more, Some("h6"), Some((64..66, None))),
+    ];
+    let mut discovery = AgentsOverviewDiscovery::default();
+    let mut shown = HashSet::new();
+    for (history_limit, cursor, page) in pages {
+        let range = page.as_ref().map_or(0..0, |(range, _)| range.clone());
+        let clipped_end = if cursor == Some("r6") { 64 } else { range.end };
+        let expected = &threads[range.start..clipped_end];
+        let complete = page.is_some();
+        let response = page
+            .map(|(range, next)| {
+                let data: Vec<_> = threads[range].iter().map(|(thread, _)| thread).collect();
+                json!({"data": data, "nextCursor": next})
+            })
+            .ok_or_else(|| JSONRPCErrorError {
+                code: -32603,
+                message: "Temporary list failure".into(),
+                data: None,
+            });
+        let serve_page = async {
+            next_cloud_page(&mut commands, cursor)
+                .await
                 .response
-                .send(Ok(Ok(json!({"data": [thread], "nextCursor": next_cursor}))))
+                .send(Ok(response))
                 .unwrap();
+        };
+        let discover = discovery.next_overview_page(
+            &handle,
+            history_limit.unwrap_or(10),
+            history_limit.is_none(),
+        );
+        let ((rows, ok), ()) = tokio::join!(discover, serve_page);
+        assert_eq!((rows.as_slice(), ok), (expected, complete));
+        shown.extend(rows.into_iter().map(|(thread, _)| thread.id));
+        if cursor == Some("r1") && complete {
+            assert_eq!(shown.len(), 62);
         }
-    };
-    let discover = async {
-        let mut discovery = AgentsOverviewDiscovery::default();
-        for (thread, has_more) in threads.iter().zip([true, false]) {
-            let page = discovery.next_batch(&handle, /*limit*/ 10).await;
-            assert_eq!(page, (vec![(thread.clone(), false)], true));
-            assert_eq!(discovery.has_more(), has_more);
+        if !complete {
+            assert!(discovery.has_cloud_refresh_pending());
         }
-    };
-    tokio::join!(serve_pages, discover);
+    }
+    assert!(!discovery.has_cloud_refresh_pending());
+    assert!(!discovery.has_more());
 }
 
 #[tokio::test]
@@ -105,10 +205,39 @@ async fn overview_return_to_current_chat_cancels_the_cloud_list_and_allows_reope
             .unwrap();
         next_cloud_page(commands, /*cursor*/ None).await
     };
-    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let size = Size::new(/*width*/ 115, /*height*/ 12);
+    let mut tui = crate::tui::test_support::make_test_tui_with_size(size)?;
+    crate::app::test_support::enable_side_retention(&mut app)?;
+    app.local_settings.tui.animations = false;
+    tui.set_owned_screen(/*owned*/ true)?;
     for key in [KeyCode::Esc, KeyCode::Enter] {
+        if key == KeyCode::Enter {
+            // Escape closes the dock. Selection closes the original modal.
+            crate::app::test_support::use_modal_agents_overview(&mut app);
+        }
         app.open_agents_overview(&cloud);
         let held_list = tokio::time::timeout(timeout, next_list(&mut commands)).await?;
+        if key == KeyCode::Esc {
+            let frame = crate::app::test_support::side_frame(&mut app, &mut tui, size)?;
+            let screen = frame
+                .lines()
+                .filter_map(|row| row.split_once('│').map(|(left, _)| left.trim_end()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(&test_path_display("/tmp/project"), "/tmp/project");
+            insta::assert_snapshot!("initial_discovery_with_current_task", screen);
+            let view = app.agents_overview.workspace.view.as_ref().unwrap();
+            let footers = [30, 31].map(|width| {
+                super::command_center::screen(view, width, size.height)
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .trim()
+                    .to_string()
+            });
+            assert_eq!(footers, ["◌ Loading tasks…", "◌ Loading additional tasks…"]);
+            assert_eq!(app.overview_selected_thread_id(), Some(thread_id));
+        }
         Box::pin(app.handle_tui_event(&mut tui, &mut cloud, TuiEvent::Key(key.into()))).await?;
         if key == KeyCode::Enter {
             tokio::time::timeout(timeout, async {
@@ -127,14 +256,25 @@ async fn overview_return_to_current_chat_cancels_the_cloud_list_and_allows_reope
             .await??;
         }
         assert!(held_list.response.is_closed());
-        assert!(!app.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID));
+        assert!(app.overview_selected_index().is_none());
     }
 
+    // The previous archive was observed, but its unarchive notification was missed.
+    app.agents_overview.threads.remove(&thread_id);
+    app.agents_overview.removed_threads.insert(thread_id);
+    crate::app::test_support::enable_side_retention(&mut app)?;
     app.open_agents_overview(&cloud);
     let reopened = tokio::time::timeout(timeout, next_list(&mut commands)).await?;
+    let mut listed = current.clone();
+    listed.name = Some("Renamed in Cloud".to_string());
+    listed.updated_at += 1;
+    listed.recency_at = Some(listed.updated_at);
+    let unread = json!({"revision": "1", "firstUnread": {"type": "threadStart"}});
     reopened
         .response
-        .send(Ok(Ok(json!({"data": [], "nextCursor": null}))))
+        .send(Ok(Ok(json!({
+            "data": [listed], "nextCursor": null, "readStates": {(thread_id.to_string()): unread}
+        }))))
         .unwrap();
     let read = tokio::time::timeout(timeout, commands.recv())
         .await?
@@ -164,8 +304,37 @@ async fn overview_return_to_current_chat_cancels_the_cloud_list_and_allows_reope
         )))
         .unwrap();
     finish_overview_refresh(&mut app, &cloud, &mut events).await;
-    assert!(app.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID));
+    let screen = crate::app::test_support::side_frame(&mut app, &mut tui, size)?;
+    assert!(!screen.contains("Loading tasks"));
+    assert!(!screen.contains("Loading additional tasks"));
+    assert!(screen.contains("? help  esc back"));
+    assert_eq!(app.overview_selected_thread_id(), Some(thread_id));
     assert!(!app.agents_overview.refresh_failed_backends.contains(&owner));
+    assert_eq!(
+        app.agents_overview.threads[&thread_id],
+        Some(listed.clone())
+    );
+    assert!(app.agents_overview.unread.contains(&thread_id));
+
+    app.refresh_agents_overview_threads(&cloud);
+    reject_cloud_pinned_list(&mut commands).await;
+    current.status = ThreadStatus::NotLoaded;
+    for response in [
+        json!({"thread": current, "readState": null}),
+        json!({"data": [], "nextCursor": null, "backwardsCursor": null}),
+    ] {
+        commands
+            .recv()
+            .await
+            .unwrap()
+            .response
+            .send(Ok(Ok(response)))
+            .unwrap();
+    }
+    finish_overview_refresh(&mut app, &cloud, &mut events).await;
+    listed.status = current.status;
+    assert_eq!(app.agents_overview.threads[&thread_id], Some(listed));
+    assert!(app.agents_overview.unread.contains(&thread_id));
     Ok(())
 }
 
@@ -186,7 +355,9 @@ async fn resume_picker_cancels_a_held_cloud_show_more_page() -> Result<()> {
     );
     let mut discovery = AgentsOverviewDiscovery::default();
     let handle = cloud.request_handle();
-    let (page, ()) = tokio::join!(discovery.next_batch(&handle, /*limit*/ 10), async {
+    let page =
+        discovery.next_overview_page(&handle, /*limit*/ 10, /*refresh_recent*/ false);
+    let (page, ()) = tokio::join!(page, async {
         let command = next_cloud_page(&mut commands, /*cursor*/ None).await;
         command
             .response
@@ -343,7 +514,7 @@ async fn overview_local_enter_drops_the_displayed_cloud_list_before_detach() -> 
         "Local saved chat",
         ThreadStatus::Idle,
     );
-    local_row.cwd = local_session.cwd;
+    local_row.cwd = local_session.cwd.into();
 
     let cloud_owner = BackendId::new();
     let cloud_id = ThreadId::new();
@@ -376,7 +547,9 @@ async fn overview_local_enter_drops_the_displayed_cloud_list_before_detach() -> 
     let mut discovery = AgentsOverviewDiscovery::default();
     let handle = cloud.request_handle();
     let (first_page, ()) = tokio::time::timeout(timeout, async {
-        tokio::join!(discovery.next_batch(&handle, /*limit*/ 10), async {
+        let page =
+            discovery.next_overview_page(&handle, /*limit*/ 10, /*refresh_recent*/ false);
+        tokio::join!(page, async {
             let command = next_cloud_page(&mut commands, /*cursor*/ None).await;
             command
                 .response
@@ -774,6 +947,13 @@ async fn check_discovery(mixed_sources: bool) -> Result<()> {
     }
     assert_eq!(app.agents_overview.threads.len(), 10);
     assert!(app.agents_overview.threads.contains_key(&ids[10]));
+    let retained_id = ids[14];
+    let mut retained = expected[&retained_id].clone().unwrap();
+    retained.name = Some("Earlier task name".to_string());
+    assert!(app.backend_registry.observe(owner, retained_id));
+    app.agents_overview
+        .threads
+        .insert(retained_id, Some(retained));
     let other = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     let other_owner = other.backend_id();
     if mixed_sources {
@@ -821,6 +1001,10 @@ async fn check_discovery(mixed_sources: bool) -> Result<()> {
     );
     app.backend_registry.disconnect(other_owner);
     other.shutdown().await?;
+    assert_eq!(
+        app.agents_overview.threads[&retained_id],
+        expected[&retained_id]
+    );
     assert_eq!(
         app.agents_overview
             .threads

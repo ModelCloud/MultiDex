@@ -32,6 +32,7 @@ use ratatui::widgets::StatefulWidgetRef;
 use std::time::Duration;
 
 pub(super) const GAP: u16 = 1;
+pub(super) const MIN_SPLIT_WIDTH: u16 = 100;
 pub(super) const RESIZE_HINT: &str = "Resize · ←/h →/l · Shift+←/→ 10 cols · Enter/Esc done";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,8 +109,9 @@ fn visible_split(app: &App, tui: &Tui, area: Rect) -> Option<SidebarLayout> {
 }
 
 pub(super) fn split_layout(app: &App, tui: &Tui, area: Rect) -> Option<SidebarLayout> {
+    let area = app.workspace_chat_area(area);
     let content = app.sidebar()?.visible_content()?;
-    if area.width < 100
+    if area.width < MIN_SPLIT_WIDTH
         || app.conversation_frame.has_caller_inset()
         || !app.side_retention_enabled(tui)
     {
@@ -250,6 +252,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return true;
         }
+        let screen = self.workspace_chat_area(screen);
         let current = screen.right() - divider.right();
         let step = match (key.code, key.modifiers) {
             (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => 1,
@@ -301,6 +304,7 @@ impl App {
             100 - focused_percent
         };
         // The sidebar gets the spare column when an equal split is odd.
+        let screen = self.workspace_chat_area(screen);
         let available = u32::from(screen.width - GAP);
         let preferred = (available * u32::from(side_percent)).div_ceil(100);
         let width = sidebar_width(preferred as i32, screen.width);
@@ -335,7 +339,7 @@ impl App {
                 visible_split(self, tui, screen).and_then(|layout| layout.divider_area())
             {
                 let current = screen.right() - divider.right();
-                let total = screen.width;
+                let total = self.workspace_chat_area(screen).width;
                 let step = (i32::from(total) * percent.abs() + 50) / 100;
                 let next = sidebar_width(i32::from(current) + step * percent.signum(), total);
                 if next != current {
@@ -402,6 +406,7 @@ impl App {
                 let Some(target) = self.sidebar_resize_target() else {
                     return Ok(false);
                 };
+                let screen = self.workspace_chat_area(screen);
                 let width = screen.right() - divider.right();
                 self.divider_drag = Some(DividerDrag {
                     target,
@@ -420,10 +425,13 @@ impl App {
                     return Ok(false);
                 };
                 let screen = tui.terminal.last_known_screen_size.into();
-                if drag.matches(screen, self) && visible_split(self, tui, screen).is_some() {
+                if drag.matches(self.workspace_chat_area(screen), self)
+                    && visible_split(self, tui, screen).is_some()
+                {
                     let width = i32::from(drag.initial_width) + i32::from(drag.press)
                         - i32::from(mouse.column);
-                    let width = sidebar_width(width, screen.width);
+                    let total = drag.screen.width;
+                    let width = sidebar_width(width, total);
                     let changed = drag.width != width;
                     drag.width = width;
                     if mouse.kind == Drag(Left) {
@@ -434,7 +442,7 @@ impl App {
                     } else if let Some(percent) = drag.percent()
                         && self.save_sidebar_width(percent).await
                     {
-                        self.exact_sidebar_width = Some((screen.width, width));
+                        self.exact_sidebar_width = Some((total, width));
                     }
                 }
             }

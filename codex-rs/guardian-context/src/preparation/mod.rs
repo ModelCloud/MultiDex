@@ -24,6 +24,7 @@ use crate::composition::FixedImageBudget;
 use crate::retained_instructions::RetainedInstructionKind;
 use crate::retained_instructions::USER_OMISSION;
 use codex_history::ResponseItemEnvelope;
+use codex_history::RetainedContext;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
@@ -44,6 +45,17 @@ pub enum ContextBudgeting {
     Fixed,
     /// Defer transcript selection and entry caps to configured allocation.
     Elastic,
+}
+
+impl ContextBudgeting {
+    /// Use the retained message window for this reviewer.
+    pub fn retained_message_view(self, context: &RetainedContext) -> Cow<'_, RetainedContext> {
+        if self == Self::Fixed {
+            context.fixed_message_view()
+        } else {
+            Cow::Borrowed(context)
+        }
+    }
 }
 
 #[cfg(test)]

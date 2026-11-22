@@ -45,18 +45,19 @@
 use crate::line_truncation::span_width;
 use crate::markdown_text_merge::DecodedTextMerge;
 use crate::render::highlight::current_syntax_theme;
+use crate::render::highlight::foreground_color_for_scopes;
 use crate::render::highlight::foreground_style_for_scopes;
-use crate::render::highlight::foreground_style_for_scopes_with_theme;
 use crate::render::highlight::highlight_code_to_lines;
+use crate::render::highlight::with_syntax_theme;
 use crate::render::line_utils::line_to_static;
 use crate::style::accent_color;
 use crate::style::table_separator_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::TerminalHyperlink;
+use crate::terminal_hyperlinks::markdown_destination;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::source_span_width;
 use crate::terminal_hyperlinks::visible_lines;
-use crate::terminal_hyperlinks::web_destination;
 use crate::width::display_width;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_line;
@@ -158,19 +159,17 @@ struct MarkdownStyles {
 
 impl Default for MarkdownStyles {
     fn default() -> Self {
-        Self::for_theme(&crate::render::highlight::current_syntax_theme())
+        with_syntax_theme(Self::for_theme)
     }
 }
 
 impl MarkdownStyles {
     fn for_theme(theme: &syntect::highlighting::Theme) -> Self {
-        let foreground = |scopes: &[&str]| {
-            let mut style =
-                foreground_style_for_scopes_with_theme(theme, scopes).unwrap_or_default();
-            style.fg = style.fg.map(|foreground| {
-                crate::style::readable_color_on(foreground, /*background*/ None)
-            });
-            style
+        let highlighter = syntect::highlighting::Highlighter::new(theme);
+        let color = |scopes: &[&str]| foreground_color_for_scopes(&highlighter, scopes);
+        let foreground = |scopes: &[&str]| Style {
+            fg: color(scopes).map(|c| crate::style::readable_color_on(c, /*background*/ None)),
+            ..Style::default()
         };
         Self {
             h1: foreground(&["markup.heading.1.markdown", "markup.heading.markdown"])
@@ -183,14 +182,11 @@ impl MarkdownStyles {
             h4: foreground(&["markup.heading.4.markdown", "markup.heading.markdown"]).italic(),
             h5: foreground(&["markup.heading.5.markdown", "markup.heading.markdown"]).italic(),
             h6: foreground(&["markup.heading.6.markdown", "markup.heading.markdown"]).italic(),
-            code: foreground_style_for_scopes_with_theme(
-                theme,
-                &[
-                    "markup.inline.raw.string.markdown",
-                    "markup.raw.inline.markdown",
-                ],
-            )
-            .unwrap_or_else(|| Style::new().fg(accent_color())),
+            code: Style::new().fg(color(&[
+                "markup.inline.raw.string.markdown",
+                "markup.raw.inline.markdown",
+            ])
+            .unwrap_or_else(accent_color)),
             emphasis: foreground(&["markup.italic.markdown"]).italic(),
             strong: foreground(&["markup.bold.markdown"]).bold(),
             strikethrough: Style::new().crossed_out(),
@@ -539,6 +535,7 @@ struct Writer<'a, 'policy> {
     styles: MarkdownStyles,
     inline_styles: Vec<Style>,
     copy_inline: Vec<crate::markdown_copy::Inline>,
+    blocks: crate::markdown_copy::block::Stack,
     copy_line: crate::markdown_copy::CopyLine,
     quote_sources: Vec<std::sync::Arc<str>>,
     code_sources: Vec<crate::markdown_copy::SourceBlock>,
@@ -555,6 +552,7 @@ struct Writer<'a, 'policy> {
     last_task_marker_end: usize,
     in_paragraph: bool,
     in_code_block: bool,
+    fence_start: Option<usize>,
     code_block_lang: Option<String>,
     code_block_buffer: String,
     code_block_content: Range<usize>,
@@ -586,6 +584,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             styles: MarkdownStyles::default(),
             inline_styles: Vec::new(),
             copy_inline: Vec::new(),
+            blocks: Default::default(),
             copy_line: Default::default(),
             quote_sources: Vec::new(),
             code_sources: Vec::new(),
@@ -602,6 +601,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             last_task_marker_end: 0,
             in_paragraph: false,
             in_code_block: false,
+            fence_start: None,
             code_block_lang: None,
             code_block_buffer: String::new(),
             code_block_content: 0..0,
@@ -662,10 +662,25 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 )
         );
         match event {
-            Event::Start(tag) => self.start_tag(tag, range, iter),
-            Event::End(tag) => self.end_tag(tag, range),
+            Event::Start(tag) => {
+                if let Some(kind) = crate::markdown_copy::block::Stack::kind(&tag) {
+                    let prefix = self.copy_prefix(/*pending_marker_line*/ false).len();
+                    self.blocks.push(kind, prefix);
+                }
+                self.start_tag(tag, range, iter);
+            }
+            Event::End(tag) => {
+                self.end_tag(tag, range);
+                self.blocks.end(tag);
+            }
             Event::Text(text) => {
                 if self.in_code_block {
+                    // A bare table preserved as code has no language and its text starts
+                    // at the block boundary. A real fence without a language starts its
+                    // text after the opener.
+                    if self.fence_start == Some(range.start) && self.code_block_lang.is_none() {
+                        self.fence_start = None;
+                    }
                     self.code_block_content.start = self.code_block_content.start.min(range.start);
                     self.code_block_content.end = range.end;
                 }
@@ -743,7 +758,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     CodeBlockKind::Fenced(lang) => Some(lang.to_string()),
                     CodeBlockKind::Indented => None,
                 };
-                self.start_codeblock(lang, indent)
+                let fence_start = lang.as_ref().map(|_| range.start);
+                self.start_codeblock(lang, indent);
+                self.fence_start = fence_start;
             }
             Tag::List(start) => {
                 if self.pending_marker_line
@@ -1244,6 +1261,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 } else {
                     None
                 };
+                let code_language: Option<std::sync::Arc<str>> = diagram
+                    .is_none()
+                    .then(|| lang.split('`').next().unwrap_or_default().into());
                 let highlighted = match diagram {
                     Some(diagram) => diagram,
                     None => highlight_code_to_lines(&code, &lang),
@@ -1261,6 +1281,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 for hl_line in highlighted {
                     self.push_line(Line::default());
                     self.copy_line.code_source = Some(std::sync::Arc::clone(&source));
+                    self.copy_line.code_language = code_language.clone();
                     for span in hl_line.spans {
                         self.push_span(span);
                     }
@@ -1270,6 +1291,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
 
         self.needs_newline = true;
         self.in_code_block = false;
+        self.fence_start = None;
         self.indent_stack.pop();
     }
 
@@ -2310,7 +2332,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
 
     fn style_link_label(&mut self, mut span: Span<'static>) -> Span<'static> {
         if let Some(link) = self.link.as_mut()
-            && (link.style_label || web_destination(&link.destination).is_some())
+            && (link.style_label || markdown_destination(&link.destination).is_some())
         {
             link.has_visible_label |=
                 !span.content.trim().is_empty() && display_width(&span.content) > 0;
@@ -2359,7 +2381,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 self.pop_inline_style();
             }
             if link.show_destination
-                || (!link.has_visible_label && web_destination(&link.destination).is_some())
+                || (!link.has_visible_label && markdown_destination(&link.destination).is_some())
             {
                 // Link destinations are rendered as " (url)" suffixes. When parsing table cells,
                 // append the suffix into the active cell buffer rather than the outer paragraph
@@ -2579,6 +2601,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             .and_then(|source| source.copy.as_deref())
             .cloned()
             .unwrap_or_default();
+        copy.block = self.blocks.current();
         copy.code_source = self.transformed_code_source.clone();
         copy.quote_source = self.quote_sources.first().cloned();
         copy.prefix = self.copy_prefix(pending_marker_line);
@@ -2611,10 +2634,12 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         self.current_subsequent_indent = self.prefix_spans(/*pending_marker_line*/ false);
         self.current_line_style = style;
         self.copy_line = crate::markdown_copy::CopyLine::default();
+        self.copy_line.block = self.blocks.current();
         self.copy_line.prefix = self.copy_prefix(was_pending);
         self.copy_line.continuation = self.copy_prefix(/*pending_marker_line*/ false);
         self.copy_line.item_prefix = self.copy_prefix(/*pending_marker_line*/ true);
         self.copy_line.code = self.in_code_block;
+        self.copy_line.fenced_code = self.fence_start.is_some();
         self.copy_line.code_source = self.transformed_code_source.clone();
         self.copy_line.quote_source = self.quote_sources.first().cloned();
         // Heading markers are already visible; retain them as Markdown syntax.
@@ -2651,7 +2676,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             if let Some(destination) = self
                 .link
                 .as_ref()
-                .and_then(|link| web_destination(&link.destination))
+                .and_then(|link| markdown_destination(&link.destination))
             {
                 // Inline code and HTML retain source columns until the transcript expands tabs.
                 let start = self.source_columns.measure(line, source_span_width);
@@ -2694,7 +2719,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         let destination = self
             .link
             .as_ref()
-            .and_then(|link| web_destination(&link.destination));
+            .and_then(|link| markdown_destination(&link.destination));
         if let Some(path) = self.label_document_path() {
             self.document_label_span(span, path)
         } else if let Some(destination) = destination {

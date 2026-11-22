@@ -46,7 +46,9 @@ use crate::responses_retry::handle_response_stream_error;
 use crate::responses_retry::is_terminal_sampling_outcome;
 use crate::rollout_budget::ResponseWork;
 use crate::rollout_budget::TurnWork;
+use crate::session::InputQueueEntry;
 use crate::session::PreviousTurnSettings;
+use crate::session::SubmittedAdditionalContext;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
 use crate::session::sampling_interrupt::SamplingInterrupt;
@@ -174,7 +176,14 @@ async fn preserve_initial_input_during<T>(
     input: &mut Vec<TurnInput>,
     prepare: impl Future<Output = T>,
 ) -> CodexResult<T> {
-    if input.is_empty() || sess.host_roster_reader(turn_context).is_none() {
+    // A context-only submission still needs Some([]) so suspension records its context.
+    if sess.host_roster_reader(turn_context).is_none()
+        || (input.is_empty()
+            && turn_context
+                .extension_data
+                .get::<SubmittedAdditionalContext>()
+                .is_none())
+    {
         return Ok(prepare.await);
     }
 
@@ -227,11 +236,12 @@ pub(crate) async fn run_turn(
     if !model_info.input_modalities.contains(&InputModality::Audio)
         && input.iter().any(turn_input_has_uploaded_audio_file)
     {
-        let result = run_hooks_and_record_inputs(
+        let result = run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &model_info,
-            &input,
+            Some(&input),
+            /*pending_input*/ &[],
             PersistContext::TurnStart,
         )
         .await;
@@ -293,11 +303,12 @@ pub(crate) async fn run_turn(
         .await?
     {
         // Compaction runs before the new input is recorded, so preserve it on every failure.
-        let _ = run_hooks_and_record_inputs(
+        let _ = run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &turn_context.capture_current_model_info(),
-            &input,
+            Some(&input),
+            /*pending_input*/ &[],
             PersistContext::Standard,
         )
         .await;
@@ -342,11 +353,12 @@ pub(crate) async fn run_turn(
         {
             Ok(requirements) => requirements,
             Err(err) => {
-                let _ = run_hooks_and_record_inputs(
+                let _ = run_hooks_and_record_input_entries(
                     &sess,
                     &turn_context,
                     &turn_context.capture_current_model_info(),
-                    &input,
+                    Some(&input),
+                    /*pending_input*/ &[],
                     PersistContext::Standard,
                 )
                 .await;
@@ -370,11 +382,12 @@ pub(crate) async fn run_turn(
     {
         Ok(step_context) => step_context,
         Err(err) if crate::tasks::ends_turn_as_interrupted(&err) => {
-            let _ = run_hooks_and_record_inputs(
+            let _ = run_hooks_and_record_input_entries(
                 &sess,
                 &turn_context,
                 &turn_context.capture_current_model_info(),
-                &input,
+                Some(&input),
+                /*pending_input*/ &[],
                 PersistContext::Standard,
             )
             .await;
@@ -429,6 +442,10 @@ pub(crate) async fn run_turn(
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
+        // A queued steer can reuse this turn context after the initial input is discarded.
+        turn_context
+            .extension_data
+            .remove::<SubmittedAdditionalContext>();
         return Ok(None);
     }
     if crate::guardian::is_basic_session_source(&turn_context.session_source)
@@ -474,11 +491,12 @@ pub(crate) async fn run_turn(
         .await?;
     }
     let mut can_drain_pending_input = input.is_empty();
-    if run_hooks_and_record_inputs(
+    if run_hooks_and_record_input_entries(
         &sess,
         &turn_context,
         &first_step_context.settings.model_info,
-        &input,
+        Some(&input),
+        /*pending_input*/ &[],
         PersistContext::TurnStart,
     )
     .await?
@@ -597,10 +615,11 @@ pub(crate) async fn run_turn(
             Vec::new()
         };
 
-        if run_hooks_and_record_inputs(
+        if run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &turn_context.capture_current_model_info(),
+            /*initial_input*/ None,
             &pending_input,
             PersistContext::SteeredUserInput,
         )
@@ -632,7 +651,8 @@ pub(crate) async fn run_turn(
                 .await?
             }
             Some(_) | None => {
-                let pending_user_input = input_for_extensions(&pending_input);
+                let pending_user_input =
+                    input_for_extensions(pending_input.iter().map(|entry| &entry.input));
                 if allow_plugin_mentions {
                     required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(
                         &pending_user_input,
@@ -913,10 +933,9 @@ pub(crate) async fn run_turn(
                         ));
                     }
                     if stop_outcome.should_block {
-                        if let Some(hook_prompt_message) = build_hook_prompt_message(
-                            &stop_outcome.continuation_fragments,
-                            &sess.item_id_generator,
-                        ) {
+                        if let Some(hook_prompt_message) =
+                            build_hook_prompt_message(&stop_outcome.continuation_fragments)
+                        {
                             sess.record_response_item_and_emit_turn_item(
                                 &turn_context,
                                 &step_context.settings.model_info,
@@ -986,7 +1005,7 @@ pub(crate) async fn run_turn(
                                 return Err(err);
                             }
                             let error = err.to_codex_protocol_error();
-                            if matches!(error, CodexErrorInfo::UsageLimitExceeded) {
+                            if error.is_usage_limit() {
                                 // Preserve the completed answer while stopping automatic work.
                                 sess.emit_turn_error_lifecycle(
                                     turn_context.as_ref(),
@@ -1211,26 +1230,53 @@ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, Pat
     display_roots
 }
 
-#[instrument(level = "trace", skip_all)]
-pub(crate) async fn run_hooks_and_record_inputs(
+#[instrument(name = "run_hooks_and_record_inputs", level = "trace", skip_all)]
+pub(crate) async fn run_hooks_and_record_input_entries(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     model_info: &ModelInfo,
-    input: &[TurnInput],
+    initial_input: Option<&[TurnInput]>,
+    pending_input: &[InputQueueEntry],
     persist_context: PersistContext,
 ) -> CodexResult<bool> {
+    // A started turn owns one initial submission; consume its context exactly once.
+    let initial_context = turn_context
+        .extension_data
+        .remove::<SubmittedAdditionalContext>();
+    // An empty original submission can deliver context by itself; missing input
+    // means its original submission is no longer available for delivery.
+    if matches!(initial_input, Some([]))
+        && let Some(context) = initial_context.as_deref()
+        && can_record_input(sess)
+    {
+        record_delivered_additional_context(sess, turn_context, model_info, context).await;
+    }
+    let initial_input = initial_input.unwrap_or_default();
     let mut blocked_input = false;
     let mut accepted_user_input = false;
-    for input_item in recordable_inputs(sess, model_info, input) {
-        let input_item = input_item?;
+    let mut input_error = None;
+    for input_item in recordable_inputs(
+        sess,
+        model_info,
+        initial_input,
+        pending_input,
+        initial_context.as_deref(),
+    ) {
+        let (input_item, additional_context) = input_item?;
         let hook_outcome = inspect_pending_input(sess, turn_context, &input_item).await;
+        let realtime_handoff_id = match input_item.as_ref() {
+            TurnInput::UserInput { metadata, .. } => metadata.realtime_handoff_id,
+            _ => None,
+        };
         if hook_outcome.should_stop {
+            if let Some(id) = realtime_handoff_id {
+                sess.reject_realtime_handoff(id).await;
+            }
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item.as_ref(), TurnInput::UserInput { content, .. } if !content.is_empty())
-            {
-                accepted_user_input = true;
+            if let Some(context) = additional_context {
+                record_delivered_additional_context(sess, turn_context, model_info, context).await;
             }
             // Tool outputs retain their durability barrier, including in mixed input batches.
             let input_persist_context = if persist_context == PersistContext::SteeredUserInput
@@ -1240,7 +1286,8 @@ pub(crate) async fn run_hooks_and_record_inputs(
             } else {
                 persist_context
             };
-            record_pending_input(
+            let is_user_input = matches!(input_item.as_ref(), TurnInput::UserInput { content, .. } if !content.is_empty());
+            if let Err(error) = record_pending_input(
                 sess,
                 turn_context,
                 model_info,
@@ -1248,39 +1295,81 @@ pub(crate) async fn run_hooks_and_record_inputs(
                 hook_outcome.additional_contexts,
                 input_persist_context,
             )
-            .await;
+            .await
+            {
+                // The batch has left the queue. Persist its unrelated siblings before failing.
+                input_error.get_or_insert(error);
+            } else if is_user_input {
+                accepted_user_input = true;
+            }
         }
     }
     // The batch has left the input queue. Persist every accepted item before the
     // optional lookup can suspend this task long enough for an interrupt to abort it.
-    if !input.is_empty() {
+    if !initial_input.is_empty() || !pending_input.is_empty() {
         super::file_audio::resolve_pending(sess).await;
+    }
+    if let Some(error) = input_error {
+        sess.conversation.stop_for_history_recovery().await;
+        return Err(CodexErr::Io(error));
     }
     Ok(blocked_input && !accepted_user_input)
 }
 
-/// Yields usable input in order, then reports unsupported audio after valid siblings can be recorded.
+pub(crate) async fn record_delivered_additional_context(
+    sess: &Session,
+    turn_context: &TurnContext,
+    model_info: &ModelInfo,
+    context: &SubmittedAdditionalContext,
+) {
+    let items = merge_submitted_context(sess, turn_context, context).await;
+    if !items.is_empty() {
+        sess.record_annotated_conversation_items(turn_context, model_info, items)
+            .await;
+    }
+}
+
+pub(crate) async fn merge_submitted_context(
+    sess: &Session,
+    turn_context: &TurnContext,
+    context: &SubmittedAdditionalContext,
+) -> Vec<ResponseItemEnvelope> {
+    let items = sess.state.lock().await.additional_context.merge(
+        context.0.clone(),
+        sess.additional_context_format(),
+        &turn_context.session_telemetry,
+        &sess.context_ids,
+    );
+    items
+        .into_iter()
+        .map(|item| sess.annotate_client_response_item(item))
+        .collect()
+}
+
+/// Yields usable input with its context in order, then reports unsupported audio after valid siblings can be recorded.
 pub(crate) fn recordable_inputs<'a>(
     sess: &Session,
     model_info: &ModelInfo,
-    input: &'a [TurnInput],
-) -> impl Iterator<Item = CodexResult<Cow<'a, TurnInput>>> {
-    let rejected_audio = !model_info.input_modalities.contains(&InputModality::Audio)
-        && input.iter().any(turn_input_has_uploaded_audio_file);
-    // Only finalized evidence may enter reusable Guardian history.
-    let items: &[TurnInput] = if sess
-        .services
-        .thread_extension_data
-        .get::<crate::guardian::PendingReviewContext>()
-        .is_some()
-    {
-        &[]
-    } else {
-        input
-    };
-    items
+    initial_input: &'a [TurnInput],
+    pending_input: &'a [InputQueueEntry],
+    initial_context: Option<&'a SubmittedAdditionalContext>,
+) -> impl Iterator<Item = CodexResult<(Cow<'a, TurnInput>, Option<&'a SubmittedAdditionalContext>)>>
+{
+    let input = initial_input
         .iter()
-        .filter_map(move |item| {
+        .enumerate()
+        .map(move |(index, item)| (item, initial_context.filter(|_| index == 0)))
+        .chain(pending_input.iter().map(InputQueueEntry::input_and_context));
+    let rejected_audio = !model_info.input_modalities.contains(&InputModality::Audio)
+        && input
+            .clone()
+            .any(|(item, _)| turn_input_has_uploaded_audio_file(item));
+    let can_record = can_record_input(sess);
+    input
+        .filter_map(move |(item, context)| {
+            if !can_record {
+                return None;
+            }
             let mut item = Cow::Borrowed(item);
             if rejected_audio
                 && turn_input_has_uploaded_audio_file(&item)
@@ -1291,9 +1380,17 @@ pub(crate) fn recordable_inputs<'a>(
                     return None;
                 }
             }
-            Some(Ok(item))
+            Some(Ok((item, context)))
         })
         .chain(rejected_audio.then(|| Err(unsupported_uploaded_audio_error())))
+}
+
+fn can_record_input(sess: &Session) -> bool {
+    // Only finalized evidence may enter reusable Guardian history.
+    sess.services
+        .thread_extension_data
+        .get::<crate::guardian::PendingReviewContext>()
+        .is_none()
 }
 
 fn turn_input_has_uploaded_audio_file(input: &TurnInput) -> bool {
@@ -1307,9 +1404,9 @@ fn unsupported_uploaded_audio_error() -> CodexErr {
 }
 
 /// Extensions and telemetry consume the protocol view, including the original mention and path labels.
-fn input_for_extensions(input: &[TurnInput]) -> Vec<UserInput> {
+fn input_for_extensions<'a>(input: impl IntoIterator<Item = &'a TurnInput>) -> Vec<UserInput> {
     input
-        .iter()
+        .into_iter()
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_)
@@ -1611,7 +1708,7 @@ async fn build_extension_turn_input_items(
     let input = TurnInputContext {
         step_store: &step_context.extension_data,
         turn_id: turn_context.sub_id.to_string(),
-        user_input: user_input.to_vec(),
+        user_input,
         environments,
     };
     let extension_metrics =
@@ -2390,11 +2487,6 @@ async fn run_sampling_request(
         if first_attempt && turn_context.config.notify.is_some() {
             notify_messages = legacy_notify_input_messages(&prompt.input);
         }
-        let _native_search = crate::model_search::SearchOwner::reserve_server_fallback(
-            &step_context.extension_data,
-            &sess.services.thread_extension_data,
-            &mut prompt.tools,
-        );
         let (submitted_audio, pending_audio) = {
             let model = &step_context.settings.model_info.slug;
             let provider = &turn_context.config.model_provider_id;
@@ -2517,7 +2609,7 @@ pub(super) enum PreparedToolRecommendations {
 }
 
 impl PreparedToolRecommendations {
-    #[instrument(level = "trace", skip_all)]
+    #[instrument(name = "plugins.recommendations.load", level = "info", skip_all)]
     pub(super) async fn load(sess: &Session, turn_context: &TurnContext) -> Self {
         let auth = sess.services.auth_manager.auth().await;
         let endpoint_candidates = sess
@@ -3413,25 +3505,15 @@ async fn try_run_sampling_request(
     let mut pending_assessment: Option<codex_api::GuardianAssessment> = None;
     let mut response_completed = false;
     let mut includes_reasoning = step_context.settings.model_info.use_responses_lite;
-    // Catalog policies can enable adaptive review independently of the legacy scorer flag.
-    // Capture evidence whenever Guardian is available; the reviewer resolves the policy.
-    let assessment_authorization = if turn_context
-        .config
-        .features
-        .enabled(Feature::GuardianApproval)
-    {
-        Some(crate::guardian::ScoreAuthorization::for_session(&sess, &Default::default()).await)
-    } else {
-        None
-    };
-    let mut resampling = crate::guardian::ResponseResampling::new(&sess);
+    let accept_actor_assessments = turn_context.config.guardian_model_provider.is_none();
     let prompt = Arc::new(prompt);
+    let mut resampling = crate::guardian::ResponseResampling::new(&sess, &prompt);
     let interrupt_at_boundary = SamplingInterrupt::enabled(&turn_context);
     let deepinfra_auto_priority = retry_state.use_deepinfra_priority();
-    let mut stream_request = async |prompt: &Arc<Prompt>| {
+    let mut stream_request = async |prompt: Arc<Prompt>| {
         let send = client_session
             .open_model_response(
-                prompt,
+                &prompt,
                 &step_context.settings.model_info,
                 &step_context.session_telemetry,
                 SamplingOptions {
@@ -3481,7 +3563,7 @@ async fn try_run_sampling_request(
                 last_agent_message: AssistantMessages::default(),
             });
         }
-        result = stream_request(&prompt) => result,
+        result = stream_request(prompt) => result,
     };
     let mut stream = match opened {
         Ok(stream) => stream,
@@ -3545,9 +3627,16 @@ async fn try_run_sampling_request(
             if resampling.update_usage_boundary {
                 sess.state.lock().await.history.reset_last_usage_boundary();
             }
+            // A completed final retained during the drain can defer queue-only mail.
+            // Recheck that boundary instead of reopening it solely because we interrupted.
+            let mailbox_preempted = *draining_for_mailbox
+                && sess
+                    .input_queue
+                    .should_preempt_sampling_for_mail(&sess.active_turn, &turn_context.sub_id)
+                    .await;
             break Ok(SamplingRequestResult {
-                needs_follow_up,
-                mailbox_preempted: *draining_for_mailbox,
+                needs_follow_up: needs_follow_up || mailbox_preempted,
+                mailbox_preempted,
                 multidex_preempted: false,
                 last_agent_message,
             });
@@ -3696,6 +3785,7 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created { response_id } => {
                 answer_moderation = None;
+                pending_assessment = None;
                 response_id_for_assessment.clone_from(&response_id);
                 if let Some(response_id) = response_id {
                     turn_context
@@ -3713,16 +3803,10 @@ async fn try_run_sampling_request(
                 between_items = true;
                 // Serving emits one final value immediately before this item's completion.
                 // After this handoff, the invocation/cell owns it independently of the stream.
-                let assessment = pending_assessment
+                let guardian_probe = pending_assessment
                     .take()
                     .filter(|value| item.id().is_some_and(|id| id.as_str() == value.item_id))
-                    .zip(assessment_authorization.as_ref())
-                    .map(|(value, authorization)| {
-                        Arc::new(crate::guardian::ServingAssessment {
-                            requires_review: value.requires_review,
-                            authorization: authorization.clone(),
-                        })
-                    });
+                    .map(|value| value.requires_review);
                 if item.id().is_none_or(|id| id.is_empty())
                     && let Some(active_item) = &active_item
                 {
@@ -3789,8 +3873,11 @@ async fn try_run_sampling_request(
                 }
 
                 let mut tool_runtime = tool_runtime.clone();
-                if assessment.is_some() {
-                    Arc::make_mut(&mut tool_runtime.step_context).serving_assessment = assessment;
+                if guardian_probe.is_some() {
+                    let tool_step = Arc::make_mut(&mut tool_runtime.step_context);
+                    // Probe results are observations; async Guardian remains authoritative.
+                    tool_step.serving_assessment = None;
+                    tool_step.guardian_probe = guardian_probe;
                 }
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
@@ -3889,7 +3976,6 @@ async fn try_run_sampling_request(
                     }
                     // Keep the response ID and terminal decision. Later tools receive a denial.
                     *draining_for_mailbox = true;
-                    needs_follow_up = true;
                     continue;
                 }
             }
@@ -4009,7 +4095,10 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::GuardianAssessment(assessment) => {
-                if response_id_for_assessment.as_deref() == Some(assessment.response_id.as_str()) {
+                if accept_actor_assessments
+                    && response_id_for_assessment.as_deref()
+                        == Some(assessment.response_id.as_str())
+                {
                     pending_assessment = Some(assessment);
                 }
             }
@@ -4046,9 +4135,10 @@ async fn try_run_sampling_request(
                 response_id,
                 token_usage,
                 usage_metadata,
-                reasoning_removals: _,
+                reasoning_removals,
                 end_turn,
             } => {
+                let retry_prompt = resampling.finish_response(end_turn, token_usage.is_some());
                 if let Some(accepted) = pending_audio.take() {
                     sess.record_retained_context(
                         codex_history::RetainedContextEvent::AcceptedFileAudio {
@@ -4057,6 +4147,8 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
+                sess.state.lock().await.last_sampling_cot_removed =
+                    reasoning_removals.as_ref().map(|counts| !counts.is_empty());
                 response_completed = true;
                 sess.services
                     .analytics_events_client
@@ -4092,7 +4184,7 @@ async fn try_run_sampling_request(
                             provider: token_usage,
                             charge: hook_output,
                         },
-                        if resampling.retry_pending {
+                        if retry_prompt.is_some() {
                             super::TokenUsageContext::SpendingOnly
                         } else {
                             super::TokenUsageContext::Sampling {
@@ -4114,17 +4206,15 @@ async fn try_run_sampling_request(
                         last_agent_message,
                     });
                 }
-                if resampling.retry_pending {
+                if let Some(prompt) = retry_prompt {
                     response_completed = false;
                     response_id_for_assessment = None;
                     pending_assessment = None;
                     includes_reasoning = step_context.settings.model_info.use_responses_lite;
-                    stream = match resampling
-                        .retry(stream_request(&prompt), &cancellation_token)
-                        .await
-                    {
-                        Ok(stream) => stream,
-                        Err(error) => break Err(error),
+                    stream = match stream_request(prompt).or_cancel(&cancellation_token).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => break Err(error),
+                        Err(error) => break Err(error.into()),
                     };
                     continue;
                 }

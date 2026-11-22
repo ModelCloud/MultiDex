@@ -193,6 +193,15 @@ the choice unset. Ephemeral threads cannot save it.
 Use `thread/metadata/update` for later changes. This preference does not select
 `turn/start.cyberAccessProgram` or grant access to an access program.
 
+With `experimentalApi`, a client preparing a thread for later use can pass
+`daybreakProgramPropagationEnrolled: false` to `thread/start` to opt that root
+out of Daybreak propagation. A managed requirement to enable propagation takes
+precedence. Omitted, null, or true uses the configured enrollment rule.
+`thread.daybreakProgramPropagationEnrolled` reports actual enrollment for the
+live thread, including in the start response and `thread/started` notification.
+Stored metadata alone yields null. Reusing the same live session preserves its
+enrollment. Starting a new session from storage yields false.
+
 # Application network policy
 
 App-server loads application network policy at startup and existing explicit
@@ -408,7 +417,16 @@ enabled = true
 
 Codex reads `[network_proxy]` and its alias `[experimental_network]` as
 `[permissions.network]` within each source before merging managed requirements.
-Across sources, use the same surface (legacy or nested). Use at most one top-level spelling per layer.
+Choose the merge operation with the domain syntax under either table name:
+`allowed_domains` and `denied_domains` each replace the previous list of that kind.
+A host in both surviving lists is denied, including when a keyed grant appears between the lists. Use `[permissions.network.domains]` (or
+the legacy table's `domains` map) for per-host updates. Source priority decides
+a shared selector; unrelated keyed rules survive a nonempty list replacement.
+A surviving `allowed_domains = []` clears lower managed grants. An empty domain
+map contributes no updates. Neither operation changes `managed_allowed_domains_only`.
+When layering mirrored declarations, use the same domain operation in both copies.
+Use the same network table spelling across sources when specifying Unix socket paths.
+Use at most one top-level spelling per layer.
 If a layer also sets `[permissions.network]`, both tables must describe the same policy.
 `configRequirements/read` returns the result in `requirements.network`.
 
@@ -430,9 +448,11 @@ version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
-If `model_providers.amazon-bedrock.aws.credential_export` is configured, Bedrock setup and
-Bedrock login return an error without changing configuration or saved credentials. Remove the
-exporter configuration before selecting another credential source. `aws.credential_export` and
+Bedrock setup and login accept an optional `providerId`: `amazon-bedrock` (Mantle) or
+`amazon-bedrock-runtime`. Omission or `null` selects Mantle for compatibility. If the selected
+provider has `aws.credential_export` configured, setup and login return an error without changing
+configuration or saved credentials. Remove the exporter configuration before selecting another
+credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
 Application network restrictions apply to each AWS credential and region HTTP request and to
@@ -778,6 +798,31 @@ HTTP, WebSocket, and code-mode gRPC requests use the shared destination checks.
 User-directed Git, SSH, shell, and other subprocess traffic retain their existing
 execution and sandbox policies.
 
+### Configuration server sign-in during startup
+
+`codex app-server --print-startup-config` reads requirements without starting
+the app server. If a required configuration server uses OAuth and needs a new
+grant, the command exits with an error whose `data` contains
+`"reason": "configServer"` and `"action": "configServerLogin"`.
+
+When the action is `configServerLogin`, start `codex app-server --startup-oauth`.
+This dedicated stdio connection accepts one JSON request per line without an
+initialize handshake. Each reply echoes the string or integer request ID.
+
+1. After the user chooses Sign in, send
+   `{"id":1,"method":"account/gatewayOAuth/login","params":{"target":{"kind":"configServer"}}}`.
+   The helper resolves the target from local managed requirements.
+2. On this pipe, `account/gatewayOAuth/changed` sends the browser handoff with
+   `{"target":{"kind":"configServer"},"status":"started","authUrl":"..."}`.
+   Open that URL on the user's desktop. Rust handles the callback, token exchange,
+   and credential storage.
+3. The original login request stays pending and returns `{"prompt":null}` on
+   success, or an error on failure. To cancel, send
+   `{"id":2,"method":"account/gatewayOAuth/cancel"}`. Closing stdin also ends the
+   pending attempt.
+4. On success, close the pipe and rerun `--print-startup-config`. Continue startup
+   only with the validated requirements.
+
 # Item history anchors
 
 Live notifications and turn history return the same `ThreadItem`. Each item has
@@ -874,8 +919,8 @@ writes still require validation. Lower-precedence definitions can be overridden;
 required definitions are read-only. Both capabilities are false when user
 configuration is ignored. The flag does not establish credential validity or
 whether a setup flow that also selects a default provider will succeed.
-`account/bedrock/setup` targets `amazon-bedrock`; edits to `amazon-bedrock-runtime`
-must use that provider's configuration paths instead.
+`account/bedrock/setup` selects Mantle by default; pass `providerId: "amazon-bedrock-runtime"`
+to select Runtime. Direct edits must use the selected provider's configuration paths.
 
 Use `modelProvider/config/write` with a tagged `settings` patch. To create a
 custom gateway, send `type: "customGateway"`, `name`, and `baseUrl`. Omit

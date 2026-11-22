@@ -17,6 +17,8 @@ anyhow = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-transport = { workspace = true }
 codex-build-info = { workspace = true }
+codex-config = { workspace = true }
+codex-exec-server = { workspace = true }
 codex-features = { workspace = true }
 codex-http-client = { workspace = true }
 codex-install-context = { workspace = true }
