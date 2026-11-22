@@ -1151,23 +1151,25 @@ impl ContextManager {
     fn items_since_last_usage(
         &self,
     ) -> impl Clone + ExactSizeIterator<Item = &ResponseItem> + DoubleEndedIterator {
-        self.items[self.last_server_reported_usage_item_count..]
+        // Restore aligns the boundary for a possible persisted count. Without that
+        // count, the entire restored window still needs a local estimate.
+        let covered_items = if self.token_info.is_some() {
+            self.last_server_reported_usage_item_count
+        } else {
+            0
+        };
+        self.items[covered_items..]
             .iter()
             .map(|envelope| &envelope.item)
     }
 
     pub(crate) fn get_total_token_usage(&self) -> i64 {
-        let last_tokens = self
-            .token_info
-            .as_ref()
-            .map(|info| info.last_token_usage.total_tokens)
-            .unwrap_or(0);
         let unreported_tokens = self.estimated_tokens_since_last_usage();
-        if self
-            .token_info
-            .as_ref()
-            .is_some_and(|info| info.last_usage_includes_reasoning == Some(true))
-        {
+        let Some(info) = &self.token_info else {
+            return unreported_tokens;
+        };
+        let last_tokens = info.last_token_usage.total_tokens;
+        if info.last_usage_includes_reasoning == Some(true) {
             last_tokens.saturating_add(unreported_tokens)
         } else {
             last_tokens
