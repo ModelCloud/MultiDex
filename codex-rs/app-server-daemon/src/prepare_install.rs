@@ -297,8 +297,13 @@ async fn prepare_from_package(
     validate_package(stage.path(), entrypoint)?;
     let binary_version =
         managed_install::managed_codex_version(&stage.path().join(entrypoint)).await?;
+    // The CLI appends its Git commit as SemVer build metadata.
     anyhow::ensure!(
-        !stable || version == binary_version,
+        !stable
+            || semver::Version::parse(&binary_version).is_ok_and(|binary_version| manifest
+                .version
+                .cmp_precedence(&binary_version)
+                .is_eq()),
         "the CLI package version does not match its executable"
     );
     let name = if stable && mode == InstallMode::Missing {
