@@ -311,6 +311,59 @@ fn sanitize_portable_responses_items(input: &mut Vec<ResponseItem>) {
 /// readable history from other providers without changing the saved transcript.
 fn sanitize_deepinfra_input(input: &mut Vec<ResponseItem>) {
     input.retain_mut(|item| match item {
+        // Codex records named external tool results without a corresponding
+        // model call. DeepInfra requires call_id on every function_call_output.
+        ResponseItem::FunctionCallOutput {
+            call_id: None,
+            name,
+            namespace,
+            output,
+            ..
+        } => {
+            use codex_protocol::models::FunctionCallOutputContentItem;
+
+            let tool = match (namespace.as_deref(), name.as_deref()) {
+                (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+                (_, Some(name)) => name.to_string(),
+                _ => "external tool".to_string(),
+            };
+            let mut content = vec![ContentItem::InputText {
+                text: format!("Tool result from {tool}:"),
+            }];
+            if let Some(text) = output.text_content() {
+                content.push(ContentItem::InputText {
+                    text: text.to_string(),
+                });
+            } else if let Some(parts) = output.content_items() {
+                content.extend(parts.iter().filter_map(|part| match part {
+                    FunctionCallOutputContentItem::InputText { text } => {
+                        Some(ContentItem::InputText { text: text.clone() })
+                    }
+                    FunctionCallOutputContentItem::InputImage { image, detail } => {
+                        Some(ContentItem::InputImage {
+                            image: image.clone(),
+                            detail: *detail,
+                        })
+                    }
+                    FunctionCallOutputContentItem::InputAudio { audio } => {
+                        Some(ContentItem::InputAudio {
+                            audio: audio.clone(),
+                        })
+                    }
+                    FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+                }));
+            }
+            *item = ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
+                id: None,
+                role: "user".to_string(),
+                content,
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            true
+        }
         ResponseItem::Message { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::FunctionCallOutput { .. } => true,
@@ -448,13 +501,14 @@ mod portable_responses_input_tests {
             serde_json::json!({"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"think"}],"encrypted_content":null}),
             serde_json::json!({"type":"custom_tool_call","call_id":"call-1","name":"apply_patch","input":"patch"}),
             serde_json::json!({"type":"custom_tool_call_output","call_id":"call-1","output":"done"}),
+            serde_json::json!({"type":"function_call_output","name":"exec","output":"external result"}),
         ]
         .into_iter()
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
         sanitize_deepinfra_input(&mut input);
         let wire = serde_json::to_value(&input).unwrap();
-        assert_eq!(input.len(), 4);
+        assert_eq!(input.len(), 5);
         assert_eq!(wire[0]["type"], "message");
         assert_eq!(wire[1]["type"], "reasoning");
         assert_eq!(wire[1]["content"][0]["text"], "think");
@@ -462,6 +516,11 @@ mod portable_responses_input_tests {
         assert_eq!(wire[2]["type"], "function_call");
         assert_eq!(wire[2]["arguments"], "{\"input\":\"patch\"}");
         assert_eq!(wire[3]["type"], "function_call_output");
+        assert_eq!(wire[3]["call_id"], "call-1");
+        assert_eq!(wire[4]["type"], "message");
+        assert_eq!(wire[4]["role"], "user");
+        assert_eq!(wire[4]["content"][0]["text"], "Tool result from exec:");
+        assert_eq!(wire[4]["content"][1]["text"], "external result");
     }
 }
 
