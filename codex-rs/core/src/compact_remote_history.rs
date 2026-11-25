@@ -14,7 +14,9 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::truncate_text;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
@@ -165,21 +167,58 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     (rewritten_outputs, estimated_deleted_tokens)
 }
 
-/// Shrink large tool results across the request after the provider rejects its
-/// context size. Preserve calls, recent messages, and explicitly retained items.
-pub(crate) fn shrink_compaction_tool_output(
+/// Shrink large tool arguments and results in the request snapshot after overflow.
+/// Keep tool identities and pairing intact, and honor explicit retention.
+pub(crate) fn shrink_compaction_tool_item(
     envelope: &ResponseItemEnvelope,
     turn_context: &TurnContext,
 ) -> Option<ResponseItemEnvelope> {
     if should_retain_client_item(envelope, &turn_context.config.features) {
         return None;
     }
-    let replacement = rewritten_output_for_context_window(envelope)?;
-    // Leave short results intact and make the rewrite idempotent.
+    let replacement = rewritten_call_for_compaction(envelope)
+        .or_else(|| rewritten_output_for_context_window(envelope))?;
+    // Leave small items intact and make the rewrite idempotent.
     let audio_durations = FileAudioDurations::default();
     let before = estimate_item_token_count_with_audio(&envelope.item, &audio_durations);
     let after = estimate_item_token_count_with_audio(&replacement.item, &audio_durations);
     (before.saturating_sub(after) >= 128).then_some(replacement)
+}
+
+fn rewritten_call_for_compaction(envelope: &ResponseItemEnvelope) -> Option<ResponseItemEnvelope> {
+    const PREVIEW_BYTES: usize = 2 * 1024;
+
+    let input = match &envelope.item {
+        ResponseItem::FunctionCall {
+            arguments,
+            encrypted_content: None,
+            encrypted_function_args: None,
+            ..
+        } => arguments,
+        ResponseItem::CustomToolCall {
+            input,
+            encrypted_content: None,
+            ..
+        } => input,
+        _ => return None,
+    };
+    if input.len() <= PREVIEW_BYTES {
+        return None;
+    }
+    let preview = truncate_text(input, TruncationPolicy::Bytes(PREVIEW_BYTES));
+    let mut item = envelope.item.clone();
+    match &mut item {
+        ResponseItem::FunctionCall { arguments, .. } => {
+            // A Responses function call still needs a valid JSON argument string.
+            *arguments = serde_json::json!({"truncated_arguments_preview": preview}).to_string();
+        }
+        ResponseItem::CustomToolCall { input, .. } => *input = preview,
+        _ => unreachable!("only function and custom tool calls are rewritten"),
+    }
+    Some(ResponseItemEnvelope {
+        item,
+        metadata: envelope.metadata.clone(),
+    })
 }
 
 fn rewritten_output_for_context_window(

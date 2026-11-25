@@ -9,7 +9,7 @@ use crate::client::SamplingOptions;
 use crate::client_common::ResponseEvent;
 use crate::client_common::SamplingEvent;
 use crate::compact_pending_input::is_retained_pending_mail;
-use crate::compact_remote_history::shrink_compaction_tool_output;
+use crate::compact_remote_history::shrink_compaction_tool_item;
 use crate::compact_remote_v2::retained_client_items;
 use crate::context::BaseInstructionsFragment;
 use crate::context::CompactionSummary;
@@ -375,7 +375,7 @@ async fn run_compact_task_inner_impl(
                         .iter()
                         .map(|item| {
                             if let Some(replacement) =
-                                shrink_compaction_tool_output(item, &turn_context)
+                                shrink_compaction_tool_item(item, &turn_context)
                             {
                                 rewritten += 1;
                                 replacement
@@ -386,7 +386,7 @@ async fn run_compact_task_inner_impl(
                         .collect();
                     if rewritten > 0 {
                         history.replace_annotated(items);
-                        tracing::info!(rewritten, "Retrying compaction with smaller tool results");
+                        tracing::info!(rewritten, "Retrying compaction with smaller tool history");
                         overflow_retries += 1;
                         retries = 0;
                         continue;
