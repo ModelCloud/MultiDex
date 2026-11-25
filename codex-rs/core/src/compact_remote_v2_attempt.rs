@@ -14,7 +14,7 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact_remote_history::shrink_compaction_tool_output;
+use crate::compact_remote_history::shrink_compaction_tool_item;
 use crate::compact_remote_history::trim_function_call_history_to_fit_context_window;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
@@ -282,7 +282,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
                         item: std::mem::replace(item, ResponseItem::CompactionTrigger {}),
                         metadata: metadata.clone(),
                     };
-                    *item = match shrink_compaction_tool_output(&envelope, turn_context) {
+                    *item = match shrink_compaction_tool_item(&envelope, turn_context) {
                         Some(replacement) => {
                             rewritten += 1;
                             replacement.item
@@ -295,7 +295,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 }
                 info!(
                     rewritten,
-                    "Retrying foreground compaction with smaller tool results"
+                    "Retrying foreground compaction with smaller tool history"
                 );
                 submitted_audio = rejected_audio::SubmittedFileAudio::from_request(
                     input,
