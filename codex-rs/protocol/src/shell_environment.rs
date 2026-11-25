@@ -1,6 +1,7 @@
 use crate::config_types::EnvironmentVariablePattern;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::config_types::ShellEnvironmentPolicyInherit;
+use crate::privacy_env::insert_privacy_env;
 use std::collections::HashMap;
 
 pub const CODEX_SESSION_ID_ENV_VAR: &str = "CODEX_SESSION_ID";
@@ -89,6 +90,9 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut env_map = populate_env(vars, policy, thread_id);
+    // Model-reachable children run agent CLIs and their integrations, so the
+    // telemetry opt-outs are forced on top of whatever the policy produced.
+    insert_privacy_env(&mut env_map);
 
     if cfg!(target_os = "windows") {
         // This is a workaround to address the failures we are seeing in the

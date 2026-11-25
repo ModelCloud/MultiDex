@@ -2,6 +2,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_config::types::McpServerEnvVar;
 use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
+use codex_protocol::privacy_env::insert_privacy_env_os;
 use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use http::HeaderMap;
 use http::HeaderName;
@@ -55,6 +56,9 @@ pub(crate) fn create_env_for_mcp_server(
         name.to_str()
             .is_none_or(|name| !is_non_inheritable_env_var(name))
     });
+    // MCP servers are integrations too: force the telemetry opt-outs even when
+    // the server config or the inherited environment says otherwise.
+    insert_privacy_env_os(&mut env);
     Ok(env)
 }
 
@@ -75,6 +79,9 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
         name.to_str()
             .is_none_or(|name| !is_non_inheritable_env_var(name))
     });
+    // Remote MCP servers run on another host but are still integrations: force
+    // the telemetry opt-outs into the environment they receive.
+    insert_privacy_env_os(&mut env);
     env
 }
 
@@ -266,9 +273,16 @@ mod tests {
             &[custom_var.into()],
         );
 
+        assert_eq!(env.get(OsStr::new(custom_var)), Some(&custom_value));
+        assert!(!env.contains_key(OsStr::new(default_var)));
+        assert!(!env.contains_key(OsStr::new("OpenAI_Federation_Rule_Id")));
         assert_eq!(
-            env,
-            HashMap::from([(OsString::from(custom_var), custom_value)])
+            env.get(OsStr::new("DO_NOT_TRACK")),
+            Some(&OsString::from("1"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")),
+            Some(&OsString::from("1"))
         );
     }
 
@@ -295,9 +309,15 @@ mod tests {
             ],
         );
 
+        assert_eq!(env.get(OsStr::new(local_var)), Some(&local_value));
+        assert!(!env.contains_key(OsStr::new(remote_var)));
         assert_eq!(
-            env,
-            HashMap::from([(OsString::from(local_var), local_value)])
+            env.get(OsStr::new("DO_NOT_TRACK")),
+            Some(&OsString::from("1"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("DISABLE_TELEMETRY")),
+            Some(&OsString::from("1"))
         );
     }
 

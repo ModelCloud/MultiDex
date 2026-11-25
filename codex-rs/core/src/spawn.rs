@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tracing::trace;
 
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::privacy_env::insert_privacy_env;
 use codex_protocol::shell_environment::is_non_inheritable_env_var;
 
 /// Experimental environment variable that will be set to some non-empty value
@@ -62,6 +63,9 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     } = request;
 
     env.retain(|name, _| !is_non_inheritable_env_var(name));
+    // Forced here as well as in the shell-environment policy so a caller that
+    // assembles its own map still launches a private child.
+    insert_privacy_env(&mut env);
 
     // Both command arguments and environment variables can contain credentials.
     trace!(

@@ -59,6 +59,7 @@ mod permission_profile_intersection;
 mod permission_profile_snapshot;
 pub mod permissions;
 pub mod plan_tool;
+pub mod privacy_env;
 pub mod protocol;
 pub mod realtime;
 pub mod request_permissions;
