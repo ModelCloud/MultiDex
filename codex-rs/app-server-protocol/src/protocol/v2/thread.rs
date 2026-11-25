@@ -37,7 +37,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
 use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
@@ -85,7 +84,9 @@ pub struct ThreadStartParams {
     /// Replace the thread's runtime workspace roots. Paths must be absolute.
     #[experimental("thread/start.runtimeWorkspaceRoots")]
     #[ts(optional = nullable)]
-    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    #[schemars(with = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    #[ts(as = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    pub runtime_workspace_roots: Option<Vec<LegacyAppPathString>>,
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
@@ -136,6 +137,11 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.daybreakEnabled")]
     #[ts(optional = nullable)]
     pub daybreak_enabled: Option<bool>,
+    /// False opts this new root out of Daybreak propagation unless managed policy
+    /// requires it. Omitted, null, or true uses the configured enrollment rule.
+    #[experimental("thread/start.daybreakProgramPropagationEnrolled")]
+    #[ts(optional = nullable)]
+    pub daybreak_program_propagation_enrolled: Option<bool>,
     /// Optional sticky environments for this thread.
     ///
     /// Omitted selects the default environment when environment access is
@@ -196,12 +202,16 @@ pub struct ThreadStartResponse {
     /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
-    pub cwd: AbsolutePathBuf,
+    #[schemars(with = "codex_utils_absolute_path::AbsolutePathBuf")]
+    #[ts(as = "codex_utils_absolute_path::AbsolutePathBuf")]
+    pub cwd: LegacyAppPathString,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/start.runtimeWorkspaceRoots")]
     #[serde(default)]
-    pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
+    #[schemars(with = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    #[ts(as = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    pub runtime_workspace_roots: Vec<LegacyAppPathString>,
     /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
     pub instruction_sources: Vec<LegacyAppPathString>,
@@ -319,7 +329,9 @@ pub struct ThreadSettings {
     /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
-    pub cwd: AbsolutePathBuf,
+    #[schemars(with = "codex_utils_absolute_path::AbsolutePathBuf")]
+    #[ts(as = "codex_utils_absolute_path::AbsolutePathBuf")]
+    pub cwd: LegacyAppPathString,
     /// Environments configured for future turns, in priority order, primary first.
     /// `null` means the server does not expose the selection; [] means none are selected.
     #[experimental("thread/settings.environments")]
@@ -410,7 +422,9 @@ pub struct ThreadResumeParams {
     /// Replace the thread's runtime workspace roots. Paths must be absolute.
     #[experimental("thread/resume.runtimeWorkspaceRoots")]
     #[ts(optional = nullable)]
-    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    #[schemars(with = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    #[ts(as = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    pub runtime_workspace_roots: Option<Vec<LegacyAppPathString>>,
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
@@ -460,12 +474,16 @@ pub struct ThreadResumeResponse {
     /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
-    pub cwd: AbsolutePathBuf,
+    #[schemars(with = "codex_utils_absolute_path::AbsolutePathBuf")]
+    #[ts(as = "codex_utils_absolute_path::AbsolutePathBuf")]
+    pub cwd: LegacyAppPathString,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/resume.runtimeWorkspaceRoots")]
     #[serde(default)]
-    pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
+    #[schemars(with = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    #[ts(as = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    pub runtime_workspace_roots: Vec<LegacyAppPathString>,
     /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
     pub instruction_sources: Vec<LegacyAppPathString>,
@@ -619,7 +637,9 @@ pub struct ThreadForkParams {
     /// Replace the thread's runtime workspace roots. Paths must be absolute.
     #[experimental("thread/fork.runtimeWorkspaceRoots")]
     #[ts(optional = nullable)]
-    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    #[schemars(with = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    #[ts(as = "Option<Vec<codex_utils_absolute_path::AbsolutePathBuf>>")]
+    pub runtime_workspace_roots: Option<Vec<LegacyAppPathString>>,
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
@@ -677,12 +697,16 @@ pub struct ThreadForkResponse {
     /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
-    pub cwd: AbsolutePathBuf,
+    #[schemars(with = "codex_utils_absolute_path::AbsolutePathBuf")]
+    #[ts(as = "codex_utils_absolute_path::AbsolutePathBuf")]
+    pub cwd: LegacyAppPathString,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/fork.runtimeWorkspaceRoots")]
     #[serde(default)]
-    pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
+    #[schemars(with = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    #[ts(as = "Vec<codex_utils_absolute_path::AbsolutePathBuf>")]
+    pub runtime_workspace_roots: Vec<LegacyAppPathString>,
     /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
     pub instruction_sources: Vec<LegacyAppPathString>,
@@ -1849,8 +1873,7 @@ pub struct ThreadGuardianReviewParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadGuardianReviewResponse {
     pub call_id: String,
-    /// Null when current policy or a remembered approval skips review.
-    pub assessment: Option<ThreadGuardianAssessment>,
+    pub assessment: ThreadGuardianAssessment,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

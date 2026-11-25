@@ -41,6 +41,7 @@ fn identical_text_from_a_discarded_attempt_does_not_gain_acceptance() -> anyhow:
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::HistoryItemAccepted {
+            source_tool_call_id: None,
             item_id: "accepted".into(),
             agent_message_payload: None,
             tool_output_payload: None,
@@ -225,6 +226,7 @@ fn inherited_output_is_child_prefill_without_copying_parent_sampling_provenance(
         parent.request_item_ids
     );
     let accepted = RawTraceEventPayload::HistoryItemAccepted {
+        source_tool_call_id: None,
         item_id: "msg-parent".into(),
         agent_message_payload: None,
         tool_output_payload: None,
@@ -280,6 +282,7 @@ fn accept_output(writer: &crate::TraceWriter, item: &serde_json::Value) -> anyho
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::HistoryItemAccepted {
+            source_tool_call_id: None,
             item_id: item["id"].as_str().unwrap().into(),
             agent_message_payload: None,
             tool_output_payload: Some(payload),
@@ -324,6 +327,40 @@ fn accepted_tool_results_survive_without_inference_and_reuse_their_ids() -> anyh
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn capped_tool_output_keeps_the_next_stripped_id_in_its_original_slot() -> anyhow::Result<()> {
+    let (temp, writer) =
+        crate::writer::capture_tests::limited_trace(/*body*/ 512, /*bundle*/ 64 << 10)?;
+    start_thread(&writer, "thread-root", "/root")?;
+    start_turn(&writer, "turn-1")?;
+    let request = json!({"input": [
+        {"type": "function_call_output", "output": "x".repeat(1024)},
+        {"type": "function_call_output", "output": "retained"}
+    ]});
+    writer.append(RawTraceEventPayload::InferenceStarted {
+        inference_call_id: "sample".into(),
+        thread_id: "thread-root".into(),
+        codex_turn_id: "turn-1".into(),
+        model: "model".into(),
+        provider_name: "test".into(),
+        request_payload: writer.write_json_payload(RawPayloadKind::InferenceRequest, &request)?,
+        prepared_prompt_payload: writer
+            .write_json_payload(RawPayloadKind::PreparedPrompt, &request)?,
+        warmup_context_payload: None,
+        stripped_tool_output_ids: vec![(0, "large".into()), (1, "small".into())],
+    })?;
+    let state = replay_bundle(temp.path())?;
+    let ids = &state.inference_calls["sample"].request_item_ids;
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        state.conversation_items[&ids[0]]
+            .responses_item_id
+            .as_deref(),
+        Some("small")
+    );
     Ok(())
 }
 

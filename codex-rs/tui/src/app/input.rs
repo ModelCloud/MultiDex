@@ -22,12 +22,9 @@ impl App {
         if self.focused_sidebar_chooser(tui) {
             return false;
         }
-        let rename_active = self
-            .chat_widget
-            .selected_index_for_active_view(AGENTS_OVERVIEW_VIEW_ID)
-            .is_some();
+        let overview_owns_input = self.agents_overview_has_focus();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        let insert_escape = if rename_active {
+        let insert_escape = if overview_owns_input {
             let state = self
                 .agents_overview
                 .view_state
@@ -50,11 +47,11 @@ impl App {
             && (key_event.modifiers == KeyModifiers::ALT
                 || key_event.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT))
             // ChatWidget's fixed image-paste shortcut is not in the configurable keymap.
-            && !(!rename_active
+            && !(!overview_owns_input
                 && key_event.kind == KeyEventKind::Press
                 && matches!(key_event.code, KeyCode::Char('v' | 'V')))
             // Empty-draft agent navigation also has fixed legacy-terminal fallbacks.
-            && !(!rename_active
+            && !(!overview_owns_input
                 && self.chat_widget.composer_text_with_pending().is_empty()
                 && (previous_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)
                     || next_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)))
@@ -94,15 +91,22 @@ impl App {
         self.chat_widget
             .observe_config_editor_transition_key_event(key_event);
         self.transcript_view.set_keymap_bindings(&self.keymap);
-        if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+        if let Some(overlay) = &mut self.overlay {
             overlay.set_keymap_bindings(&self.keymap);
         }
-        if self.overlay.is_none() && self.chat_widget.handle_quick_dial_menu(key_event) {
+        if self.overlay.is_none()
+            && !self.workspace_center_owns_input()
+            && self.chat_widget.handle_quick_dial_menu(key_event)
+        {
             return None;
         }
         let contexts = self.key_chord_contexts(tui);
         let select_mode_chord = self.select_mode_owns_chord(tui, key_event);
-        if (matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.owns_interaction_key(key_event))
+        if (self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::input_transcript)
+            .is_some_and(|view| view.owns_interaction_key(key_event))
             || (tui.is_owned_screen()
                 && self.overlay.is_none()
                 && !self.focused_sidebar_chooser(tui)
@@ -123,6 +127,7 @@ impl App {
                     },
                 )))
             && !select_mode_chord
+            && !self.workspace_center_owns_input()
         {
             let close = tui.is_owned_screen()
                 && self.overlay.is_none()
@@ -133,7 +138,8 @@ impl App {
                 (close
                     && action.context == crate::keymap::KeymapContext::Pager
                     && action.action == "close_transcript")
-                    || (action.is_side_pane() && contexts.contains_action(action))
+                    || ((action.is_side_pane() || action.action == "open_agents")
+                        && contexts.contains_action(action))
             };
             let chord = match self.key_chord_matcher.clone().advance(
                 key_event,
@@ -162,6 +168,12 @@ impl App {
             }
         }
         let was_pending = self.key_chord_matcher.is_pending();
+        if !was_pending
+            && self.workspace_center_owns_input()
+            && self.agents_overview_binding_matches(key_event)
+        {
+            return Some(key_event);
+        }
         if !was_pending
             && contexts.is_warnings()
             && (crate::key_hint::plain(KeyCode::Char('k')).is_press(key_event)
@@ -247,6 +259,19 @@ impl App {
         if !self.conversation_focus_available(tui) {
             return contexts;
         }
+        if self.workspace_center_owns_input()
+            && self
+                .agents_overview
+                .workspace
+                .view
+                .as_ref()
+                .is_some_and(|view| !view.owns_nested_input())
+        {
+            return contexts.with_pane_directions().with_main_composer_focus();
+        }
+        if self.workspace_center_owns_input() {
+            return contexts;
+        }
         if self.focused_sidebar_chooser(tui) {
             let contexts = KeymapContextSet::focused_sidebar_chooser();
             return if self.can_nudge_side_width(tui) {
@@ -280,21 +305,36 @@ impl App {
         }
     }
 
+    pub(super) fn agents_overview_binding_matches(&self, key: KeyEvent) -> bool {
+        keymap_action_ids()
+            .filter(|id| id.context == crate::keymap::KeymapContext::Agents)
+            .any(|id| {
+                bindings_for_action(&self.keymap, id.context.config_name(), id.action)
+                    .is_some_and(|bindings| bindings.is_pressed(key))
+            })
+    }
+
     pub(super) fn active_keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        if self.workspace_center_owns_input()
+            && let Some(view) = &self.agents_overview.workspace.view
+        {
+            use crate::bottom_pane::BottomPaneView;
+            return view.keymap_contexts().with_voice_toggle(&self.keymap);
+        }
         use crate::keymap::KeymapContext;
         use crate::keymap::KeymapContextSet;
 
         if let Some(overlay) = &self.overlay {
-            let contexts = match overlay {
-                Overlay::Transcript(view) if view.is_search_editing() => {
+            let contexts = match overlay.input_transcript() {
+                Some(view) if view.is_search_editing() => {
                     KeymapContextSet::new(KeymapContext::Editor)
                 }
-                Overlay::Transcript(view) if view.is_select_mode() => {
+                Some(view) if view.is_select_mode() => {
                     KeymapContextSet::transcript().with_transcript_select()
                 }
                 _ if self.backtrack.overlay_preview_active => KeymapContextSet::browsing(),
-                Overlay::Transcript(_) => KeymapContextSet::transcript(),
-                _ => KeymapContextSet::new(KeymapContext::Pager),
+                Some(_) => KeymapContextSet::transcript(),
+                None => KeymapContextSet::new(KeymapContext::Pager),
             };
             return contexts.with_voice_toggle(&self.keymap);
         }
@@ -344,6 +384,28 @@ impl App {
             contexts
         };
         contexts.with_voice_toggle(&self.keymap)
+    }
+
+    pub(super) fn voice_toggle_pressed(&self, key: KeyEvent) -> bool {
+        key.kind == KeyEventKind::Press
+            && self
+                .active_keymap_contexts()
+                .contains_action(crate::keymap::KeymapActionId {
+                    context: crate::keymap::KeymapContext::Chat,
+                    action: "toggle_voice",
+                })
+            && self.keymap.chat.toggle_voice.is_pressed(key)
+    }
+
+    pub(super) fn handle_voice_toggle_key(&mut self, tui: &mut tui::Tui, key: KeyEvent) -> bool {
+        if !self.voice_toggle_pressed(key) {
+            return false;
+        }
+        self.cancel_transcript_browsing(tui);
+        if !self.chat_widget.handle_startup_submission_key(key) {
+            self.control_voice(crate::app_event::VoiceControl::Toggle);
+        }
+        true
     }
 
     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
@@ -708,18 +770,17 @@ impl App {
             return;
         }
 
-        if self.chat_widget.is_read_only_view()
-            && self.overlay.is_none()
-            && self.chat_widget.no_modal_or_popup_active()
-        {
-            if key_event.kind == KeyEventKind::Press
-                && key_event.code == KeyCode::Left
-                && key_event.modifiers == KeyModifiers::NONE
-                && self.chat_widget.agents_navigation_key_available()
+        if self.overlay.is_none() && self.chat_widget.no_modal_or_popup_active() {
+            if self
+                .chat_widget
+                .blocked_thread_command_center_key_pressed(key_event)
             {
                 self.open_agents_overview(app_server);
+                return;
             }
-            return;
+            if self.chat_widget.is_read_only_view() {
+                return;
+            }
         }
 
         if self.should_handle_unavailable_thread_key(key_event) {

@@ -27,6 +27,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_tool_call_id::ToolCallId;
 
 /// Child creation options; omitted overrides retain native MAv2 inheritance and role rules.
 pub struct ThreadCreateRequest {
@@ -115,7 +116,7 @@ pub enum ThreadSpawnError {
 pub(crate) async fn spawn(
     session: &Session,
     step_context: &StepContext,
-    call_id: &str,
+    call_id: &ToolCallId,
     request: ThreadSpawnRequest,
 ) -> Result<ThreadSpawnResult, ThreadSpawnError> {
     let (request, message) = request.into_parts()?;
@@ -126,11 +127,24 @@ pub(crate) async fn spawn(
         input: AgentInput::Message {
             message,
             mode: MessageDeliveryMode::TriggerTurn,
+            source_tool_call_id: session
+                .services
+                .rollout_thread_trace
+                .is_enabled()
+                .then(|| call_id.clone()),
         },
         source: settings.source,
         options: settings.options,
     };
     let (agent, config) = session.services.agent_control.spawn(request).await?;
+    step_context
+        .turn
+        .session_telemetry
+        .record_multi_agent_spawned(
+            session.session_id(),
+            &step_context.turn.sub_id,
+            agent.thread_id,
+        );
     Ok(ThreadSpawnResult {
         agent,
         config,

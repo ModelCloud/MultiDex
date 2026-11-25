@@ -11,13 +11,17 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+use codex_protocol::ResponseItemId;
 
 use crate::bundle::MANIFEST_FILE_NAME;
 use crate::bundle::RAW_EVENT_LOG_FILE_NAME;
 use crate::bundle::TRACE_MANIFEST_SCHEMA_VERSION;
 use crate::bundle::TraceBundleManifest;
+use crate::model::AgentThreadId;
+use crate::model::ConversationItemId;
 use crate::model::ExecutionStatus;
 use crate::model::RolloutTrace;
+use crate::model::ToolCallId;
 use crate::shard::PayloadReader;
 
 use crate::raw_event::RAW_TRACE_EVENT_SCHEMA_VERSION;
@@ -73,12 +77,14 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         terminal_ids_by_process: BTreeMap::new(),
         process_ids_by_terminal: BTreeMap::new(),
         thread_conversation_snapshots: BTreeMap::new(),
+        structured_output_hashes: BTreeMap::new(),
         pending_compaction_replacement_item_ids: BTreeMap::new(),
         code_cell_ids_by_runtime: BTreeMap::new(),
         last_thread_resume_seq: BTreeMap::new(),
         pending_code_cell_starts: BTreeMap::new(),
         pending_code_cell_lifecycle_events: BTreeMap::new(),
         pending_agent_interaction_edges: Vec::new(),
+        native_tool_deliveries: BTreeMap::new(),
         first_acceptances: BTreeMap::new(),
         receivable_ids: BTreeMap::new(),
         snapshot_output_anchors: BTreeSet::new(),
@@ -138,6 +144,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     // Spawn edges prefer the child task message as their target, but a child can
     // fail before that message is ever reduced. Only after replaying the whole
     // bundle do we know which spawn deliveries need the child-thread fallback.
+    reducer.finish_native_tool_deliveries()?;
     reducer.resolve_pending_spawn_edge_fallbacks()?;
     // Cell starts can be queued until their model output arrives. Link only
     // materialized cells, after both sides of the dispatch have been replayed.
@@ -202,16 +209,20 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     Ok(reducer.rollout)
 }
 
+struct ReceivableItem {
+    item_id: ConversationItemId,
+    awaiting_snapshot: bool,
+}
+
 struct TraceReducer {
     rollout: RolloutTrace,
     payload_reader: PayloadReader,
     /// First (wall time, sequence) by receiving thread and Responses item ID.
     first_acceptances: BTreeMap<String, BTreeMap<String, (i64, crate::RawEventSeq)>>,
-    /// A native delivery or tool output has one graph ID until its first snapshot.
-    /// None means a snapshot already supplied its body (and a later acceptance is a duplicate).
-    receivable_ids: BTreeMap<(String, String), Option<String>>,
+    /// First graph item for each receiving thread and Responses wire ID.
+    receivable_ids: BTreeMap<(AgentThreadId, ResponseItemId), ReceivableItem>,
     /// Accepted tool outputs first encountered in the batch about to be appended.
-    snapshot_output_anchors: BTreeSet<String>,
+    snapshot_output_anchors: BTreeSet<ConversationItemId>,
     next_conversation_item_ordinal: u64,
     next_terminal_operation_ordinal: u64,
     /// Latest session for each thread-local runtime handle; each exec replaces it.
@@ -219,14 +230,16 @@ struct TraceReducer {
     /// Retains the begin/end consistency check when a handle is later reused.
     process_ids_by_terminal: BTreeMap<String, String>,
     /// Latest request and its response items, used to reconcile the next request.
-    thread_conversation_snapshots: BTreeMap<String, Vec<String>>,
+    thread_conversation_snapshots: BTreeMap<AgentThreadId, Vec<ConversationItemId>>,
+    /// Full identities for JSON tool outputs whose reduced bodies contain only a preview.
+    structured_output_hashes: BTreeMap<ConversationItemId, [u8; 32]>,
     /// Replacement snapshot installed by compaction but not yet seen in a sampling request.
     ///
     /// The first full request after compaction should compare against the installed replacement
     /// history, not against the pre-compaction request. That keeps repeated prefix/context messages
     /// as fresh post-compaction conversation items while still reusing the summary/replacement
     /// items that actually became live history.
-    pending_compaction_replacement_item_ids: BTreeMap<String, Vec<String>>,
+    pending_compaction_replacement_item_ids: BTreeMap<AgentThreadId, Vec<ConversationItemId>>,
     /// Runtime cell ids indexed by thread-local code-mode handle.
     ///
     /// Reduced `CodeCellId`s are based on the model-visible `exec` call id
@@ -251,13 +264,10 @@ struct TraceReducer {
     /// queued for ownership validation; these lifecycle events wait with it and
     /// are replayed in raw sequence order once the cell materializes.
     pending_code_cell_lifecycle_events: BTreeMap<String, Vec<PendingCodeCellLifecycleEvent>>,
-    /// Multi-agent deliveries whose recipient-side transcript item has not been observed yet.
-    ///
-    /// V2 agent tools enqueue mailbox messages in the target thread. The trace event for the
-    /// sending tool arrives before the recipient inference request materializes that mailbox item
-    /// as a `ConversationItem`, so the reducer keeps the delivery edge pending until it can point
-    /// at the exact model-visible item instead of a coarse thread.
+    /// Legacy collaboration events and automatic agent results lack a source-to-item ID.
     pending_agent_interaction_edges: Vec<PendingAgentInteractionEdge>,
+    /// V2 tool activity and the recipient's history item can arrive in either order.
+    native_tool_deliveries: BTreeMap<ToolCallId, tool::NativeToolDelivery>,
 }
 
 impl TraceReducer {
@@ -350,6 +360,7 @@ impl TraceReducer {
             }
             RawTraceEventPayload::HistoryItemAccepted {
                 item_id,
+                source_tool_call_id,
                 agent_message_payload,
                 tool_output_payload,
             } => {
@@ -357,6 +368,10 @@ impl TraceReducer {
                     .thread_id
                     .context("history acceptance has no thread")?;
                 self.thread_mut(&thread_id)?;
+                let item_id = ResponseItemId::from_server(item_id);
+                if let Some(source) = source_tool_call_id {
+                    self.record_agent_message_target(source, thread_id.clone(), item_id.clone())?;
+                }
                 // Keep the acceptance edge even when a capture limit hid the receipt body.
                 if let Some(payload) = agent_message_payload.or(tool_output_payload)
                     && payload.capture.is_complete()
@@ -372,7 +387,7 @@ impl TraceReducer {
                 self.first_acceptances
                     .entry(thread_id)
                     .or_default()
-                    .entry(item_id)
+                    .entry(item_id.into())
                     .or_insert((event.wall_time_unix_ms, event.seq));
             }
             RawTraceEventPayload::InferenceStarted {

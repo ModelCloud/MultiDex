@@ -161,7 +161,6 @@ pub(crate) fn build_tool_router(
         session.services.mcp_manager.shared_definitions(),
         &mut registry,
     );
-    let search = step_store.get::<crate::model_search::ModelSearch>();
     apply_mcp_tool_exposure_policy(
         turn_context,
         model_info,
@@ -175,40 +174,12 @@ pub(crate) fn build_tool_router(
         extension_tool_executors(session, step_store),
         &mut registry,
     );
-    let native_mode = match search.as_deref() {
-        None => Some(turn_context.config.web_search_mode.value()),
-        Some(crate::model_search::ModelSearch::Native { mode, .. }) => Some(*mode),
-        _ => None,
-    };
-    if matches!(
-        search.as_deref(),
-        Some(
-            crate::model_search::ModelSearch::Native { .. }
-                | crate::model_search::ModelSearch::Disabled
-        )
-    ) {
-        for tool in mcp
-            .tools()
-            .iter()
-            .filter(|tool| codex_mcp::is_model_search_tool(tool))
-        {
-            registry.remove(&tool.canonical_tool_name());
-        }
-    }
-    if native_mode.is_none() {
-        registry.remove(&ToolName::namespaced("web", "run"));
-    }
     append_dynamic_tool_runtimes(dynamic_tools, &mut registry);
-    let hosted_specs = if let Some(mode) = native_mode {
-        hosted_model_tool_specs(
-            turn_context,
-            model_info,
-            mode,
-            standalone_web_search_tool.as_slice(),
-        )
-    } else {
-        Vec::new()
-    };
+    let hosted_specs = hosted_model_tool_specs(
+        turn_context,
+        model_info,
+        standalone_web_search_tool.as_slice(),
+    );
 
     finalize_tool_router(
         turn_context,
@@ -375,7 +346,6 @@ pub(crate) fn append_source_tools(
     hosted_model_tool_specs(
         turn_context,
         model_info,
-        turn_context.config.web_search_mode.value(),
         standalone_web_search_tool.as_slice(),
     )
 }
@@ -408,6 +378,10 @@ pub(crate) fn finalize_tool_router(
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> CodexResult<ToolRouter> {
     let model_messages = ResolvedModelMessages::from_model(model_info);
+    model_messages
+        .validate_description_prefix_budget()
+        .map_err(CodexErrorDetails::InvalidRequest)?;
+
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     enforce_strict_3p_tools(turn_context, model_info, &mut registry);
@@ -478,12 +452,9 @@ pub(crate) fn finalize_tool_router(
         }
     }
 
-    prepare_function_description_prefixes(
-        turn_context,
-        model_info,
-        &mut registry,
-        search_exposure,
-    )?;
+    registry.apply_functions_namespace_function_prefixes(
+        model_messages.functions_namespace_functions_description_prefixes(),
+    );
 
     if let Some(exposure) = search_exposure {
         append_tool_search_executor(
@@ -494,11 +465,9 @@ pub(crate) fn finalize_tool_router(
         );
     }
 
-    let indirect_prefixes = IndirectNamespacePrefixes::new(
-        model_messages.indirect_description_prefixes(),
-        registry.mcp_namespaces(),
-    )
-    .map_err(|error| CodexErrorDetails::InvalidRequest(error.to_string()))?;
+    let indirect_prefixes = registry
+        .indirect_namespace_prefixes(model_messages.indirect_description_prefixes())
+        .map_err(|error| CodexErrorDetails::InvalidRequest(error.to_string()))?;
     let (code_mode_tool_names, exec_definitions) =
         register_code_mode_executors(turn_context, model_info, &mut registry, &indirect_prefixes);
     let include_tool_namespaces_info = turn_context
@@ -726,7 +695,6 @@ fn spec_for_model_request(
 fn hosted_model_tool_specs(
     turn_context: &TurnContext,
     model_info: &ModelInfo,
-    mode: WebSearchMode,
     registered_extension_tool_names: &[ToolName],
 ) -> Vec<ToolSpec> {
     // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
@@ -741,7 +709,7 @@ fn hosted_model_tool_specs(
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
         && turn_context.provider.capabilities().web_search)
-        .then_some(mode);
+        .then_some(turn_context.config.web_search_mode.value());
     let web_search_config = web_search_mode
         .as_ref()
         .and(turn_context.config.web_search_config.as_ref());
@@ -925,69 +893,6 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
     })
 }
 
-fn prepare_function_description_prefixes(
-    turn_context: &TurnContext,
-    model_info: &ModelInfo,
-    registry: &mut ToolRegistry,
-    search_exposure: Option<ToolExposure>,
-) -> CodexResult<()> {
-    let model_messages = ResolvedModelMessages::from_model(model_info);
-    let prefixes = model_messages.functions_namespace_functions_description_prefixes();
-    let mut available_tools = Vec::new();
-    if prefixes.is_some_and(|prefixes| !prefixes.is_empty()) {
-        let code_mode_enabled = matches!(
-            effective_tool_mode(turn_context, model_info),
-            ToolMode::CodeMode | ToolMode::CodeModeOnly
-        );
-        let search_name = ToolName::plain(TOOL_SEARCH_TOOL_NAME);
-        let search_visible = search_exposure.is_some_and(|exposure| {
-            !is_hidden_by_code_mode_only(turn_context, model_info, &search_name, exposure)
-                || (code_mode_enabled
-                    && registry
-                        .tool_policy
-                        .allows(&ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME))
-                    && turn_context
-                        .config
-                        .features
-                        .enabled(Feature::CodeModeToolSearch)
-                    && exposure.is_available_in_code_mode()
-                    && !is_excluded_from_code_mode(turn_context, &search_name))
-        });
-        available_tools.extend(
-            registry
-                .entries()
-                .filter(|tool| {
-                    is_directly_visible(turn_context, model_info, tool)
-                        || (search_visible
-                            && tool.exposure.is_deferred()
-                            && tool.runtime.search_info().is_some())
-                })
-                .map(|tool| tool.runtime.tool_name()),
-        );
-        available_tools.extend(
-            code_mode_tools(turn_context, model_info, registry)
-                .map(|(_, _, tool)| tool.runtime.tool_name()),
-        );
-        // These wrappers are generated after their inner descriptions are ready.
-        if code_mode_enabled {
-            available_tools.extend(
-                [
-                    codex_code_mode::PUBLIC_TOOL_NAME,
-                    codex_code_mode::WAIT_TOOL_NAME,
-                ]
-                .into_iter()
-                .map(ToolName::plain)
-                .filter(|name| registry.tool_policy.allows(name)),
-            );
-        }
-    }
-    registry
-        .apply_functions_namespace_function_prefixes(prefixes, available_tools)
-        .map_err(|error| CodexErrorDetails::InvalidRequest(error.to_owned()).into())
-}
-
-/// Select the same nested tools for prefix budgeting and Code Mode construction.
-/// A registered tool alone is not reachable when policy disallows the exec wrapper.
 fn code_mode_tools<'a>(
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
@@ -1057,7 +962,7 @@ fn register_code_mode_executors(
     indirect_prefixes: &IndirectNamespacePrefixes<'_>,
 ) -> (
     BTreeMap<String, ToolName>,
-    Option<Arc<Vec<codex_code_mode::ExecDefinition>>>,
+    Option<Arc<codex_code_mode::ExecDefinitions>>,
 ) {
     let tool_mode = effective_tool_mode(turn_context, model_info);
     if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
@@ -1409,14 +1314,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         );
     }
 
-    if !turn_context.root_capabilities_restricted
+    let root_messages = !turn_context.root_capabilities_restricted
         && (features.enabled(Feature::SendMessageToUserAsync)
             || context
                 .model_info
                 .experimental_supported_tools
                 .iter()
-                .any(|tool| tool == "send_message_to_user_async"))
-    {
+                .any(|tool| tool == "send_message_to_user_async"));
+    let subagent_messages = features.subagent_async_messages_enabled
+        && turn_context.session_source.parent_thread_id().is_some();
+    if root_messages || subagent_messages {
         registry.add_with_exposure(SendMessageToUserAsyncHandler, ToolExposure::DirectModelOnly);
     }
 

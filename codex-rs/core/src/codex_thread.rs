@@ -28,6 +28,7 @@ use codex_history::RolloutItem;
 use codex_models_manager::ModelsManagerConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
+use codex_protocol::AgentPath;
 use codex_protocol::RequestCountry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -40,6 +41,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ProfileWorkspaceRoot;
 use codex_protocol::models::ResponseItem;
@@ -50,6 +52,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
@@ -87,6 +90,7 @@ use codex_user_input::ResolvedUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
+use futures::future::BoxFuture;
 use rmcp::model::ReadResourceRequestParams;
 use std::any::Any;
 use std::path::PathBuf;
@@ -199,7 +203,7 @@ pub enum ConfigRefreshOutcome {
     Published,
     /// The captured owner changed; the caller must reload before retrying.
     Stale,
-    /// Resolution failed and a configuration disabling enterprise MCP was published.
+    /// Resolution failed. The scope may still have published a fail-closed configuration.
     Rejected,
 }
 
@@ -207,6 +211,21 @@ pub use codex_guardian_context::GuardianRootMessage;
 
 pub use codex_guardian_reviewer::GuardianAuthorizationVersion;
 pub use codex_guardian_reviewer::GuardianRootSnapshot;
+
+/// An atomic snapshot of admission for the thread's current turn slot.
+///
+/// A slot may be reserved before Core assigns it a turn ID. This snapshot does
+/// not include work draining after an abort removes the slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum TurnAdmissionState {
+    /// Core does not own a current turn slot.
+    Idle,
+    /// The slot is reserved, but execution has not been admitted.
+    Pending { turn_id: Option<String> },
+    /// Execution was admitted; the slot remains admitted through finishing.
+    Admitted { turn_id: String },
+}
 
 pub struct CodexThread {
     pub(crate) session: Arc<Session>,
@@ -410,9 +429,9 @@ impl CodexThread {
         &self.session.services.thread_extension_data
     }
 
-    /// Generator used for response items produced on behalf of this thread.
-    pub fn item_id_generator(&self) -> &codex_protocol::ItemIdGenerator {
-        &self.session.item_id_generator
+    /// Allocates context IDs on behalf of this thread.
+    pub fn context_ids(&self) -> &codex_thread_context_ids::ThreadContextIds {
+        &self.session.context_ids
     }
 
     /// Returns tools from this thread’s ready, unshared Apps MCP client.
@@ -893,6 +912,22 @@ impl CodexThread {
         self.session.active_turn.lock().await.is_some()
     }
 
+    /// Returns admission and turn identity from the same current-slot snapshot.
+    pub async fn turn_admission_state(&self) -> TurnAdmissionState {
+        let active = self.session.active_turn.lock().await;
+        match active.as_ref() {
+            None => TurnAdmissionState::Idle,
+            Some(turn) => match &turn.turn_id {
+                Some(turn_id) if turn.admitted => TurnAdmissionState::Admitted {
+                    turn_id: turn_id.clone(),
+                },
+                turn_id => TurnAdmissionState::Pending {
+                    turn_id: turn_id.clone(),
+                },
+            },
+        }
+    }
+
     /// Returns the current turn ID, including while its stop hook runs.
     pub async fn current_turn_id(&self) -> Option<String> {
         self.session
@@ -1132,8 +1167,77 @@ impl CodexThread {
         crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation).await
     }
 
-    /// Record raw Responses API items without starting a new turn.
-    pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
+    /// Inject raw Responses items. Plaintext agent-mail batches in a native MAv2
+    /// runtime use queue-only mailbox delivery and its existing wake policy.
+    /// Other batches retain history-injection semantics.
+    pub fn inject_response_items(
+        &self,
+        items: Vec<ResponseItem>,
+    ) -> BoxFuture<'_, CodexResult<()>> {
+        // Keep the concrete future in core so callers don't each compile their own copy.
+        Box::pin(self.inject_response_items_inner(items))
+    }
+
+    async fn inject_response_items_inner(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
+        let config = self.session.get_config().await;
+        // Native mail can represent this shape without changing its payload. Keep
+        // mixed history and multipart/encrypted items on the raw injection path.
+        if !config.multi_agent_v2.disable_native_tools
+            && !items.is_empty()
+            && let Some(messages) = items
+                .iter()
+                .map(|item| {
+                    let ResponseItem::AgentMessage {
+                        id,
+                        author,
+                        recipient,
+                        content,
+                        internal_chat_message_metadata_passthrough,
+                    } = item
+                    else {
+                        return None;
+                    };
+                    let [AgentMessageInputContent::InputText { text }] = content.as_slice() else {
+                        return None;
+                    };
+                    Some(InterAgentCommunication {
+                        id: id.clone(),
+                        author: AgentPath::try_from(author.as_str()).ok()?,
+                        recipient: AgentPath::try_from(recipient.as_str()).ok()?,
+                        other_recipients: Vec::new(),
+                        content: text.clone(),
+                        encrypted_content: None,
+                        internal_chat_message_metadata_passthrough:
+                            internal_chat_message_metadata_passthrough.clone(),
+                        trigger_turn: false,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+            && match self.multi_agent_version() {
+                Some(version) => version,
+                None => self.session.resolve_multi_agent_version_for_model(
+                    self.selected_model_info().await.as_ref(),
+                    &config,
+                ),
+            } == MultiAgentVersion::V2
+        {
+            // Keep capacity eviction out between individual submissions. Each
+            // submission retains its own pin through dispatch after this batch returns.
+            let _batch_residency = self
+                .session
+                .services
+                .local_agent_runtime
+                .pin_v2_residency(self)
+                .await?;
+            for communication in messages {
+                self.submit(Op::InterAgentCommunication {
+                    communication,
+                    start_options: TurnStartOptions::default(),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
         self.inject_response_items_with_retention(items).await
     }
 
@@ -1182,22 +1286,27 @@ impl CodexThread {
             ));
         }
         let items: Vec<InjectedResponseItem> = items.into_iter().map(Into::into).collect();
+        for item in &items {
+            validate_injected_response_item(&item.item)?;
+        }
         let mut indexed_items = items.iter().enumerate();
         while let Some((index, item)) = indexed_items.next() {
-            validate_injected_response_item(&item.item)?;
-            if item.retention != ItemRetention::Always {
+            if matches!(
+                item.retention,
+                ItemRetention::Unspecified | ItemRetention::Default
+            ) {
                 continue;
             }
             let needs_call = crate::tools::output_call_id(&item.item).is_some()
                 && !matches!(&item.item, ResponseItem::ToolSearchOutput { execution, .. } if execution == "server");
             if (crate::tools::input_call_id(&item.item).is_some() || needs_call)
                 && !indexed_items.next().is_some_and(|(_, output)| {
-                    output.retention == ItemRetention::Always
+                    output.retention == item.retention
                         && crate::tools::is_matching_tool_output(&item.item, &output.item)
                 })
             {
                 return Err(CodexErr::InvalidRequest(format!(
-                    "items[{index}]: retained tool calls and outputs must be adjacent in the same request, call first, with both marked always"
+                    "items[{index}]: retained tool calls and outputs must be adjacent in the same request, call first, with the same retention policy"
                 )));
             }
         }
@@ -1211,6 +1320,12 @@ impl CodexThread {
 
     pub fn rollout_path(&self) -> Option<PathBuf> {
         self.rollout_path.clone()
+    }
+
+    /// Whether the latest completed sampling request in this live context reported a removal.
+    /// Returns None before sampling or when that response omitted the report.
+    pub async fn last_sampling_cot_removed(&self) -> Option<bool> {
+        self.session.last_sampling_cot_removed().await
     }
 
     /// Selects a local feedback rollout without materializing an untouched thread.
@@ -1228,6 +1343,13 @@ impl CodexThread {
     /// Returns startup metadata without the one-time initial message replay.
     pub fn startup_metadata(&self) -> &ThreadStartupMetadata {
         &self.startup_metadata
+    }
+
+    /// Whether this live thread joined the Daybreak propagation experiment at startup.
+    pub fn daybreak_program_propagation_enrolled(&self) -> bool {
+        self.thread_extension_data()
+            .get::<crate::agent::helper_daybreak::Enrollment>()
+            .is_some()
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -1477,6 +1599,15 @@ impl CodexThread {
         self.session.disable_mcp_enterprise_auth().await;
     }
 
+    /// Refresh managed Guardian policy for future turns without changing MCP state.
+    /// Session and user policy fallbacks remain pinned until their own reload.
+    pub async fn refresh_guardian_policy(
+        &self,
+        snapshot: &codex_config::GuardianPolicySnapshot,
+    ) -> ConfigRefreshOutcome {
+        self.session.refresh_guardian_policy(snapshot).await
+    }
+
     /// Refresh MCP configuration, managed requirements, and session plugin and app overrides.
     /// An omitted section preserves its current overrides. An empty map restores inheritance.
     /// A stale owner requires reloading from the current config before retrying.
@@ -1492,6 +1623,13 @@ impl CodexThread {
         .await
     }
 
+    /// Invalidates this thread's executor DiscoveryV2 inventory. The next discovery
+    /// consumer reloads it; unchanged turns and other reads share the cached inventory.
+    /// Environment/session, cwd, and sandbox changes also trigger discovery independently.
+    pub fn invalidate_executor_discovery(&self) {
+        self.session.invalidate_executor_discovery();
+    }
+
     /// Refreshes this thread's Apps tools before returning their runtime state.
     pub async fn refresh_codex_apps_tools(
         &self,
@@ -1500,7 +1638,7 @@ impl CodexThread {
     }
 
     /// Refreshes cloud plugin and skill catalogs before input admission, without starting a turn.
-    /// Serializes publication with step preparation and marks MCP dirty for later reconciliation.
+    /// Serializes publication with step preparation and queues MCP prewarm as plugins are published.
     /// Accepts complete or partial catalogs; failed discovery remains retryable.
     pub async fn refresh_cloud_plugins(&self) -> anyhow::Result<()> {
         self.session.refresh_cloud_plugins().await

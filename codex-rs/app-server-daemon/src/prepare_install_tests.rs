@@ -26,17 +26,25 @@ fn daemon(home: &std::path::Path) -> crate::Daemon {
 }
 
 fn package(root: &Path, version: &str) -> PathBuf {
-    package_with_entrypoint(root, version, "bin/codex")
+    package_with_entrypoint(root, version, version, "bin/codex")
 }
 
-fn package_with_entrypoint(root: &Path, version: &str, entrypoint: &str) -> PathBuf {
+fn package_with_entrypoint(
+    root: &Path,
+    version: &str,
+    binary_version: &str,
+    entrypoint: &str,
+) -> PathBuf {
     let target = super::platform_target().expect("target");
     for dir in ["bin", "codex-path", "codex-resources/nested"] {
         std::fs::create_dir_all(root.join(dir)).expect("package directory");
     }
     let bin = root.join(entrypoint);
-    codex_utils_cargo_bin::write_executable(&bin, &format!("#!/bin/sh\necho 'codex {version}'\n"))
-        .expect("codex executable");
+    codex_utils_cargo_bin::write_executable(
+        &bin,
+        &format!("#!/bin/sh\necho 'codex {binary_version}'\n"),
+    )
+    .expect("codex executable");
     for file in ["bin/codex-code-mode-host", "codex-path/rg"] {
         codex_utils_cargo_bin::write_executable(&root.join(file), "runtime")
             .expect("executable helper");
@@ -165,7 +173,8 @@ async fn seeds_multidex_package_using_manifest_entrypoint() {
     let home = temp.path().join("home");
     let daemon = daemon(&home);
     let source = temp.path().join("multidex-package");
-    let multidex_bin = package_with_entrypoint(&source, "0.163.0", "bin/multidex");
+    let multidex_bin =
+        package_with_entrypoint(&source, "0.163.0", "0.163.0+abcdef123", "bin/multidex");
 
     prepare_from_package(
         &daemon,
@@ -193,6 +202,29 @@ async fn seeds_multidex_package_using_manifest_entrypoint() {
         Path::new("bin/multidex")
     );
     assert!(validate_package(&selected, "bin/multidex").is_ok());
+}
+
+#[tokio::test]
+async fn rejects_multidex_package_with_different_executable_version() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let source = temp.path().join("multidex-package");
+    let multidex_bin =
+        package_with_entrypoint(&source, "0.163.0", "0.163.1+abcdef123", "bin/multidex");
+
+    let error = prepare_from_package(
+        &daemon(&home),
+        &DaemonSettings::default(),
+        InstallMode::Missing,
+        Some(&source),
+        &multidex_bin,
+        |_| Ok(true),
+    )
+    .await
+    .expect_err("reject a different executable version");
+
+    assert!(error.to_string().contains("does not match its executable"));
+    assert!(!home.join("packages/app-server-daemon/current").exists());
 }
 
 #[tokio::test]

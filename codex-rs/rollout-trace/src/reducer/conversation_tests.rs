@@ -224,6 +224,7 @@ fn response_outputs_require_harness_acceptance() -> anyhow::Result<()> {
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::HistoryItemAccepted {
+            source_tool_call_id: None,
             item_id: "msg-accepted".into(),
             agent_message_payload: None,
             tool_output_payload: None,
@@ -552,6 +553,62 @@ fn request_reuses_prior_tool_outputs_with_internal_metadata() -> anyhow::Result<
         assert_eq!(rollout.conversation_items.len(), 2);
     }
 
+    Ok(())
+}
+
+#[test]
+fn tool_search_outputs_keep_the_evidence_for_each_version() -> anyhow::Result<()> {
+    let long_text = "prefix".repeat(340);
+    let a = json!(format!("{long_text}A"));
+    let b = json!(format!("{long_text}B"));
+    let null = json!(null);
+    for body_cap in [512, 8192] {
+        let (root, writer) = crate::writer::capture_tests::limited_trace(body_cap, 128 << 10)?;
+        start_thread(&writer, ROOT_THREAD_ID, "/root")?;
+        let mut requests = Vec::new();
+        for (index, (first, second)) in [
+            (&a, &null),
+            (&b, &null),
+            (&b, &null),
+            (&null, &b),
+            (&null, &null),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let turn = format!("turn-{index}");
+            start_turn(&writer, &turn)?;
+            let mut output = json!({"type": "tool_search_output", "call_id": "search", "tools": [
+                {"name": "one", "text": first}, {"name": "two", "text": second}
+            ]});
+            if index == 2 {
+                output["internal_chat_message_metadata_passthrough"] = json!({"text": a});
+            }
+            let request = writer
+                .write_json_payload(RawPayloadKind::InferenceRequest, &json!({"input":[output]}))?;
+            assert_eq!(
+                request.is_complete(),
+                body_cap > long_text.len() || index == 4
+            );
+            requests.push(request.raw_payload_id.clone());
+            append_inference_start(&writer, &format!("inference-{index}"), &turn, request)?;
+        }
+        drop(writer);
+        let rollout = replay_bundle(root.path())?;
+        // A changed value or a moved missing slot gets its own evidence. An exact repeat
+        // reuses the first sighting, and genuine JSON nulls form a distinct observation.
+        for (index, source) in [0, 1, 1, 3, 4].into_iter().enumerate() {
+            let item_id =
+                &rollout.inference_calls[&format!("inference-{index}")].request_item_ids[0];
+            let [ConversationPart::Json { raw_payload_id, .. }] =
+                rollout.conversation_items[item_id].body.parts.as_slice()
+            else {
+                panic!("expected JSON tool-search output");
+            };
+            assert_eq!(raw_payload_id, &requests[source]);
+        }
+        assert_eq!(rollout.conversation_items.len(), 4);
+    }
     Ok(())
 }
 
@@ -1438,7 +1495,7 @@ fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: "tool-1".to_string(),
+            tool_call_id: "tool-1".into(),
             model_visible_call_id: Some("call-1".to_string()),
             code_mode_runtime_tool_id: None,
             requester: crate::raw_event::RawToolCallRequester::Model,
@@ -1459,7 +1516,7 @@ fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
         trace_context("turn-1"),
         RawTraceEventPayload::ToolCallRuntimeStarted {
             kind: ToolCallKind::ExecCommand,
-            tool_call_id: "tool-1".to_string(),
+            tool_call_id: "tool-1".into(),
             runtime_payload: runtime,
         },
     )?;
@@ -1467,7 +1524,7 @@ fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
     writer.append_with_context(
         trace_context("turn-1"),
         RawTraceEventPayload::ToolCallEnded {
-            tool_call_id: "tool-1".to_string(),
+            tool_call_id: "tool-1".into(),
             status: ExecutionStatus::Completed,
             result_payload: None,
         },
@@ -1501,7 +1558,7 @@ fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
 
     assert_eq!(
         first_inference.tool_call_ids_started_by_response,
-        vec!["tool-1".to_string()],
+        vec![crate::ToolCallId::from("tool-1")],
     );
     assert_eq!(
         tool_call.model_visible_call_item_ids,
@@ -1516,7 +1573,7 @@ fn late_tool_start_with_image_limit(body_limit: usize) -> anyhow::Result<()> {
         assert_eq!(
             rollout.conversation_items[output_item_id].produced_by,
             vec![ProducerRef::Tool {
-                tool_call_id: "tool-1".to_string(),
+                tool_call_id: "tool-1".into(),
             }],
         );
     }

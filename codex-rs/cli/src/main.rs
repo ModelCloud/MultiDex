@@ -487,7 +487,7 @@ enum SandboxSubcommand {
 #[cfg(target_os = "macos")]
 type HostSandboxArgs = codex_cli::SeatbeltCommand;
 #[cfg(target_os = "linux")]
-type HostSandboxArgs = codex_cli::LandlockCommand;
+type HostSandboxArgs = codex_cli::LinuxSandboxCommand;
 #[cfg(target_os = "windows")]
 type HostSandboxArgs = codex_cli::WindowsCommand;
 
@@ -1054,6 +1054,17 @@ fn main() -> anyhow::Result<()> {
     codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--codex-run-as-sandbox-launcher"))
+        {
+            anyhow::ensure!(
+                std::env::args_os().len() == 2,
+                "--codex-run-as-sandbox-launcher does not accept additional arguments"
+            );
+            return codex_cli::shared_sandbox_launcher::run(arg0_paths.codex_linux_sandbox_exe)
+                .await;
+        }
         // Finish polling the large subcommand dispatcher before polling interactive TUI events.
         if let Some(tui) = Box::pin(dispatch_cli(arg0_paths, remote_control_disabled)).await? {
             tui.await?;
@@ -1270,26 +1281,17 @@ async fn dispatch_cli(
             prepend_config_flags(&mut config_overrides, root_config_overrides.clone());
             match subcommand {
                 PluginSubcommand::Add(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_add(overrides, args).await?;
+                    plugin_cmd::run_plugin_add(&config_overrides, args).await?;
                 }
                 PluginSubcommand::List(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_list(overrides, args).await?;
+                    plugin_cmd::run_plugin_list(&config_overrides, args).await?;
                 }
                 PluginSubcommand::Marketplace(mut marketplace_cli) => {
                     prepend_config_flags(&mut marketplace_cli.config_overrides, config_overrides);
                     marketplace_cli.run().await?;
                 }
                 PluginSubcommand::Remove(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_remove(overrides, args).await?;
+                    plugin_cmd::run_plugin_remove(&config_overrides, args).await?;
                 }
             }
         }
@@ -1315,10 +1317,10 @@ async fn dispatch_cli(
                 root_remote_auth_token_env.as_deref(),
                 subcommand.as_ref(),
             )?;
-            if startup_config.print_startup_config {
+            if startup_config.print_startup_config || startup_config.startup_oauth {
                 anyhow::ensure!(
                     subcommand.is_none(),
-                    "--print-startup-config cannot run a subcommand"
+                    "startup configuration modes cannot run a subcommand"
                 );
                 codex_app_server::print_startup_config(
                     arg0_paths,
@@ -1413,7 +1415,9 @@ async fn dispatch_cli(
                                 continue;
                             }
                             let value = if let Some(table) = value.as_table() {
-                                let Some(enabled) = table.get("enabled") else {
+                                let Some(enabled) =
+                                    table.get(codex_features::feature_toggle_field(name))
+                                else {
                                     continue;
                                 };
                                 enabled
@@ -1858,7 +1862,7 @@ async fn dispatch_cli(
             )
             .await?;
             #[cfg(target_os = "linux")]
-            codex_cli::run_command_under_landlock(
+            codex_cli::run_command_under_linux_sandbox(
                 sandbox_cli,
                 arg0_paths.codex_linux_sandbox_exe.clone(),
                 loader_overrides,
@@ -3660,6 +3664,17 @@ enabled = true
             err.to_string(),
             "--force requires a session UUID; names must be confirmed interactively"
         );
+    }
+
+    #[test]
+    fn sandbox_runs_launcher_executable() {
+        let cli = MultitoolCli::try_parse_from(["codex", "sandbox", "launcher", "--help"])
+            .expect("parse sandbox executable");
+        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+            panic!("expected sandbox command");
+        };
+        assert!(command.subcommand.is_none());
+        assert_eq!(command.host.command, vec!["launcher", "--help"]);
     }
 
     #[test]

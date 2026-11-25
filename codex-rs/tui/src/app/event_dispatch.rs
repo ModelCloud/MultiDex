@@ -30,9 +30,17 @@ use codex_app_server_protocol::WindowsSandboxSetupMode;
 pub(super) const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
 impl App {
-    // Keep the existing dispatcher layout until it can be formatted separately.
+    pub(crate) fn handle_event<'a>(
+        &'a mut self,
+        tui: &'a mut tui::Tui,
+        app_server: &'a mut AppServerSession,
+        event: AppEvent,
+    ) -> futures::future::LocalBoxFuture<'a, Result<AppRunControl>> {
+        Box::pin(self.dispatch_event(tui, app_server, event))
+    }
+
     #[rustfmt::skip]
-    pub(crate) async fn handle_event(
+    async fn dispatch_event(
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
@@ -86,6 +94,8 @@ impl App {
                     | AppEvent::TestConfigNotification
                     | AppEvent::SendConfigTestNotification { .. }
                     | AppEvent::SaveConfigPreference(_)
+                    | AppEvent::SaveReasoningSummary { .. }
+                    | AppEvent::RefreshConfigReasoningSummary
                     | AppEvent::CopyWarning(_)
                     | AppEvent::UpdateWarnings { .. }
                     | AppEvent::CopySelection { .. }
@@ -103,6 +113,7 @@ impl App {
                     | AppEvent::StartQueuedSavedChat
                     | AppEvent::OpenSidebarAgent { .. }
                     | AppEvent::OpenSidebarDocument { .. }
+                    | AppEvent::OpenModelSidebarDocument { .. }
                     | AppEvent::SidebarDocumentResolved { .. }
                     | AppEvent::SidebarDocumentLoaded { .. }
                     | AppEvent::SidebarFilesLoaded { .. }
@@ -232,7 +243,16 @@ impl App {
             event => (event, None),
         };
         match event {
-            AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+            AppEvent::OpenDaemonMenu => {
+                let policy_error = if self.daemon_cli_executable.is_some()
+                    && !matches!(self.app_server_target, AppServerTarget::Remote { .. } | AppServerTarget::Cloud)
+                {
+                    codex_app_server_daemon::ensure_updates_allowed().await.err().map(|error| error.to_string())
+                } else {
+                    None
+                };
+                self.open_daemon_menu(policy_error.as_deref());
+            }
             AppEvent::RemoteControl(_) | AppEvent::RemoteControlForBackend { .. } | AppEvent::RemoteControlFinished { .. } => {}
             AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
             AppEvent::RunDaemonRestart => {
@@ -246,8 +266,17 @@ impl App {
                     )));
                 }
             }
-            AppEvent::ConfirmDaemonUpdate(source) => self.confirm_daemon_update(source),
+            AppEvent::ConfirmDaemonUpdate(source) => {
+                match codex_app_server_daemon::ensure_updates_allowed().await {
+                    Ok(()) => self.confirm_daemon_update(source),
+                    Err(error) => self.chat_widget.add_error_message(error.to_string()),
+                }
+            }
             AppEvent::RunDaemonUpdate(source) => {
+                if let Err(error) = codex_app_server_daemon::ensure_updates_allowed().await {
+                    self.chat_widget.add_error_message(error.to_string());
+                    return Ok(AppRunControl::Continue);
+                }
                 self.pending_update_action = Some(UpdateAction::Daemon(source));
                 return Ok(self.handle_exit_mode(app_server, ExitMode::Immediate).await);
             }
@@ -267,7 +296,7 @@ impl App {
             AppEvent::CloseMisalignmentReview => self.chat_widget.show_misalignment_policy_precaution(),
             AppEvent::SkillsListLoaded { ref cwd, .. }
                 if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud
-                    || cwds_differ(cwd, self.config.cwd.as_path()) =>
+                    || self.chat_widget.session_cwd() != cwd =>
             {
                 self.skill_load_warnings.startup_complete = true;
             }
@@ -504,7 +533,7 @@ impl App {
             AppEvent::ChooseStatuslineProvider { scan, id, key } => self.choose_statusline_provider(scan, id, key, app_server).await,
             AppEvent::CreateCustomStatusline { backend, thread_id, key } => {
                 if app_server.thread_params_mode() != crate::ThreadParamsMode::Cloud
-                    && self.config.features.enabled(Feature::TuiExtensionsStatusLine)
+                    && self.chat_widget.custom_statusline_enabled()
                     && self.chat_widget.active_view_is(crate::bottom_pane::StatusLineSetupView::VIEW_ID)
                     && self.chat_widget.model_catalog().backend == backend
                     && backend.is_none_or(|id| id == app_server.backend_id())
@@ -779,11 +808,6 @@ impl App {
                         .await;
                     let mut fork_config = self.config.clone();
                     fork_config.daybreak_enabled = self.chat_widget.daybreak_enabled;
-                    if app_server.uses_remote_workspace() {
-                        fork_config.workspace_roots.clone_from(
-                            &self.chat_widget.config_ref().workspace_roots,
-                        );
-                    }
                     fork_config.model_provider_id.clone_from(&self.chat_widget.config_ref().model_provider_id);
                     fork_config.model = Some(self.chat_widget.current_model().to_string());
                     fork_config.model_reasoning_effort =
@@ -792,6 +816,7 @@ impl App {
                     match app_server.fork_thread_at(
                         &self.local_settings,
                         fork_config,
+                        app_server.uses_remote_workspace().then(|| self.chat_widget.session_workspace_roots()),
                         thread_id,
                         /*last_turn_id*/ None,
                         /*before_turn_id*/ None,
@@ -834,6 +859,10 @@ impl App {
                                     }
                                     // Keep local input without replacing the fork's running state.
                                     self.chat_widget.restore_reconnected_input(retained_input, &[]);
+                                    if from_agents_overview && self.agents_overview.workspace.is_open() {
+                                        self.focus_workspace_composer(tui);
+                                        self.repaint_agents_overview();
+                                    }
                                     if let Some(err) = name_error {
                                         self.chat_widget.add_error_message(err);
                                     }
@@ -1233,10 +1262,13 @@ impl App {
             AppEvent::CorrectFlushedAgentMessage { item, cell } => {
                 let belongs_to_item = |cell: &Arc<dyn HistoryCell>| {
                     cell.as_any().downcast_ref::<history_cell::AgentMarkdownCell>().is_some_and(|cell| cell.interrupted_item.as_ref() == Some(&item))
+                        || cell.as_any().downcast_ref::<history_cell::PendingAgentMessageCell>().is_some_and(|cell| cell.0 == item)
                 };
+                let hidden = cell.copy_source() == Some("");
                 if let Some(index) = self.transcript_cells.iter().position(belongs_to_item) {
-                    // Keep the reply where it first appeared, with intervening tools in order.
-                    if self.transcript_cells.extract_if(index + 1.., |cell| belongs_to_item(cell)).count() > 0 {
+                    // Remove a hidden reply entirely; otherwise retain its original position.
+                    let remove_from = index + usize::from(!hidden);
+                    if self.transcript_cells.extract_if(remove_from.., |cell| belongs_to_item(cell)).count() > 0 {
                         self.native_history.retain(&self.transcript_cells);
                         self.transcript_view.restart_search();
                         self.transcript_view.history_loaded(&self.transcript_cells, 0..0);
@@ -1244,8 +1276,19 @@ impl App {
                             overlay.replace_cells(self.transcript_cells.clone());
                         }
                     }
-                    self.replace_agent_message(tui, index..index + 1, cell, crate::app_event::ConsolidationScrollbackReflow::Required)?;
-                } else {
+                    if hidden {
+                        self.finish_required_stream_reflow(tui)?;
+                    } else {
+                        self.replace_agent_message(tui, index..index + 1, cell, crate::app_event::ConsolidationScrollbackReflow::Required)?;
+                    }
+                    let previous = self.transcript_cells.iter().rev().find(|cell| {
+                        (cell.as_any().is::<history_cell::AgentMarkdownCell>() && !cell.raw_lines().is_empty())
+                            || cell.as_any().is::<history_cell::ProposedPlanCell>()
+                    });
+                    self.chat_widget.reconcile_corrected_cloud_copy(
+                        &item, previous.map(AsRef::as_ref),
+                    );
+                } else if !hidden {
                     self.insert_history_cell(tui, Box::new(cell));
                 }
             }
@@ -1305,7 +1348,7 @@ impl App {
                     && (self.agents_overview.threads.iter().any(|(id, thread)| {
                         (mode == ExitMode::Immediate
                             || Some(*id) != self.current_displayed_thread_id()
-                            || self.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID))
+                            || self.agents_overview_has_focus())
                             && matches!(thread.as_ref().map(|t| &t.status), Some(ThreadStatus::Active { .. }))
                     }) || self.running_side_thread_id().await.is_some()) =>
             {
@@ -1413,15 +1456,14 @@ impl App {
             // The Cloud preview does not have a skills catalog.
             AppEvent::CodexOp(AppCommand::ListSkills { .. })
                 if app_server.thread_params_mode() == crate::ThreadParamsMode::Cloud => {}
-            AppEvent::CodexOp(AppCommand::ListSkills { cwds, force_reload: true })
+            AppEvent::CodexOp(AppCommand::ListSkills { cwd, force_reload: true })
                 if self.awaiting_side_replay(tui)
                     && let Some(thread_id) = self.active_thread_id
                     && self.side_pair_key(thread_id).is_some()
                     && !self.thread_unavailable(thread_id) =>
             {
                 // Session replay refreshes skill metadata. Let focus paint while that RPC is pending.
-                let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
-                if cwds.contains(&cwd) {
+                if &cwd == self.chat_widget.session_cwd() {
                     let request_id = Uuid::new_v4();
                     app_server.pending_side_skills_refresh = Some(request_id);
                     let rpc_id = app_server.next_request_id();
@@ -1431,7 +1473,7 @@ impl App {
                         let result = background_requests::fetch_skills_list(
                             request_handle,
                             rpc_id,
-                            SkillsListParams { cwds, force_reload: true },
+                            SkillsListParams { cwds: vec![cwd.to_path_buf()], force_reload: true },
                         )
                         .await
                         .map_err(|err| format!("{err:#}"));
@@ -1663,7 +1705,7 @@ impl App {
                     .await?;
             }
             AppEvent::DiffResult(cwd, text) => {
-                if cwds_differ(&cwd, self.chat_widget.config_ref().cwd.as_path()) {
+                if &cwd != self.chat_widget.session_cwd() {
                     return Ok(AppRunControl::Continue);
                 }
                 // Clear the in-progress state in the bottom pane
@@ -2105,7 +2147,7 @@ impl App {
                     app_server.pending_side_skills_refresh = None;
                     if !self.awaiting_side_replay(tui)
                         && self.current_displayed_thread_id() == Some(thread_id)
-                        && !cwds_differ(&cwd, self.chat_widget.config_ref().cwd.as_path())
+                        && self.chat_widget.session_cwd() == &cwd
                     {
                         self.handle_skills_list_result(
                             result.map_err(|err| color_eyre::eyre::eyre!(err)),
@@ -3430,20 +3472,45 @@ impl App {
             AppEvent::AgentsOverviewThreadsLoaded { request_id, result } => {
                 self.apply_agents_overview_thread_refresh(app_server, request_id, result);
             }
+            AppEvent::OpenThreadLink { thread_id } => {
+                return Box::pin(thread_links::open_thread_link(self, tui, app_server, thread_id)).await;
+            }
             AppEvent::SelectAgentsOverviewThread { thread_id }
                 if self.agents_overview.pending_archives.contains_key(&thread_id) => {}
             AppEvent::SelectAgentsOverviewThread { thread_id } => {
-                match self
-                    .select_agents_overview_thread(tui, app_server, thread_id)
-                    .await?
-                {
+                match crate::boxed_future!(self.select_agents_overview_thread(tui, app_server, thread_id)).await? {
                     AppRunControl::Continue
                         if self.primary_thread_id.is_none()
-                            && self.chat_widget.selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID).is_none() => {
+                            && self.overview_selected_index().is_none() => {
                         self.open_agents_overview(app_server);
+                    }
+                    AppRunControl::Continue
+                        if self.agents_overview.workspace.is_open()
+                            && self.current_displayed_thread_id() == Some(thread_id) => {
+                        self.focus_workspace_composer(tui);
+                        self.repaint_agents_overview();
                     }
                     AppRunControl::Continue => {}
                     AppRunControl::Exit(reason) => return Ok(AppRunControl::Exit(reason)),
+                }
+            }
+            AppEvent::BackfillResumedSubagents { thread_id, backend_id } => {
+                if self.primary_thread_id == Some(thread_id) && app_server.backend_id() == backend_id {
+                    // Earlier replay events have populated the destination's transcript.
+                    self.refresh_owned_transcript(tui)?;
+                    if !crate::boxed_future!(self.backfill_loaded_subagent_threads(app_server)).await.completed {
+                        crate::boxed_future!(self.backfill_loaded_subagent_threads(app_server)).await;
+                    }
+                    // The scan may outlast the press-only guard window.
+                    if self.startup_protected_input_boundary && self.chat_widget.has_active_modal() {
+                        self.discard_startup_modal_input(tui)?;
+                    }
+                    if !self.chat_widget.is_read_only_view() {
+                        // Backfill makes parked child requests eligible for replay.
+                        // The event loop paints and protects any newly opened modal.
+                        crate::boxed_future!(self.replay_agents_overview_requests(app_server, thread_id)).await;
+                    }
+                    tui.frame_requester().schedule_frame();
                 }
             }
             AppEvent::ForkAgentsOverviewThread { thread_id } => {
@@ -3460,7 +3527,7 @@ impl App {
                 }
                 // Attachment replay must not submit queued input on the source task.
                 self.chat_widget.fork_in_progress = true;
-                let control = self.select_agents_overview_thread(tui, app_server, thread_id).await;
+                let control = crate::boxed_future!(self.select_agents_overview_thread(tui, app_server, thread_id)).await;
                 if matches!(&control, Ok(AppRunControl::Continue))
                     && self.current_displayed_thread_id() == Some(thread_id)
                 {
@@ -3487,7 +3554,7 @@ impl App {
                         };
                         let manager = pending.manager.clone();
                         let cwd = AbsolutePathBuf::try_from(checkout.cwd.clone())?;
-                        return Box::pin(self.start_agents_overview_session(tui, app_server, Some(cwd), Some((manager, checkout)), /*startup_draft*/ None)).await;
+                        return Box::pin(self.start_agents_overview_session(tui, app_server, Some(cwd.into()), Some((manager, checkout)), /*startup_draft*/ None)).await;
                     }
                     Err(error) => self.add_agents_overview_error(error),
                 }
@@ -3712,32 +3779,55 @@ impl App {
                     Box::pin(self.open_document(tui, app_server, source, link)).await?;
                 }
             }
+            AppEvent::OpenModelSidebarDocument { backend, thread_id, document } => {
+                let pending = self.sidebars.entry(Some(thread_id)).or_default()
+                    .pending_documents.entry(backend).or_default();
+                const MAX_PENDING_PER_THREAD: usize = 8;
+                pending.retain(|request| request.path != document.path);
+                if pending.len() == MAX_PENDING_PER_THREAD {
+                    pending.pop_front();
+                }
+                pending.push_back(document);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::SidebarDocumentResolved { backend_id, parent, source, request, original_path, path, location, } => {
+                let requested = self.sidebars.get_mut(&Some(parent))
+                    .and_then(|pane| pane.focus_document_request.take_if(|id| *id == request))
+                    .is_some();
+                if requested {
+                    tui.frame_requester().schedule_frame();
+                }
                 if backend_id == app_server.backend_id()
                     && self.sidebar_parent() == Some(parent)
-                    && let Some(pane) = self.sidebars.get_mut(&Some(parent))
+                    && self.sidebars.contains_key(&Some(parent))
                 {
                     // Late opens can add their tabs without taking back the user's focus.
-                    let requested = pane.focus_document_request == Some(request);
-                    if requested {
-                        pane.focus_document_request = None;
-                    }
                     let focus = requested
                         && self.current_displayed_thread_id() == Some(source)
                         && self.document_preview_available(tui, app_server);
                     match path {
                         Ok(path) => Box::pin(self.open_resolved_document(tui, app_server, source, original_path, path, location, focus)).await?,
-                        Err(error) if focus => self.chat_widget.add_error_message(format!("Could not open file: {error}")),
+                        Err(error) if focus => self.chat_widget.add_error_message(format!("Could not open {original_path}: {error}")),
                         Err(_) => {}
                     }
                 }
             }
-            AppEvent::SidebarDocumentLoaded { backend_id, parent, request, result } => {
-                if let Some(doc) = self.sidebars.get_mut(&Some(parent)).and_then(|pane| pane.documents.get_mut(&request))
+            AppEvent::SidebarDocumentLoaded { backend_id, parent, tab, request, result } => {
+                let model_load = self.model_preview_load == Some(request);
+                if model_load {
+                    self.model_preview_load = None;
+                    tui.frame_requester().schedule_frame();
+                }
+                if let Some(doc) = self.sidebars.get_mut(&Some(parent)).and_then(|pane| pane.documents.get_mut(&tab))
                     && doc.backend == backend_id
                 {
-                    doc.loaded(result);
-                    tui.frame_requester().schedule_frame();
+                    if model_load && doc.model_loading() && app_server.backend_id() == backend_id {
+                        doc.finish_model_load(app_server, result).await;
+                        tui.frame_requester().schedule_frame();
+                    } else if doc.watch.as_ref().is_some_and(|(id, _)| *id == request) {
+                        doc.loaded(result);
+                        tui.frame_requester().schedule_frame();
+                    }
                 }
             }
             AppEvent::SidebarFilesLoaded { backend_id, parent, request, page } => {
@@ -4119,6 +4209,16 @@ impl App {
             }
             AppEvent::SaveConfigPreference(preference) => {
                 self.save_config_preference(tui, preference).await;
+            }
+            AppEvent::SaveReasoningSummary { backend, summary } => {
+                if backend == app_server.backend_id() {
+                    self.update_reasoning_summary(app_server, Some(summary)).await;
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::RefreshConfigReasoningSummary => {
+                self.update_reasoning_summary(app_server, /*requested*/ None).await;
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::PersistAgentsOverviewGrouping(grouping) => {
                 self.persist_agents_overview_grouping(grouping).await;

@@ -117,6 +117,11 @@ pub(super) async fn handle_message_string_tool(
                     turn.provider.info().is_openai(),
                 ),
                 mode,
+                source_tool_call_id: session
+                    .services
+                    .rollout_thread_trace
+                    .is_enabled()
+                    .then(|| call_id.clone()),
             },
             start_options: TurnStartOptions {
                 parent_turn_id: (mode == MessageDeliveryMode::TriggerTurn)
@@ -138,7 +143,7 @@ pub(super) async fn handle_message_string_tool(
         SubAgentActivityItem {
             model: None,
             reasoning_effort: None,
-            id: call_id,
+            id: call_id.into(),
             agent_thread_id: receiver_thread_id,
             agent_path: receiver_agent_path,
             kind: SubAgentActivityKind::Interacted,

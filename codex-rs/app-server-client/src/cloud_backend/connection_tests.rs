@@ -257,7 +257,7 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
     let mut recovery = idle::Recovery::new(state, Arc::clone(&requests.client), login.clone());
     recovery.held = Some((
         "t".into(),
-        tokio::time::Instant::now() + std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
         Box::pin(async move {
             let idle: &[u8] = b"\x1a\x09\x12\x07\x0a\x02\x12\x00\x12\x01t";
             Some(idle::Opened {
@@ -272,7 +272,7 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
     replies.idle = Some(recovery);
     requests.warned_partial_history = Some("t".into());
     replies.next_event(&output).await;
-    assert_eq!(installed.await?, Ok(()));
+    installed.await??;
     let AppServerEvent::ServerNotification(notification) = notifications.try_recv()? else {
         panic!("expected held first event");
     };
@@ -296,6 +296,7 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
         (true, &["7"][..], "install"),
         (false, &["14", "7"][..], "install"),
         (false, &["14", "busy"][..], "install"),
+        (false, &["14", "14", "14", "busy"][..], "outage"),
         (true, &["busy"][..], "install"),
         (true, &["busy"][..], "cancel"),
         (true, &["busy", "busy"][..], "retry"),
@@ -340,6 +341,10 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
                 login.clone()
             },
         );
+        if outcome == "outage" {
+            // Two replacements have already disconnected in quick succession.
+            recovery.attempts = 2;
+        }
         recovery.observed_idle = Some(idle);
         let mut worker_replies = Replies {
             idle: Some(recovery),
@@ -355,13 +360,16 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
             run_worker(commands, &mut worker_requests, &mut worker_replies, &events).await;
         });
         let budget = std::time::Duration::from_secs(if outcome == "slow-history" { 2 } else { 8 });
-        let result = handle
-            .resume_disconnected_thread(
-                "t".into(),
-                /*require_history*/ false,
-                tokio::time::Instant::now() + budget,
-            )
-            .await;
+        let restore = || {
+            handle.resume_disconnected_thread("t".into(), /*require_history*/ false, budget)
+        };
+        if outcome == "outage" {
+            let Err(crate::TypedRequestError::Transport { source, .. }) = restore().await else {
+                panic!("expected a retryable attach failure");
+            };
+            assert_eq!(source.kind(), std::io::ErrorKind::ConnectionAborted);
+        }
+        let result = restore().await;
         if outcome == "pat" || statuses.last() == Some(&"7") {
             let Err(crate::TypedRequestError::Server { source, .. }) = result else {
                 panic!("expected recovery to reject this authentication mode or access denial");
@@ -453,10 +461,10 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
                         .all(|request| !request.url.path().ends_with("/ListItems"))
                 );
             } else if outcome == "slow-history" {
-                let Err(crate::TypedRequestError::Server { source, .. }) = history else {
-                    panic!("expected the recovery deadline to withhold the page");
+                let Err(crate::TypedRequestError::Transport { source, .. }) = history else {
+                    panic!("expected the request timeout to withhold the page");
                 };
-                assert_eq!(source, idle::recovery_error(idle::RECOVERY_TIMEOUT));
+                assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
             } else {
                 assert_eq!(
                     history?,
@@ -490,7 +498,7 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
                         .resume_disconnected_thread(
                             "t".into(),
                             /*require_history*/ true,
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(8),
+                            std::time::Duration::from_secs(8),
                         )
                         .await?;
                     assert_eq!(settings.as_ref(), Some(cached.as_ref()));
@@ -506,7 +514,10 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
                 assert!(client.next_event().now_or_never().is_none());
             } else {
                 // The wiremock response is finite: it must never ACK a live installation.
-                assert!(release.install().await.is_err());
+                assert_eq!(
+                    release.install().await.unwrap_err().kind(),
+                    std::io::ErrorKind::ConnectionAborted,
+                );
                 assert!(client.next_event().now_or_never().is_none());
             }
         }
@@ -837,8 +848,12 @@ async fn prepared_resume_keeps_the_previous_stream_until_handoff() -> Result<()>
             if outcome == "burst" {
                 // One partial-history warning plus the entire live burst, including its unread tail.
                 for _ in 0..PREPARED_EVENT_LIMIT + 2 {
+                    let mut event = client.next_event().await;
+                    while matches!(event, Some(AppServerEvent::CloudInventoryChanged(Some(_)))) {
+                        event = client.next_event().await;
+                    }
                     assert!(
-                        matches!(client.next_event().await, Some(AppServerEvent::ServerNotification(notification))
+                        matches!(event, Some(AppServerEvent::ServerNotification(notification))
                         if matches!(*notification, protocol::ServerNotification::Warning(_)))
                     );
                 }
@@ -982,12 +997,20 @@ async fn accepted_idle_reconnect_reports_changed_login() -> Result<()> {
 }
 
 #[tokio::test]
-async fn attachment_status_follows_its_server_notifications() -> Result<()> {
+async fn attachment_tracks_its_status_and_reports_account_inventory_changes() -> Result<()> {
     let (output, mut events) = mpsc::unbounded_channel();
-    let mut replies = Replies::default();
-    let notifications: [&[u8]; 3] = [
+    let (client, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let handle = client.request_handle();
+    let mut replies = Replies {
+        attached: handle.attached.clone(),
+        ..Default::default()
+    };
+    let notifications: [&[u8]; 6] = [
         b"\x1a\x0d\x12\x0b\x0a\x06\x22\x04\x0a\x02\x08\x01\x12\x01t", // t is waiting
+        b"\xaa\x01\x0c\x12\x0a\x0a\x01x\x12\x05\x22\x01u\x40\x04",    // x starts a turn
         b"\x1a\x09\x12\x07\x0a\x02\x12\x00\x12\x01x",                 // x is idle
+        b"\x22\x05\x12\x03\x0a\x01x",                                 // x is archived
+        b"\x32\x05\x12\x03\x0a\x01x",                                 // x is unarchived
         b"\x1a\x09\x12\x07\x0a\x02\x12\x00\x12\x01t",                 // t is idle
     ];
     let stream = stream::iter(
@@ -1007,13 +1030,27 @@ async fn attachment_status_follows_its_server_notifications() -> Result<()> {
     let waiting = cloud::ThreadStatus::Active {
         active_flags: vec![cloud::ThreadActiveFlag::WaitingOnApproval],
     };
-    assert_eq!(replies.thread_status("t"), Some(&waiting));
-    replies.forward_next(&output).await;
-    assert_eq!(replies.thread_status("t"), Some(&waiting));
+    let waiting = serde_json::json!(waiting);
+    let status_change = |status: &Value| serde_json::json!({"method": "thread/status/changed", "params": {"threadId": "t", "status": status}});
+    for expected in [
+        status_change(&waiting),
+        Value::Null,
+        Value::Null,
+        serde_json::json!({"method": "thread/archived", "params": {"threadId": "x"}}),
+        serde_json::json!({"method": "thread/unarchived", "params": {"threadId": "x"}}),
+        status_change(&serde_json::json!(cloud::ThreadStatus::Idle)),
+    ] {
+        let AppServerEvent::CloudInventoryChanged(lifecycle) = events.try_recv()? else {
+            panic!("expected inventory change");
+        };
+        assert_eq!(serde_json::to_value(lifecycle)?, expected);
+        let status = expected.pointer("/params/status").unwrap_or(&waiting);
+        assert_eq!(&serde_json::to_value(replies.thread_status("t"))?, status);
+        assert!(handle.has_attachment());
+        replies.forward_next(&output).await;
+    }
 
-    replies.forward_next(&output).await;
-    assert_eq!(replies.thread_status("t"), Some(&cloud::ThreadStatus::Idle));
-    replies.forward_next(&output).await;
+    assert!(!handle.has_attachment());
     assert_eq!(replies.thread_status("t"), Some(&cloud::ThreadStatus::Idle));
     let AppServerEvent::ThreadStreamDisconnected(error) = events.try_recv()? else {
         panic!("expected a Cloud stream loss");
@@ -1030,5 +1067,8 @@ async fn attachment_status_follows_its_server_notifications() -> Result<()> {
         .replace("t", async { Ok(stream::pending().boxed()) }, &output)
         .await?;
     assert_eq!(replies.thread_status("t"), None);
+    assert!(handle.has_attachment());
+    replies.detach("t");
+    assert!(!handle.has_attachment());
     Ok(())
 }

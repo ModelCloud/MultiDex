@@ -51,6 +51,7 @@ pub async fn update_from_cli(
     #[cfg(windows)]
     crate::backend::windows::ensure_not_elevated()?;
     let daemon = Daemon::from_environment()?;
+    crate::update_policy::ensure_allowed(&daemon).await?;
     let settings = daemon.load_settings().await?;
     let source = InstallContext::current().package_layout.as_ref();
     if !Box::pin(prepare_from_package(
@@ -206,6 +207,7 @@ async fn prepare_from_package(
         None // Initial startup already holds the operation lock.
     };
     let current_settings = if mode == InstallMode::Replace {
+        crate::update_policy::ensure_allowed(daemon).await?;
         Some(daemon.load_settings().await?)
     } else {
         None
@@ -295,8 +297,13 @@ async fn prepare_from_package(
     validate_package(stage.path(), entrypoint)?;
     let binary_version =
         managed_install::managed_codex_version(&stage.path().join(entrypoint)).await?;
+    // The CLI appends its Git commit as SemVer build metadata.
     anyhow::ensure!(
-        !stable || version == binary_version,
+        !stable
+            || semver::Version::parse(&binary_version).is_ok_and(|binary_version| manifest
+                .version
+                .cmp_precedence(&binary_version)
+                .is_eq()),
         "the CLI package version does not match its executable"
     );
     let name = if stable && mode == InstallMode::Missing {
@@ -344,6 +351,7 @@ async fn prepare_from_package(
     #[cfg(windows)]
     windows::validate_selection(&root)?;
     if mode == InstallMode::Replace {
+        crate::update_policy::ensure_allowed(daemon).await?;
         let stopped = async {
             crate::backend::pid_update_loop_backend(daemon.backend_paths(settings))
                 .stop()
