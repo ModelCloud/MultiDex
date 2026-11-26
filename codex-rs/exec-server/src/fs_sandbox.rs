@@ -341,6 +341,10 @@ pub(crate) fn spawn_command(
     command.current_dir(cwd.as_path());
     let mut env = request.env;
     env.retain(|name, _| !codex_protocol::shell_environment::is_non_inheritable_env_var(name));
+    // The sandboxed command is the process that actually runs agent CLIs and
+    // their integrations, so the opt-outs are forced here rather than trusted
+    // to the request's env map.
+    codex_protocol::privacy_env::insert_privacy_env(&mut env);
     command.envs(env);
     command.stdin(stdin);
     // A helper is a known executable: native launch errors must not retry through fork.

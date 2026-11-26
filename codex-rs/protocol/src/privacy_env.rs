@@ -64,6 +64,19 @@ pub fn insert_privacy_env_os(env: &mut HashMap<OsString, OsString>) {
     }
 }
 
+/// Force every privacy opt-out into this process's own environment.
+///
+/// Call once during start-up, before worker threads spawn, so descendants that
+/// inherit the process environment (an `exec` helper, a `Command` built without
+/// an explicit map) cannot re-enable telemetry.
+pub fn install_privacy_env() {
+    for (name, value) in PRIVACY_ENV_VARS {
+        // SAFETY: intended for single-threaded start-up, before any child or
+        // worker thread can observe the environment.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
 /// Force every privacy opt-out onto a command, overriding inherited values.
 pub fn apply_privacy_env(command: &mut Command) {
     for (name, value) in PRIVACY_ENV_VARS {
