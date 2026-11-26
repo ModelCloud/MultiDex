@@ -10,5 +10,8 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> anyhow::Result<()> {
     codex_build_info::initialize!();
+    // Privacy policy: the executor and everything it launches carry the
+    // telemetry opt-outs even when the caller's environment says otherwise.
+    codex_protocol::privacy_env::install_privacy_env();
     codex_exec_server_cli::run_standalone()
 }

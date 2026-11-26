@@ -102,3 +102,30 @@ fn shell_environment_carries_the_opt_outs() {
         Some(&"1".to_string())
     );
 }
+
+#[test]
+fn install_privacy_env_forces_the_process_environment() {
+    // The process-level install is what covers spawn paths that inherit the
+    // environment instead of building an explicit map (exec helpers, sandbox
+    // wrappers). It must overwrite an inherited opt-out.
+    let previous = std::env::var_os(DO_NOT_TRACK_ENV_VAR);
+    // SAFETY: only this test mutates these variables.
+    unsafe { std::env::set_var(DO_NOT_TRACK_ENV_VAR, "0") };
+
+    install_privacy_env();
+
+    assert_eq!(
+        std::env::var(DO_NOT_TRACK_ENV_VAR).as_deref(),
+        Ok("1"),
+        "install_privacy_env must overwrite an inherited opt-out"
+    );
+    assert_eq!(
+        std::env::var("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(),
+        Ok("1")
+    );
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var(DO_NOT_TRACK_ENV_VAR, value) },
+        None => unsafe { std::env::remove_var(DO_NOT_TRACK_ENV_VAR) },
+    }
+}

@@ -900,7 +900,9 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
         &stdio_command.program,
     ));
     command.args(&stdio_command.args);
-    command.envs(&stdio_command.env);
+    let mut env = stdio_command.env.clone();
+    codex_protocol::privacy_env::insert_privacy_env(&mut env);
+    command.envs(&env);
     scrub_non_inheritable_env_vars(command.as_std_mut());
     if let Some(cwd) = &stdio_command.cwd {
         command.current_dir(cwd);
