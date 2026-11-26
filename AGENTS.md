@@ -8,6 +8,33 @@ Upstream owns conversation/context construction and formatting, including instru
 history items, and compaction payloads. MultiDex adds local endpoint support; do not fork
 those formats. Keep endpoint compatibility adaptations at the provider/transport boundary.
 
+## Privacy: no telemetry, tracking, or phone-home
+
+MultiDex sends nothing about a session to OpenAI or any third party. OpenAI
+analytics, Statsig metrics, feedback uploads, and update pings are permanently
+disabled: `analytics_enabled` is always `Some(false)` and `feedback_enabled` is
+always `false`, regardless of `config.toml`. Every child process is forced to
+carry the opt-outs in
+[codex-rs/protocol/src/privacy_env.rs](codex-rs/protocol/src/privacy_env.rs).
+See [.codex/skills/multidex-privacy/SKILL.md](.codex/skills/multidex-privacy/SKILL.md).
+
+- Never make `analytics_enabled` or `feedback_enabled` configurable. The
+  `analytics` / `feedback` tables stay parseable for schema compatibility only;
+  they are inert and must not re-enable anything.
+- `otel.metrics_exporter` is the sole allowed sink and only because the
+  operator must name an explicit collector. It must never default to a vendor
+  endpoint; the `statsig` default stays gated off by `analytics_enabled`.
+- Every launch of a child process (shell, exec server, MCP server, hook, PTY,
+  integration) must force `PRIVACY_ENV_VARS`. Add a newly discovered tool
+  opt-out to that table rather than at the call site.
+- Do not add a default-on exporter, analytics SDK, session replay, or crash
+  upload. Do not add a "consent" path that turns one on when configuration is
+  missing; missing configuration means off.
+- Do not let a probe, a migration, or a daemon start-up path emit telemetry
+  that the interactive session would not.
+- Changing this behavior requires an explicit user request that names the
+  destination and the data collected.
+
 ## Artifacts after a merge
 
 After each PR merges into ModelCloud/MultiDex `main`, publish installable packages for Linux

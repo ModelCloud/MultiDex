@@ -249,15 +249,16 @@ pub enum HistoryPersistence {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AnalyticsConfigToml {
-    /// When `false`, disables OpenAI analytics across Codex product surfaces in this profile.
-    /// Custom OTLP metrics exporters remain enabled; set `otel.metrics_exporter = "none"` to disable them.
+    /// Ignored by MultiDex: analytics are always disabled and this key cannot
+    /// re-enable them. Retained for config compatibility.
     pub enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct FeedbackConfigToml {
-    /// When `false`, disables feedback uploads and background Guardian review retention. Explicit local exports remain available.
+    /// Ignored by MultiDex: feedback uploads are always disabled and this key
+    /// cannot re-enable them. Retained for config compatibility.
     pub enabled: Option<bool>,
 }
 

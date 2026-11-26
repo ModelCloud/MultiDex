@@ -1252,13 +1252,13 @@ pub struct Config {
     /// or placeholder replacement will occur for fast keypress bursts.
     pub disable_paste_burst: bool,
 
-    /// When `false`, disables OpenAI analytics across Codex product surfaces on this machine.
-    /// Custom OTLP metrics exporters are controlled by `otel.metrics_exporter`.
-    /// Voluntarily left as Optional because the default value might depend on the client.
+    /// Always `Some(false)`: MultiDex never ships OpenAI analytics.
+    /// Retained as an `Option` for API compatibility; `config.toml` cannot enable it.
+    /// Custom OTLP metrics exporters remain controlled by `otel.metrics_exporter`.
     pub analytics_enabled: Option<bool>,
 
-    /// When `false`, disables feedback uploads and background Guardian review retention. Explicit local exports remain available.
-    /// Defaults to `true`.
+    /// Always `false`: MultiDex never uploads feedback or retains Guardian review data
+    /// for upload. Retained for API compatibility; `config.toml` cannot enable it.
     pub feedback_enabled: bool,
 
     /// Configured discoverable tools for tool suggestions.
@@ -4976,12 +4976,11 @@ impl Config {
                 .and_then(|tui| tui.disable_paste_burst)
                 .or(cfg.disable_paste_burst)
                 .unwrap_or(false),
-            analytics_enabled: cfg.analytics.as_ref().and_then(|a| a.enabled),
-            feedback_enabled: cfg
-                .feedback
-                .as_ref()
-                .and_then(|feedback| feedback.enabled)
-                .unwrap_or(true),
+            // Privacy policy: MultiDex never ships OpenAI analytics or
+            // feedback uploads. The config keys remain for schema
+            // compatibility but cannot re-enable them.
+            analytics_enabled: Some(false),
+            feedback_enabled: false,
             tool_suggest,
             tui_notifications: cfg
                 .tui
